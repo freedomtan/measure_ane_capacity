@@ -32,13 +32,16 @@ codesign -s "Apple Development" measure_conv_ios
 
 > **Note**: Running a standalone binary on a non-jailbroken iPhone is restricted. The easiest way to run this on a device is to wrap it in an iOS App.
 
-#### Method: Create an Xcode Project
+#### Method 1: Create an Xcode Project (GUI)
 1. Open Xcode and create a new **iOS App** (Objective-C).
-2. Replace the contents of `main.m` with the code from `measure_conv_universal.m`.
+2. Replace the contents of `main.m` with the code from `measure_conv_gui.m`.
 3. Add `Metal` and `MetalPerformanceShadersGraph` to the **Frameworks, Libraries, and Embedded Content**.
 4. Run the app on your connected iPhone.
-5. Setup the scheme to disable "Debug Executable" if you want accurate timing (to avoid debugger overhead), or run in Release mode.
-6. Check the Xcode **Console** for the output.
+5. The app will show a "Run Benchmark" button and display results in a text view.
+
+#### Method 2: Xcode Project (Console Only)
+1. Follow the steps above but use `measure_conv_universal.m` instead.
+2. Check the Xcode **Console** for the output.
 
 ## Running the Benchmark
 
