@@ -34,15 +34,13 @@ codesign -s "Apple Development" measure_conv_ios
 
 #### Method 1: Create an Xcode Project (GUI)
 1. Open Xcode and create a new **iOS App** (Objective-C).
-2. **Delete** the following default files: `AppDelegate.h/m`, `SceneDelegate.h/m`, `ViewController.h/m`, and `Main.storyboard`.
+2. **Delete** the following default files: `AppDelegate.h/m`, `SceneDelegate.h/m`, and `ViewController.h/m`.
 3. **Replace** the contents of `main.m` with the code from `measure_conv_gui.m`.
-4. **Project Settings**:
-    - Go to target settings > **General** > **Deployment Info**.
-    - Clear the **Main Interface** field (make it empty).
-5. **Info.plist**:
-    - Remove the **Application Scene Manifest** entry (to prevent it from looking for SceneDelegate).
-6. Add `Metal` and `MetalPerformanceShadersGraph` to the **Frameworks, Libraries, and Embedded Content**.
-7. Run the app on your connected iPhone.
+4. **Info.plist** (Scene Manifest):
+    - In the **Info** tab, find **Application Scene Manifest**.
+    - **Delete** that entire row (to prevent the app from trying to use a SceneDelegate).
+5. Add `Metal` and `MetalPerformanceShadersGraph` to the **Frameworks, Libraries, and Embedded Content**.
+6. Run the app on your connected iPhone.
 
 #### Method 2: Xcode Project (Console Only)
 1. Follow the steps above but use `measure_conv_universal.m` instead.
