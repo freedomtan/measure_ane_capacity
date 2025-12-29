@@ -23,7 +23,8 @@ make clean
 Execute the compiled binary:
 
 ```bash
-./measure_conv_fp16
+```bash
+./measure_conv
 ```
 
 ## Benchmark Results
@@ -31,15 +32,18 @@ Execute the compiled binary:
 ### Apple M4 Pro
 
 | Device | Precision | Latency (Avg) | Speed (TOPS) |
-| :--- | :--- | :--- | :--- |
-| **GPU** | FP16 | 39.25 ms | **9.85** |
-| **ANE** | FP16 | 20.92 ms | **18.48** |
+| :--- | :--- | ---: | ---: |
+| **GPU** | FP16 | 39.05 ms | **9.90** |
+| **ANE** | FP16 | 20.90 ms | **18.50** |
+| **ANE** | INT8 | 10.76 ms | **35.91** |
 
 ### Apple M1
 
 | Device | Precision | Latency (Avg) | Speed (TOPS) |
-| :--- | :--- | :--- | :--- |
+| :--- | :--- | ---: | ---: |
 | **GPU** | FP16 | 129.10 ms | **2.99** |
 | **ANE** | FP16 | 35.70 ms | **10.83** |
+| **ANE** | INT8 | 34.02 ms | **11.36** |
 
 *Note: Results may vary slightly depending on system load and thermal state.*
+*Note: GPU INT8 convolution is not supported by MPSGraph on this device/configuration.*
