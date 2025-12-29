@@ -57,21 +57,18 @@ Execute the compiled binary:
 
 ## Benchmark Results
 
-### Apple M4 Pro
+| Model | Device | Precision | Latency (Avg) | Speed (TOPS) |
+| :--- | :--- | :--- | ---: | ---: |
+| **Mac Mini M4 Pro** | **GPU** | FP16 | 39.05 ms | **9.90** |
+| **Mac Mini M4 Pro** | **ANE** | FP16 | 20.90 ms | **18.50** |
+| **Mac Mini M4 Pro** | **ANE** | INT8 | 10.76 ms | **35.91** |
+| **MacBook Pro M1** | **GPU** | FP16 | 129.10 ms | **2.99** |
+| **MacBook Pro M1** | **ANE** | FP16 | 35.70 ms | **10.83** |
+| **MacBook Pro M1** | **ANE** | INT8 | 34.02 ms | **11.36** |
+| **iPhone 17 Pro** | **GPU** | FP16 | 57.02 ms | **6.78** |
+| **iPhone 17 Pro** | **ANE** | FP16 | 8.70 ms | **44.41** |
+| **iPhone 17 Pro** | **ANE** | INT8 | 7.85 ms | **49.27** |
 
-| Device | Precision | Latency (Avg) | Speed (TOPS) |
-| :--- | :--- | ---: | ---: |
-| **GPU** | FP16 | 39.05 ms | **9.90** |
-| **ANE** | FP16 | 20.90 ms | **18.50** |
-| **ANE** | INT8 | 10.76 ms | **35.91** |
-
-### Apple M1
-
-| Device | Precision | Latency (Avg) | Speed (TOPS) |
-| :--- | :--- | ---: | ---: |
-| **GPU** | FP16 | 129.10 ms | **2.99** |
-| **ANE** | FP16 | 35.70 ms | **10.83** |
-| **ANE** | INT8 | 34.02 ms | **11.36** |
 
 *Note: Results may vary slightly depending on system load and thermal state.*
 *Note: GPU INT8 convolution is not supported by MPSGraph on this device/configuration.*
