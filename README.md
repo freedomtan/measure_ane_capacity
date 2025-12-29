@@ -30,6 +30,16 @@ xcrun -sdk iphoneos clang -fobjc-arc -O3 -framework Foundation -framework Metal 
 codesign -s "Apple Development" measure_conv_ios
 ```
 
+> **Note**: Running a standalone binary on a non-jailbroken iPhone is restricted. The easiest way to run this on a device is to wrap it in an iOS App.
+
+#### Method: Create an Xcode Project
+1. Open Xcode and create a new **iOS App** (Objective-C).
+2. Replace the contents of `main.m` with the code from `measure_conv_universal.m`.
+3. Add `Metal` and `MetalPerformanceShadersGraph` to the **Frameworks, Libraries, and Embedded Content**.
+4. Run the app on your connected iPhone.
+5. Setup the scheme to disable "Debug Executable" if you want accurate timing (to avoid debugger overhead), or run in Release mode.
+6. Check the Xcode **Console** for the output.
+
 ## Running the Benchmark
 
 Execute the compiled binary:
