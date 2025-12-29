@@ -10,5 +10,7 @@ measure_conv_fp16: measure_conv_fp16.m
 
 measure_conv: measure_conv.m
 
+measure_conv_universal: measure_conv_universal.m
+
 clean:
 	rm -f ${TARGETS}

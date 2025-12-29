@@ -18,6 +18,18 @@ To clean the build artifacts:
 make clean
 ```
 
+### iOS Build
+
+To build for iOS, you need to use the `xcrun` command to target the iPhone SDK and sign the binary.
+
+```bash
+# Compile for iOS (arm64)
+xcrun -sdk iphoneos clang -fobjc-arc -O3 -framework Foundation -framework Metal -framework MetalPerformanceShadersGraph measure_conv_universal.m -o measure_conv_ios
+
+# Sign the binary (replace 'Apple Development' with your identity)
+codesign -s "Apple Development" measure_conv_ios
+```
+
 ## Running the Benchmark
 
 Execute the compiled binary:
