@@ -35,4 +35,11 @@ Execute the compiled binary:
 | **GPU** | FP16 | 39.25 ms | **9.85** |
 | **ANE** | FP16 | 20.92 ms | **18.48** |
 
+### Apple M1
+
+| Device | Precision | Latency (Avg) | Speed (TOPS) |
+| :--- | :--- | :--- | :--- |
+| **GPU** | FP16 | 129.10 ms | **2.99** |
+| **ANE** | FP16 | 35.70 ms | **10.83** |
+
 *Note: Results may vary slightly depending on system load and thermal state.*
