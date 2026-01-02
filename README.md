@@ -6,10 +6,13 @@ This project benchmarks the performance of 2D convolutions on Apple Silicon usin
 
 To compile the project, ensure you have clang and the necessary frameworks (Foundation, Metal, MetalPerformanceShadersGraph) installed (standard on macOS with Xcode Command Line Tools).
 
-Run the following command in the terminal:
-
 ```bash
 make
+```
+
+To build just the Swift version:
+```bash
+make measure_conv_swift
 ```
 
 To clean the build artifacts:
@@ -19,7 +22,6 @@ make clean
 ```
 
 ### iOS Build
-
 To build for iOS, you need to use the `xcrun` command to target the iPhone SDK and sign the binary.
 
 ```bash
