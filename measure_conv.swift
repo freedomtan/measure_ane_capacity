@@ -50,6 +50,13 @@ func runBench(device: MTLDevice, useANE: Bool, dataType: MPSDataType, name: Stri
             weightsLayout: .OIHW)!
             
         cur = graph.convolution2D(cur, weights: w, descriptor: d, name: nil)
+        
+        // Realistic Quantized flow: Int8 -> (Conv) -> Int32/FP16 -> (Select/Scale) -> Int8
+        // We simulate this by casting to FP16 and back to Int8 to force the graph to handle dequant/quant
+        if dataType == .int8 {
+            let fp = graph.cast(cur, to: .float16, name: "dequant")
+            cur = graph.cast(fp, to: .int8, name: "requant")
+        }
     }
     
     var mDev: MPSGraphDevice?

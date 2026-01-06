@@ -94,6 +94,14 @@
                                    weightsTensor:w
                                       descriptor:d
                                             name:nil];
+      // Realistic Quantized flow: Int8 -> (Conv) -> Int32/FP16 ->
+      // (Select/Scale) -> Int8
+      if (dataType == MPSDataTypeInt8) {
+        MPSGraphTensor *fp = [graph castTensor:cur
+                                        toType:MPSDataTypeFloat16
+                                          name:@"dequant"];
+        cur = [graph castTensor:fp toType:MPSDataTypeInt8 name:@"requant"];
+      }
     }
 
     NSDictionary *feeds = @{
