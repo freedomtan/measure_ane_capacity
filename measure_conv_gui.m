@@ -24,12 +24,13 @@
   struct Config {
     bool useANE;
     MPSDataType type;
+    bool useQDQ;
     NSString *name;
   } configs[] = {
-      {false, MPSDataTypeFloat16, @"GPU FP16"},
-      {true, MPSDataTypeFloat16, @"ANE FP16"},
-      // {false, MPSDataTypeInt8,    @"GPU INT8"}, // Skip GPU INT8
-      {true, MPSDataTypeInt8, @"ANE INT8"},
+      {false, MPSDataTypeFloat16, false, @"GPU FP16"},
+      {true, MPSDataTypeFloat16, false, @"ANE FP16"},
+      {true, MPSDataTypeInt8, false, @"ANE INT8"},
+      {true, MPSDataTypeInt8, true, @"ANE QDQ (Int8->FP16->Int8)"},
   };
 
   int configCount = sizeof(configs) / sizeof(configs[0]);
@@ -40,6 +41,7 @@
   [self runBench:device
           useANE:cfg.useANE
         dataType:cfg.type
+          useQDQ:cfg.useQDQ
             name:cfg.name
              log:logger];
 }
@@ -47,6 +49,7 @@
 - (void)runBench:(id<MTLDevice>)device
           useANE:(bool)useANE
         dataType:(MPSDataType)dataType
+          useQDQ:(bool)useQDQ
             name:(NSString *)name
              log:(void (^)(NSString *))logger {
   @autoreleasepool {
@@ -71,16 +74,34 @@
     MPSGraphTensor *input = [graph placeholderWithShape:inShape
                                                dataType:dataType
                                                    name:@"in"];
-    MPSGraphTensor *cur = input;
-    NSUInteger elementSize = (dataType == MPSDataTypeFloat16) ? 2 : 1;
 
+    MPSGraphTensor *cur = input;
+
+    // QDQ Constants
+    MPSGraphTensor *scale = [graph constantWithScalar:1.0
+                                             dataType:MPSDataTypeFloat32];
+    MPSGraphTensor *zp = [graph constantWithScalar:0.0
+                                          dataType:MPSDataTypeInt32];
+
+    // Weights: Always FP16 or DataType (if not QDQ)
+    MPSDataType wType = useQDQ ? MPSDataTypeFloat16 : dataType;
+    NSUInteger elementSize = (wType == MPSDataTypeFloat16) ? 2 : 1;
     NSMutableData *wData =
         [NSMutableData dataWithLength:Co * Ci * K * K * elementSize];
     MPSGraphTensor *w = [graph constantWithData:wData
                                           shape:wShape
-                                       dataType:dataType];
+                                       dataType:wType];
 
     for (int i = 0; i < L; i++) {
+      if (useQDQ) {
+        cur = [graph dequantizeTensor:cur
+                          scaleTensor:scale
+                      zeroPointTensor:zp
+                             dataType:MPSDataTypeFloat16
+                                 axis:1
+                                 name:nil];
+      }
+
       MPSGraphConvolution2DOpDescriptor *d = [MPSGraphConvolution2DOpDescriptor
           descriptorWithStrideInX:1
                         strideInY:1
@@ -90,17 +111,19 @@
                      paddingStyle:MPSGraphPaddingStyleTF_SAME
                        dataLayout:MPSGraphTensorNamedDataLayoutNCHW
                     weightsLayout:MPSGraphTensorNamedDataLayoutOIHW];
+
       cur = [graph convolution2DWithSourceTensor:cur
                                    weightsTensor:w
                                       descriptor:d
                                             name:nil];
-      // Realistic Quantized flow: Int8 -> (Conv) -> Int32/FP16 ->
-      // (Select/Scale) -> Int8
-      if (dataType == MPSDataTypeInt8) {
-        MPSGraphTensor *fp = [graph castTensor:cur
-                                        toType:MPSDataTypeFloat16
-                                          name:@"dequant"];
-        cur = [graph castTensor:fp toType:MPSDataTypeInt8 name:@"requant"];
+
+      if (useQDQ) {
+        cur = [graph quantizeTensor:cur
+                        scaleTensor:scale
+                    zeroPointTensor:zp
+                           dataType:MPSDataTypeInt8
+                               axis:1
+                               name:nil];
       }
     }
 
@@ -122,8 +145,10 @@
       return;
     }
 
+    NSUInteger inputElementSize = (dataType == MPSDataTypeFloat16) ? 2 : 1;
     id<MTLBuffer> iBuf =
-        [device newBufferWithLength:B * H * W * Ci * elementSize options:0];
+        [device newBufferWithLength:B * H * W * Ci * inputElementSize
+                            options:0];
     MPSGraphTensorData *iData =
         [[MPSGraphTensorData alloc] initWithMTLBuffer:iBuf
                                                 shape:inShape
@@ -234,6 +259,10 @@
                       logHandler:^(NSString *s) {
                         [self log:s];
                       }]; // ANE INT8
+    [self.benchmarker runAtIndex:3
+                      logHandler:^(NSString *s) {
+                        [self log:s];
+                      }]; // ANE QDQ
 
     dispatch_async(dispatch_get_main_queue(), ^{
       [self log:@"\nDone!"];
