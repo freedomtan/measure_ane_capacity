@@ -72,7 +72,7 @@ Execute the compiled binary:
 | **iPhone 16 Pro** | **GPU** | FP16 | 149.35 ms | **2.59** |
 | **iPhone 16 Pro** | **ANE** | FP16 | 12.81 ms | **30.18** |
 | **iPhone 16 Pro** | **ANE** | INT8 | 7.98 ms | **48.46** |
-| **MacBook Pro M1** | **ANE** | DQ->FP16->Q | 6.41 ms | **60.29** |
+| **iPhone 16 Pro** | **ANE** | DQ->FP16->Q | 6.41 ms | **60.29** |
 | **iPhone 17 Pro** | **GPU** | FP16 | 57.02 ms | **6.78** |
 | **iPhone 17 Pro** | **ANE** | FP16 | 8.70 ms | **44.41** |
 | **iPhone 17 Pro** | **ANE** | INT8 | 7.85 ms | **49.27** |
