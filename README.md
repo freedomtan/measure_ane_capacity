@@ -99,31 +99,44 @@ When `--save-package` is enabled, `measure_ane_pmu` serializes each variant into
 ## Benchmark Results
 
 ### Apple M4 Pro (H16g, 16 ANE Cores) — Physical Silicon PMU Telemetry
-*Workload: 20 chained $3\times 3$ Conv layers on $[1, 128, 256, 256]$ tensor ($386.55\text{ GOPs} / 0.3865\text{ TOPs}$ per pass)*
 
-| Variant | Device | Latency | Speed (TOPS) | Compute Cycles* | Output Stalls | Planar Cycles (L2PE) | DMA Traffic |
-| :--- | :--- | ---: | ---: | ---: | ---: | ---: | ---: |
-| **GPU FP16** | Metal GPU | 39.13 ms | **9.88** | — | — | — | — |
-| **ANE FP16** | Physical ANE | 20.61 ms | **18.76** | 157,200* | 503,317,431 | 10,494,464 | 34.99 MB |
-| **ANE INT8** | Physical ANE | 10.78 ms | **35.87** | 105,045,873 | 233,509,350 | 5,247,232 | 18.35 MB |
-| **ANE QDQ** | Physical ANE | 20.78 ms | **18.60** | 5,010,176 | 627,454,283 | 5,249,536 | 35.27 MB |
+#### 1. Maximum Compute Saturation Benchmark ($C=256, H=256, W=256, L=50$ Layers)
+*Scaling channel depth ($C=256$) and layer count ($L=50$) maximizes arithmetic intensity, completely amortizes command queue dispatch, and pushes the physical silicon ALU arrays to their architectural limits (3.865 TOPs / 1.933 Trillion MACs per pass):*
 
-*\*Note on Compute Cycles: Under memory-bound workloads ($16\text{ MB}$ intermediate feature maps spilling on-chip L2 SRAM to DRAM), `kANE_NE_COMPUTE_CYCLES` is clock-gated OFF during the $503\text{M}$ output writeback stall cycles. In `conv_fp16`, back-to-back convolutions keep output writeback queues continuously saturated. In `conv_int8`, intermediate requantization casts on the Planar Engine create distinct computational phases, allowing the convolution engine to log $105\text{M}$ unstalled cycles. Total pipeline cycles (Compute + Stalls) account for 100% of runtime across all variants.*
+| Variant | Precision | Latency | Speed (TOPS) | Output Stalls (`[15]`) | DMA Traffic (`[17]`) | Throughput / Core (`[10]`) | Total Chip Throughput | Peak Saturation |
+| :--- | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| **ANE FP16** | Float16 | 205.48 ms | **18.81** | 5,346,498,518 | 350.10 MB | **248.9 MACs/cyc/core** | 3,982.2 MACs/cycle | **97.22%** (of 256 peak) |
+| **ANE INT8** | Int8 | 101.67 ms | **38.02** 🏆 | 1,914,275,704 | 173.11 MB | **503.4 MACs/cyc/core** | 8,054.1 MACs/cycle | **98.32%** (of 512 peak) |
 
-#### Cache-Resident Benchmark ($H=64, W=64$, L=10 Layers)
-*When intermediate feature maps ($\sim 1.0\text{ MB}$) fit entirely within on-chip L2 SRAM ($\sim 4-8\text{ MB}$), output stalls collapse by $>16\times$ and unstalled compute cycles become directly visible:*
+> 🏆 **Record Peak Reached**: Native INT8 achieves **38.02 TOPS**, hitting **100.05% of Apple's advertised 38 TOPS ceiling** on Apple M4 Pro silicon, with each of the 16 cores executing **503.4 MACs / cycle** out of the 512 physical hardware maximum.
 
-| Variant ($64\times 64$, L=10) | Latency | Speed (TOPS) | Compute Cycles (`[13]`) | Output Stalls (`[15]`) | DMA Traffic (`[17]`) | ALU Efficiency |
-| :--- | ---: | ---: | ---: | ---: | ---: | ---: |
-| **ANE FP16** | 1.15 ms | **10.50** | 463,416 | 15,587,386 | 1.80 MB | 13,033.2 MACs/cyc |
-| **ANE INT8** | 0.77 ms | **15.72** | 484,910 | 7,547,107 | 1.23 MB | 12,455.5 MACs/cyc |
+#### 2. Standard Benchmark ($C=128, H=256, W=256, L=20$ Layers)
+*Workload: 20 chained 3×3 Conv layers on `[1, 128, 256, 256]` tensor (386.55 GOPs / 0.3865 TOPs per pass)*
+
+| Variant | Device | Latency | Speed (TOPS) | Compute Cycles* | Output Stalls | Planar Cycles (L2PE) | DMA Traffic | Throughput / Core (`[10]`) |
+| :--- | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| **GPU FP16** | Metal GPU | 39.13 ms | **9.88** | — | — | — | — | — |
+| **ANE FP16** | Physical ANE | 20.61 ms | **18.76** | 157,200* | 503,317,431 | 10,494,464 | 34.99 MB | **248.2 MACs/cyc/core** (97.0%) |
+| **ANE INT8** | Physical ANE | 10.78 ms | **35.87** | 105,045,873 | 233,509,350 | 5,247,232 | 18.35 MB | **472.0 MACs/cyc/core** (92.2%) |
+| **ANE QDQ** | Physical ANE | 20.78 ms | **18.60** | 5,010,176 | 627,454,283 | 5,249,536 | 35.27 MB | **246.1 MACs/cyc/core** (96.1%) |
+
+*\*Note on Compute Cycles: Under memory-bound workloads (16 MB intermediate feature maps spilling on-chip L2 SRAM to DRAM), `kANE_NE_COMPUTE_CYCLES` is clock-gated OFF during the 503M output writeback stall cycles. In `conv_fp16`, back-to-back convolutions keep output writeback queues continuously saturated. In `conv_int8`, intermediate requantization casts on the Planar Engine create distinct computational phases, allowing the convolution engine to log 105M unstalled cycles. Total pipeline cycles (Compute + Stalls) account for 100% of runtime across all variants.*
+
+#### 3. Cache-Resident Benchmark ($C=128, H=64, W=64, L=10$ Layers)
+*When intermediate feature maps (~1.0 MB) fit entirely within on-chip L2 SRAM (~4–8 MB), output stalls collapse by >16× and unstalled compute cycles become directly visible:*
+
+| Variant (64×64, L=10) | Latency | Speed (TOPS) | Compute Cycles (`[13]`) | Output Stalls (`[15]`) | DMA Traffic (`[17]`) | Throughput / Core (`[10]`) | Total Chip Throughput |
+| :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| **ANE FP16** | 1.15 ms | **10.50** | 463,416 | 15,587,386 | 1.80 MB | **156.5 MACs/cyc/core** | 2,504.0 MACs/cyc (61.1% peak) |
+| **ANE INT8** | 0.77 ms | **15.72** | 484,910 | 7,547,107 | 1.23 MB | **212.2 MACs/cyc/core** | 3,395.2 MACs/cyc (41.5% peak) |
 
 > **Key Architectural Observations from Silicon PMU:**
-> 1. **Peak INT8 Realization**: Native INT8 delivers **35.87 TOPS** on Apple M4 Pro, hitting ~94.4% of Apple's advertised 38 TOPS hardware ceiling.
-> 2. **Integer Scaling & DMA Reduction**: INT8 doubles throughput over FP16 (35.87 vs 18.76 TOPS) and cuts Unified Memory DMA traffic directly in half (18.35 MB vs 34.99 MB).
-> 3. **Output Backpressure Stalls**: Because $128 \times 256 \times 256$ feature maps ($16\text{ MB}$) exceed on-chip L2 SRAM ($\sim 4 - 8\text{ MB}$), large spatial maps incur output backpressure to DRAM (`kANE_NE_OUTPUT_STALL_CYCLES`). Halving tensor size in INT8 cuts output stalls by $>2.1\times$ (503M $\to$ 233M cycles).
-> 4. **L2 SRAM Fitting**: Reducing spatial dimensions to fit inside L2 SRAM ($H=64, W=64$) collapses output writeback stalls by $>16\times$ ($15.5\text{M}$ cycles) and unlocks peak ALU utilization ($>12,400\text{ MACs / cycle}$ across 16 cores, $>75\%$ theoretical saturation).
-> 5. **QDQ Execution**: In QDQ (`dequantize -> conv -> quantize`), the internal convolution arithmetic executes in FP16 precision, matching FP16 throughput (~18.60 TOPS) and FP16 DMA footprint (~35.27 MB).
+> 1. **Peak INT8 Realization**: Native INT8 reaches **38.02 TOPS** on Apple M4 Pro (503.4 MACs/cycle/core), fully saturating the 38 TOPS hardware specification (100.05%).
+> 2. **Peak FP16 Realization**: Native FP16 reaches **18.81 TOPS** (248.9 MACs/cycle/core out of 256 physical limit), operating at **97.22% ALU saturation**.
+> 3. **Integer Scaling & DMA Reduction**: INT8 doubles throughput over FP16 and cuts Unified Memory DMA traffic directly in half.
+> 4. **Output Backpressure Stalls**: Because large feature maps exceed on-chip L2 SRAM (~4–8 MB), large spatial maps incur output backpressure to DRAM (`kANE_NE_OUTPUT_STALL_CYCLES`). Halving tensor size in INT8 cuts output stalls by >2.1× (503M → 233M cycles).
+> 5. **L2 SRAM Fitting**: Reducing spatial dimensions to fit inside L2 SRAM ($H=64, W=64$) collapses output writeback stalls by >16× (15.5M cycles). Note that dividing Total MACs by `COMPUTE_CYCLES` (`[13]`) yields an inflated ratio because `[13]` is gated during stalls; the physically bounded metric is Throughput per Nominal Cycle (`[10]`).
+> 6. **QDQ Execution**: In QDQ (`dequantize -> conv -> quantize`), the internal convolution arithmetic executes in FP16 precision, matching FP16 throughput (~18.60 TOPS) and FP16 DMA footprint (~35.27 MB).
 >
 > *(For an exhaustive breakdown of each register, see [`How_to_Interpret_measure_ane_pmu_Numbers.md`](How_to_Interpret_measure_ane_pmu_Numbers.md).)*
 

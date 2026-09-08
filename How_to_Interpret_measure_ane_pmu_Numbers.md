@@ -6,7 +6,7 @@ This report provides a comprehensive microarchitectural guide to interpreting th
 
 ## 1. Executive Summary & Core Telemetry Matrix
 
-When benchmarking a chain of 2D convolutions ($B=1, C=128, H=256, W=256, K=3\times 3, L=20$, totaling **$386.55\text{ GOPs}$ / $193.27\text{ Billion MACs}$**), [`measure_ane_pmu`](file:///Users/freedom/work/measure_ane_capacity/measure_ane_pmu.m) outputs the following comparison matrix:
+When benchmarking a chain of 2D convolutions ($B=1, C=128, H=256, W=256, K=3\times 3, L=20$, totaling **386.55 GOPs / 193.27 Billion MACs**), [`measure_ane_pmu`](file:///Users/freedom/work/measure_ane_capacity/measure_ane_pmu.m) outputs the following comparison matrix:
 
 | Benchmark Variant | Target Silicon | Latency | Realized TOPS | Active Compute (`[13]`) | Output Stalls (`[15]`) | Planar Cycles (`[21]`) | DMA Traffic (`[17]`) |
 | :--- | :--- | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -86,11 +86,19 @@ To correctly interpret PMU registers, one must understand how tensors flow throu
 - **Physical Meaning**: This is the ANE equivalent of the CPU's `CPU_CLK_UNHALTED` / `TSC`. It increments on **every clock edge**, regardless of whether the pipeline is computing, waiting, stalling, or draining.
 - **How to Interpret It**:
   1. **Ground-Truth Hardware Speedup**:
-     $$\text{Silicon Speedup} = \frac{\Delta \mathtt{kANE\_NE\_NOMINAL\_CYCLES}_{\text{FP16}}}{\Delta \mathtt{kANE\_NE\_NOMINAL\_CYCLES}_{\text{INT8}}} = \frac{259.06\text{M}}{135.73\text{M}} = \mathbf{1.908\times}$$
+
+     $$
+     \text{Silicon Speedup} = \frac{\Delta \mathtt{kANE\_NE\_NOMINAL\_CYCLES}_{\text{FP16}}}{\Delta \mathtt{kANE\_NE\_NOMINAL\_CYCLES}_{\text{INT8}}} = \frac{259.06\text{M}}{135.73\text{M}} = \mathbf{1.908\times}
+     $$
+
      Because this counter is measured on silicon by the hardware PLL, it is 100% free of OS context switches, Metal driver command queue overhead, and scheduling jitter.
   2. **DVFS Operating Frequency**:
-     $$\text{Frequency (GHz)} = \frac{\Delta \mathtt{kANE\_NE\_NOMINAL\_CYCLES}}{\text{Hardware Latency (ns)} \times 16\text{ cores}}$$
-     On M4, the Neural Engine clocks dynamically between **$\sim 1.0\text{ GHz}$** (base power state) and **$\sim 1.5 - 2.3\text{ GHz}$** under heavy sustained convolution load.
+
+     $$
+     \text{Frequency (GHz)} = \frac{\Delta \mathtt{kANE\_NE\_NOMINAL\_CYCLES}}{\text{Hardware Latency (ns)} \times 16\text{ cores}}
+     $$
+
+     On M4, the Neural Engine clocks dynamically between **~1.0 GHz** (base power state) and **~1.5 – 2.3 GHz** under heavy sustained convolution load.
 
 ---
 
@@ -102,14 +110,25 @@ To correctly interpret PMU registers, one must understand how tensors flow throu
 - **Why It Can Seem Disproportionately Small**:
   - If a model processes tensors larger than the on-chip L2 SRAM, the writeback buffers stay congested writing out to DRAM.
   - The MAC units compute a burst of results in a handful of cycles, the output FIFO fills up, and the engine halts.
-  - The engine spends 99% of its time waiting in `OUTPUT_STALL`. Only the tiny sliver of unstalled execution increments `kANE_NE_COMPUTE_CYCLES` (e.g., $157\text{K}$ cycles for FP16).
-  - When the tensor fits inside L2 SRAM ($H=64, W=64$), the stalls disappear, and `COMPUTE_CYCLES` jumps to its true value (**$463\text{K} - 485\text{K}$ cycles**).
+  - The engine spends 99% of its time waiting in `OUTPUT_STALL`. Only the tiny sliver of unstalled execution increments `kANE_NE_COMPUTE_CYCLES` (e.g., 157K cycles for FP16).
+  - When the tensor fits inside L2 SRAM ($H=64, W=64$), the stalls disappear, and `COMPUTE_CYCLES` jumps to its true value (**463K – 485K cycles**).
 - **Why `Total MACs / COMPUTE_CYCLES` is an Invalid Metric**:
-  - Dividing total workload operations ($193.27\text{B MACs}$) by gated compute cycles ($157\text{K}$) produces an absurd mathematical artifact: **$1.2\text{ Million MACs/cycle}$** (whereas physical silicon peak across 16 cores is $4,096\text{ MACs/cycle}$ for FP16 and $8,192\text{ MACs/cycle}$ for INT8).
-  - This calculation ignores the $503\text{M}$ stall cycles during which the hardware was stalled waiting to flush to DRAM.
+  - Dividing total workload operations (193.27B MACs) by gated compute cycles (157K) produces an absurd mathematical artifact: **1.2 Million MACs/cycle** (whereas physical silicon peak is 256 MACs/cyc/core for FP16 and 512 MACs/cyc/core for INT8).
+  - This calculation ignores the 503M stall cycles during which the hardware was stalled waiting to flush to DRAM.
   - **The Ground-Truth Metric is Throughput per Nominal Silicon Cycle**:
-    $$\text{Throughput (MACs / cycle)} = \frac{\text{Total MACs}}{\mathtt{kANE\_NE\_NOMINAL\_CYCLES}}$$
-    Yielding **$247.9\text{ MACs / cycle}$** ($15.5\text{ MACs/cyc/core}$) for FP16 vs. **$472.0\text{ MACs / cycle}$** ($29.5\text{ MACs/cyc/core}$) for INT8—demonstrating the exact **$1.90\times$ integer doubling** within physically bounded limits.
+    Because `kANE_NE_NOMINAL_CYCLES` ([10]) records the aggregate reference clock cycles summed across all 16 cores, dividing `Total MACs` by `NOMINAL_CYCLES` directly yields the **Throughput per Core per Cycle**:
+
+    $$
+    \text{Throughput / Core Cycle} = \frac{\text{Total MACs}}{\mathtt{kANE\_NE\_NOMINAL\_CYCLES}}\quad (\text{Target: up to } 256\text{ for FP16, } 512\text{ for INT8})
+    $$
+
+    $$
+    \text{Total Chip Throughput (16 cores)} = 16 \times \frac{\text{Total MACs}}{\mathtt{kANE\_NE\_NOMINAL\_CYCLES}}\quad (\text{Target: up to } 4,096\text{ for FP16, } 8,192\text{ for INT8})
+    $$
+
+    Yielding **248.2 MACs / cycle / core** (3,971.2 MACs / cycle across 16 cores) for FP16 vs. **468.0 – 477.4 MACs / cycle / core** (7,488.0 – 7,638.6 MACs / cycle across 16 cores) for INT8—demonstrating the exact **1.90× integer doubling** within physically bounded limits:
+    - **FP16**: 248.2 MACs/cyc/core out of theoretical peak 256 MACs/cyc/core (**96.95% ALU saturation**).
+    - **INT8**: 468.0 – 477.4 MACs/cyc/core out of theoretical peak 512 MACs/cyc/core (**91.4% – 93.2% ALU saturation**).
 
 ---
 
@@ -118,11 +137,11 @@ To correctly interpret PMU registers, one must understand how tensors flow throu
 - **Microarchitectural Significance**:
   - This is the **primary indicator of DRAM bandwidth starvation and L2 cache capacity overflow**.
   - In our 20-layer benchmark ($H=256, W=256, C=128$):
-    - Each feature map is $1 \times 128 \times 256 \times 256 \times 2\text{ bytes} = \mathbf{16.0\text{ MB}}$.
-    - Because physical L2 SRAM is only $\sim 4-8\text{ MB}$, the $16\text{ MB}$ tensor spills to DRAM.
-    - Result: **$503,317,431$ stall cycles** in FP16.
-    - When moving to INT8, the feature map size drops to **$8.0\text{ MB}$** (50% reduction).
-    - Result: Output stalls drop to **$233,509,350$ cycles** (**$2.15\times$ stall reduction**).
+    - Each feature map is 1 × 128 × 256 × 256 × 2 bytes = **16.0 MB**.
+    - Because physical L2 SRAM is only ~4–8 MB, the 16 MB tensor spills to DRAM.
+    - Result: **503,317,431 stall cycles** in FP16.
+    - When moving to INT8, the feature map size drops to **8.0 MB** (50% reduction).
+    - Result: Output stalls drop to **233,509,350 cycles** (**2.15× stall reduction**).
 
 ---
 
@@ -131,8 +150,8 @@ To correctly interpret PMU registers, one must understand how tensors flow throu
 - **Subsystem Role**:
   - The Planar Engine handles element-wise arithmetic, non-linear activation functions (ReLU, GELU, Sigmoid), pooling, and tensor quantization/dequantization casts.
 - **Interpreting the Numbers**:
-  - **FP16**: $10,494,464\text{ cycles}$
-  - **INT8**: $5,247,232\text{ cycles}$ (**exactly $50.0\%$ of FP16**)
+  - **FP16**: 10,494,464 cycles
+  - **INT8**: 5,247,232 cycles (**exactly 50.0% of FP16**)
   - **Why INT8 takes exactly half the Planar cycles**: In Apple's vector datapath (patent US11200490B2), INT8 channels are packed with double density across the crossbar ports, enabling the vector ALU to process twice as many elements per clock cycle.
 
 ---
@@ -140,9 +159,9 @@ To correctly interpret PMU registers, one must understand how tensors flow throu
 ### 3.5 `kANE_DMA_READWRITE_BYTES` (Index `[17]`)
 - **What It Measures**: Total bytes transferred over the unified memory bus between host DRAM and the ANE's local SRAM.
 - **Interpreting the Numbers**:
-  - **FP16**: $34.99\text{ MB/iteration}$ ($16\text{ MB in} + 16\text{ MB out} + \text{weights/alignment overhead}$).
-  - **INT8**: $18.35\text{ MB/iteration}$ ($8\text{ MB in} + 8\text{ MB out} + \text{weights/alignment overhead}$).
-  - **Ratio**: $\frac{34.99}{18.35} = \mathbf{1.907\times}$ reduction.
+  - **FP16**: 34.99 MB/iteration (16 MB in + 16 MB out + weights/alignment overhead).
+  - **INT8**: 18.35 MB/iteration (8 MB in + 8 MB out + weights/alignment overhead).
+  - **Ratio**: 34.99 / 18.35 = **1.907×** reduction.
   - This proves why INT8 doubles end-to-end throughput: it cuts DRAM memory traffic directly in half.
 
 ---
@@ -166,27 +185,38 @@ Large Tensors (H=256, W=256 | 16 MB/layer)         Cache-Resident Tensors (H=64,
 
 ### Direct Empirical Comparison
 
-| Workload Dimension | Precision | Wall Latency | TOPS | Active Compute (`[13]`) | Output Stalls (`[15]`) | DMA Traffic (`[17]`) | ALU Throughput |
-| :--- | :--- | ---: | ---: | ---: | ---: | ---: | ---: |
-| **Large ($256\times 256$, L=20)** | FP16 | 20.61 ms | **18.76** | 157,200 | 503,317,431 | 34.99 MB | Memory-Gated |
-| **Large ($256\times 256$, L=20)** | INT8 | 10.78 ms | **35.87** | 105,045,873 | 233,509,350 | 18.35 MB | 1,839.9 MACs/cyc |
-| **Small ($64\times 64$, L=10)** | FP16 | 1.15 ms | **10.50** | 463,416 | 15,587,386 | 1.80 MB | 13,033.2 MACs/cyc |
-| **Small ($64\times 64$, L=10)** | INT8 | 0.77 ms | **15.72** | 484,910 | 7,547,107 | 1.23 MB | 12,455.5 MACs/cyc |
+| Workload Dimension | Precision | Latency | TOPS | Output Stalls ([15]) | DMA I/O ([17]) | Throughput / Core ([10]) | Total Chip Throughput | Peak Saturation |
+| :--- | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| **Max Saturation (256×256, C=256, L=50)** | FP16 | 205.48 ms | **18.81** | 5,346,498,518 | 350.10 MB | **248.9 MACs/cyc/core** | 3,982.2 MACs/cycle | **97.22%** (of 256 peak) |
+| **Max Saturation (256×256, C=256, L=50)** | INT8 | 101.67 ms | **38.02** 🏆 | 1,914,275,704 | 173.11 MB | **503.4 MACs/cyc/core** | 8,054.1 MACs/cycle | **98.32%** (of 512 peak) |
+| **Standard (256×256, C=128, L=20)** | FP16 | 20.61 ms | **18.76** | 503,317,431 | 34.99 MB | **248.2 MACs/cyc/core** | 3,971.2 MACs/cycle | **96.95%** (of 256 peak) |
+| **Standard (256×256, C=128, L=20)** | INT8 | 10.78 ms | **35.87** | 233,509,350 | 18.35 MB | **472.0 MACs/cyc/core** | 7,552.0 MACs/cycle | **92.19%** (of 512 peak) |
+| **Cache-Resident (64×64, C=128, L=10)** | FP16 | 1.15 ms | **10.50** | 15,587,386 | 1.80 MB | **156.5 MACs/cyc/core** | 2,504.0 MACs/cycle | **61.13%** (of 256 peak) |
+| **Cache-Resident (64×64, C=128, L=10)** | INT8 | 0.77 ms | **15.72** | 7,547,107 | 1.23 MB | **212.2 MACs/cyc/core** | 3,395.2 MACs/cycle | **41.45%** (of 512 peak) |
+
+> [!NOTE]
+> **Comparing Nominal Clock Cycles ([10]) vs. Gated Active Compute Cycles ([13])**:
+> - The table above evaluates true physical hardware throughput against **Nominal Cycles ([10])**, which represents the unhalted reference clock timebase across all 16 cores.
+> - In earlier analyses, calculating `Total MACs / kANE_NE_COMPUTE_CYCLES ([13])` yielded raw ratios like 1,839.9 MACs/cyc (Large INT8) or >12,400 MACs/cyc (Small). Those inflated numbers occurred because `COMPUTE_CYCLES` is **clock-gated OFF** during pipeline and writeback stalls, and does not represent total elapsed time. The true physical hardware ceilings are **256 MACs / cycle / core for FP16** and **512 MACs / cycle / core for INT8**.
 
 ### Insights Revealed:
-1. **At $H=256, W=256$**:
-   - The workload is **memory-bandwidth bound**.
-   - INT8 is $2\times$ faster not just because it uses dual integer multipliers, but because **it cuts the DRAM transfer bottleneck and output stalls by $50\%$**.
-2. **At $H=64, W=64$**:
-   - The workload is **L2 SRAM cache-resident**.
-   - Output stalls collapse by over $16\times$ ($15.5\text{M}$ cycles).
-   - Effective throughput reaches **$>12,400\text{ MACs / cycle}$** across the 16 cores ($>775\text{ MACs / cycle / core}$), operating at over **$75\%$ of theoretical peak ALU saturation**.
+1. **At Maximum Compute Saturation (C=256, H=256, W=256, L=50)**:
+   - Deepening the network and expanding channels maximizes arithmetic intensity and completely amortizes command queue setup.
+   - **Native INT8 hits 38.02 TOPS**, achieving **100.05% of Apple's advertised 38 TOPS ceiling** on M4 Pro silicon. The 16 cores maintain **503.4 MACs / cycle / core** (**98.32% of the theoretical 512 MACs/core limit**).
+   - **Native FP16 hits 18.81 TOPS**, achieving **99.0% of Apple's rated 19 TOPS FP16 limit**, with each core maintaining **248.9 MACs / cycle / core** (**97.22% of the 256 MACs/core limit**).
+2. **At Standard Dimensions (C=128, H=256, W=256, L=20)**:
+   - Intermediate feature maps (16 MB for FP16, 8 MB for INT8) exceed on-chip L2 SRAM (~4–8 MB) and spill to DRAM.
+   - INT8 is nearly 2× faster (10.78 ms vs 20.61 ms) because it halves the DMA footprint (18.35 MB vs 34.99 MB) and cuts output writeback stalls by >2.1× (233M vs 503M cycles).
+3. **At Small Dimensions (C=128, H=64, W=64, L=10)**:
+   - The workload fits comfortably within on-chip L2 SRAM (~1 MB per layer).
+   - Output stalls collapse by over 16× (15.5M cycles for FP16, 7.5M for INT8).
+   - Because the workload duration is short (~0.8 – 1.3 ms), driver execution overhead represents a larger proportion of total nominal clock cycles, resulting in lower sustained ALU saturation (41% – 61%).
 
 ---
 
 ## 5. Native INT8 vs. Quantize-Dequantize (QDQ)
 
-A common point of confusion is why QDQ (`dequantizeTensor` $\to$ `conv2D` $\to$ `quantizeTensor`) does not match Native INT8 performance. The PMU counters explain this unambiguously:
+A common point of confusion is why QDQ (`dequantizeTensor` → `conv2D` → `quantizeTensor`) does not match Native INT8 performance. The PMU counters explain this unambiguously:
 
 ```
 Native INT8 Pipeline:
@@ -199,7 +229,7 @@ QDQ Pipeline:
 ```
 
 1. **Arithmetic Precision**: In QDQ, `MPSGraph` unrolls the convolution into **FP16 arithmetic**. The supplemental integer multiplier `MULB` is clock-gated OFF, halving peak compute throughput.
-2. **DMA Footprint**: The intermediate dequantized activations are expanded to 16-bit floating-point, resulting in **$35.27\text{ MB}$ of DMA traffic** (virtually identical to pure FP16's $34.99\text{ MB}$).
+2. **DMA Footprint**: The intermediate dequantized activations are expanded to 16-bit floating-point, resulting in **35.27 MB of DMA traffic** (virtually identical to pure FP16's 34.99 MB).
 3. **Conclusion**: To unlock the 38 TOPS ceiling on Apple M4, models **must use Native INT8 tensor contracts** (`MPSDataTypeInt8` input and weights) rather than simulated float dequantization wrappers.
 
 ---
@@ -229,8 +259,8 @@ graph TD
     G --> G1["Model is dominated by elementwise math, GELU, LayerNorm, or casts"]
     G1 --> G2["Action: Fuse activations into conv descriptors or use native INT8 casts"]
 
-    F -- No --> H["Compute Saturated (Optimal!"]
-    H --> H1["Model is achieving peak MAC utilization (>10,000 MACs/cycle)"]
+    F -- No --> H["Compute Saturated (Optimal)!"]
+    H --> H1["Model is achieving peak MAC utilization (>7,500 - 8,000 MACs/cycle)"]
 ```
 
 ---
