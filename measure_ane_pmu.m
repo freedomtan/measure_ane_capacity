@@ -535,9 +535,10 @@ static BenchResult benchmarkVariant(const BenchConfig *cfg, id<MTLDevice> dev,
 
         double totalMacs = totalOps / 2.0;
         printf("   • Total MAC Operations       : %'.0f MACs\n", totalMacs);
-        if (res.computeCycles > 0) {
-            double macsPerCycle = totalMacs / (double)res.computeCycles;
-            printf("   • Effective Throughput       : %.1f MACs / ANE cycle (across 16 cores)\n", macsPerCycle);
+        if (nominalCycles > 0) {
+            double macsPerNominalCycle = totalMacs / (double)nominalCycles;
+            printf("   • Throughput / Silicon Cycle : %.1f MACs / cycle (%.1f MACs / cycle / core across 16 cores)\n",
+                   macsPerNominalCycle, macsPerNominalCycle / 16.0);
         }
 
         [client unloadModel:model options:@{} qos:25 error:nil];

@@ -104,6 +104,12 @@ To correctly interpret PMU registers, one must understand how tensors flow throu
   - The MAC units compute a burst of results in a handful of cycles, the output FIFO fills up, and the engine halts.
   - The engine spends 99% of its time waiting in `OUTPUT_STALL`. Only the tiny sliver of unstalled execution increments `kANE_NE_COMPUTE_CYCLES` (e.g., $157\text{K}$ cycles for FP16).
   - When the tensor fits inside L2 SRAM ($H=64, W=64$), the stalls disappear, and `COMPUTE_CYCLES` jumps to its true value (**$463\text{K} - 485\text{K}$ cycles**).
+- **Why `Total MACs / COMPUTE_CYCLES` is an Invalid Metric**:
+  - Dividing total workload operations ($193.27\text{B MACs}$) by gated compute cycles ($157\text{K}$) produces an absurd mathematical artifact: **$1.2\text{ Million MACs/cycle}$** (whereas physical silicon peak across 16 cores is $4,096\text{ MACs/cycle}$ for FP16 and $8,192\text{ MACs/cycle}$ for INT8).
+  - This calculation ignores the $503\text{M}$ stall cycles during which the hardware was stalled waiting to flush to DRAM.
+  - **The Ground-Truth Metric is Throughput per Nominal Silicon Cycle**:
+    $$\text{Throughput (MACs / cycle)} = \frac{\text{Total MACs}}{\mathtt{kANE\_NE\_NOMINAL\_CYCLES}}$$
+    Yielding **$247.9\text{ MACs / cycle}$** ($15.5\text{ MACs/cyc/core}$) for FP16 vs. **$472.0\text{ MACs / cycle}$** ($29.5\text{ MACs/cyc/core}$) for INT8—demonstrating the exact **$1.90\times$ integer doubling** within physically bounded limits.
 
 ---
 
