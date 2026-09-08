@@ -86,18 +86,15 @@ To correctly interpret PMU registers, one must understand how tensors flow throu
 - **Physical Meaning**: This is the ANE equivalent of the CPU's `CPU_CLK_UNHALTED` / `TSC`. It increments on **every clock edge**, regardless of whether the pipeline is computing, waiting, stalling, or draining.
 - **How to Interpret It**:
   1. **Ground-Truth Hardware Speedup**:
-
-     $$
-     \text{Silicon Speedup} = \frac{\Delta \mathtt{kANE\_NE\_NOMINAL\_CYCLES}_{\text{FP16}}}{\Delta \mathtt{kANE\_NE\_NOMINAL\_CYCLES}_{\text{INT8}}} = \frac{259.06\text{M}}{135.73\text{M}} = \mathbf{1.908\times}
-     $$
-
+     ```
+     Silicon Speedup = Δ kANE_NE_NOMINAL_CYCLES (FP16) / Δ kANE_NE_NOMINAL_CYCLES (INT8)
+                     = 259.06M / 135.73M = 1.908×
+     ```
      Because this counter is measured on silicon by the hardware PLL, it is 100% free of OS context switches, Metal driver command queue overhead, and scheduling jitter.
   2. **DVFS Operating Frequency**:
-
-     $$
-     \text{Frequency (GHz)} = \frac{\Delta \mathtt{kANE\_NE\_NOMINAL\_CYCLES}}{\text{Hardware Latency (ns)} \times 16\text{ cores}}
-     $$
-
+     ```
+     Frequency (GHz) = Δ kANE_NE_NOMINAL_CYCLES / (Hardware Latency (ns) × 16 cores)
+     ```
      On M4, the Neural Engine clocks dynamically between **~1.0 GHz** (base power state) and **~1.5 – 2.3 GHz** under heavy sustained convolution load.
 
 ---
@@ -117,15 +114,13 @@ To correctly interpret PMU registers, one must understand how tensors flow throu
   - This calculation ignores the 503M stall cycles during which the hardware was stalled waiting to flush to DRAM.
   - **The Ground-Truth Metric is Throughput per Nominal Silicon Cycle**:
     Because `kANE_NE_NOMINAL_CYCLES` ([10]) records the aggregate reference clock cycles summed across all 16 cores, dividing `Total MACs` by `NOMINAL_CYCLES` directly yields the **Throughput per Core per Cycle**:
+    ```
+    Throughput / Core Cycle          = Total MACs / kANE_NE_NOMINAL_CYCLES
+                                       (Target: up to 256 for FP16, 512 for INT8)
 
-    $$
-    \text{Throughput / Core Cycle} = \frac{\text{Total MACs}}{\mathtt{kANE\_NE\_NOMINAL\_CYCLES}}\quad (\text{Target: up to } 256\text{ for FP16, } 512\text{ for INT8})
-    $$
-
-    $$
-    \text{Total Chip Throughput (16 cores)} = 16 \times \frac{\text{Total MACs}}{\mathtt{kANE\_NE\_NOMINAL\_CYCLES}}\quad (\text{Target: up to } 4,096\text{ for FP16, } 8,192\text{ for INT8})
-    $$
-
+    Total Chip Throughput (16 cores) = 16 × (Total MACs / kANE_NE_NOMINAL_CYCLES)
+                                       (Target: up to 4,096 for FP16, 8,192 for INT8)
+    ```
     Yielding **248.2 MACs / cycle / core** (3,971.2 MACs / cycle across 16 cores) for FP16 vs. **468.0 – 477.4 MACs / cycle / core** (7,488.0 – 7,638.6 MACs / cycle across 16 cores) for INT8—demonstrating the exact **1.90× integer doubling** within physically bounded limits:
     - **FP16**: 248.2 MACs/cyc/core out of theoretical peak 256 MACs/cyc/core (**96.95% ALU saturation**).
     - **INT8**: 468.0 – 477.4 MACs/cyc/core out of theoretical peak 512 MACs/cyc/core (**91.4% – 93.2% ALU saturation**).
