@@ -2,9 +2,14 @@ CC = clang
 CFLAGS = -fobjc-arc -O3
 FRAMEWORKS = -framework Foundation -framework Metal -framework MetalPerformanceShadersGraph
 LDFLAGS = ${FRAMEWORKS}
-TARGETS  = measure_conv_fp16 measure_conv measure_conv_universal measure_conv_qdq measure_conv_swift
+ANE_FRAMEWORKS = -F/System/Library/PrivateFrameworks -framework AppleNeuralEngine -framework IOSurface -framework IOKit -framework Security
+TARGETS  = measure_conv_fp16 measure_conv measure_conv_universal measure_conv_qdq measure_conv_swift measure_ane_pmu
 
 all: ${TARGETS}
+
+measure_ane_pmu: measure_ane_pmu.m
+	$(CC) $(CFLAGS) $(FRAMEWORKS) $(ANE_FRAMEWORKS) measure_ane_pmu.m -o measure_ane_pmu
+	codesign -s - --entitlements entitlements.plist -f measure_ane_pmu
 
 measure_conv_fp16: measure_conv_fp16.m
 
@@ -19,3 +24,4 @@ measure_conv_swift: measure_conv.swift
 
 clean:
 	rm -f ${TARGETS} measure_conv_ios
+	rm -rf packages/

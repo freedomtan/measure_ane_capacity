@@ -1,0 +1,14 @@
+# Compiled binaries
+measure_conv
+measure_conv_fp16
+measure_conv_universal
+measure_conv_qdq
+measure_conv_swift
+measure_conv_ios
+measure_ane_pmu
+
+# Build artifacts and packages
+*.o
+*.dSYM
+packages/
+.DS_Store
