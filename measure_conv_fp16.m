@@ -11,6 +11,25 @@
 + (instancetype)ANEDevice;
 @end
 
+// Fill buffer with small non-zero values to prevent hardware zero-skipping on H17/H18.
+static void fillNonZeroData(void *buffer, size_t byteCount, MPSDataType dataType) {
+  if (!buffer || byteCount == 0) return;
+  if (dataType == MPSDataTypeFloat16) {
+    uint16_t *p = (uint16_t *)buffer;
+    size_t count = byteCount / sizeof(uint16_t);
+    static const uint16_t fp16_pattern[4] = {0x2C00, 0xAC00, 0x2800, 0xA800};
+    for (size_t i = 0; i < count; i++) {
+      p[i] = fp16_pattern[i % 4];
+    }
+  } else {
+    int8_t *p = (int8_t *)buffer;
+    static const int8_t int8_pattern[4] = {1, -1, 2, -2};
+    for (size_t i = 0; i < byteCount; i++) {
+      p[i] = int8_pattern[i % 4];
+    }
+  }
+}
+
 /**
  * Runs the Conv2D benchmark on the specified device.
  *
@@ -50,8 +69,9 @@ void run_bench(id<MTLDevice> device, bool useANE) {
     // Use FP16 (2 bytes per element) for better performance on ANE/GPU
     NSUInteger elementSize = 2;
 
-    // Create constant weights tensor filled with zeros (allocation only, content doesn't matter for perf)
+    // Create constant weights tensor filled with non-zero values (required on H17+ to prevent hardware zero-skipping)
     NSMutableData *wData = [NSMutableData dataWithLength:Co * Ci * K * K * elementSize];
+    fillNonZeroData(wData.mutableBytes, wData.length, MPSDataTypeFloat16);
     MPSGraphTensor *w = [graph constantWithData:wData shape:wShape dataType:MPSDataTypeFloat16];
 
     // --- Graph Construction ---
@@ -96,6 +116,7 @@ void run_bench(id<MTLDevice> device, bool useANE) {
     // --- Execution Setup ---
     // Allocate input buffer on the GPU/Shared memory
     id<MTLBuffer> iBuf = [device newBufferWithLength:B * H * W * Ci * elementSize options:0];
+    fillNonZeroData(iBuf.contents, iBuf.length, MPSDataTypeFloat16);
     // Wrap buffer in MPSGraphTensorData
     MPSGraphTensorData *iData = [[MPSGraphTensorData alloc] initWithMTLBuffer:iBuf
                                                                         shape:inShape

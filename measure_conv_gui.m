@@ -7,6 +7,24 @@
 + (instancetype)ANEDevice;
 @end
 
+static void fillNonZeroData(void *buffer, size_t byteCount, MPSDataType dataType) {
+  if (!buffer || byteCount == 0) return;
+  if (dataType == MPSDataTypeFloat16) {
+    uint16_t *ptr = (uint16_t *)buffer;
+    size_t count = byteCount / sizeof(uint16_t);
+    const uint16_t patterns[4] = {0x2C00, 0xAC00, 0x2800, 0xA800};
+    for (size_t i = 0; i < count; i++) {
+      ptr[i] = patterns[i & 3];
+    }
+  } else {
+    int8_t *ptr = (int8_t *)buffer;
+    const int8_t patterns[4] = {1, -1, 2, -2};
+    for (size_t i = 0; i < byteCount; i++) {
+      ptr[i] = patterns[i & 3];
+    }
+  }
+}
+
 // --- Benchmarking Logic (Refactored for GUI) ---
 @interface Benchmarker : NSObject
 - (void)runAtIndex:(NSInteger)index logHandler:(void (^)(NSString *))log;
@@ -88,6 +106,7 @@
     NSUInteger elementSize = (wType == MPSDataTypeFloat16) ? 2 : 1;
     NSMutableData *wData =
         [NSMutableData dataWithLength:Co * Ci * K * K * elementSize];
+    fillNonZeroData(wData.mutableBytes, wData.length, wType);
     MPSGraphTensor *w = [graph constantWithData:wData
                                           shape:wShape
                                        dataType:wType];
@@ -149,6 +168,7 @@
     id<MTLBuffer> iBuf =
         [device newBufferWithLength:B * H * W * Ci * inputElementSize
                             options:0];
+    fillNonZeroData(iBuf.contents, iBuf.length, dataType);
     MPSGraphTensorData *iData =
         [[MPSGraphTensorData alloc] initWithMTLBuffer:iBuf
                                                 shape:inShape

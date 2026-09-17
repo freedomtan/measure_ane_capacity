@@ -13,6 +13,24 @@ extension MPSGraphDevice {
     }
 }
 
+func fillNonZeroData(buffer: UnsafeMutableRawPointer, byteCount: Int, dataType: MPSDataType) {
+    guard byteCount > 0 else { return }
+    if dataType == .float16 {
+        let ptr = buffer.bindMemory(to: UInt16.self, capacity: byteCount / 2)
+        let count = byteCount / 2
+        let patterns: [UInt16] = [0x2C00, 0xAC00, 0x2800, 0xA800]
+        for i in 0..<count {
+            ptr[i] = patterns[i & 3]
+        }
+    } else {
+        let ptr = buffer.bindMemory(to: Int8.self, capacity: byteCount)
+        let patterns: [Int8] = [1, -1, 2, -2]
+        for i in 0..<byteCount {
+            ptr[i] = patterns[i & 3]
+        }
+    }
+}
+
 func runBench(device: MTLDevice, useANE: Bool, dataType: MPSDataType, name: String) {
     let graph = MPSGraph()
 
@@ -36,6 +54,7 @@ func runBench(device: MTLDevice, useANE: Bool, dataType: MPSDataType, name: Stri
     // Weights allocation
     let wLength = Co.intValue * Ci.intValue * K.intValue * K.intValue * elementSize
     let wData = NSMutableData(length: wLength)!
+    fillNonZeroData(buffer: wData.mutableBytes, byteCount: wLength, dataType: dataType)
     let w = graph.constant(wData as Data, shape: wShape, dataType: dataType)
 
     for _ in 0..<L {
@@ -80,6 +99,7 @@ func runBench(device: MTLDevice, useANE: Bool, dataType: MPSDataType, name: Stri
     
     let bufferLength = B.intValue * H.intValue * W.intValue * Ci.intValue * elementSize
     let iBuf = device.makeBuffer(length: bufferLength, options: [])!
+    fillNonZeroData(buffer: iBuf.contents(), byteCount: bufferLength, dataType: dataType)
     
     // Fix argument label (likely just '(_:shape:dataType:)')
     let iData = MPSGraphTensorData(iBuf, shape: inShape, dataType: dataType)

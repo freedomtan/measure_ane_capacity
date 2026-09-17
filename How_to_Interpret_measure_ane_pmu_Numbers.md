@@ -229,7 +229,40 @@ QDQ Pipeline:
 
 ---
 
-## 6. Performance Diagnostic Playbook
+## 6. Zero-Skipping & Lossless Compression on H17+ Architectures
+
+A critical architectural change introduced in **H17 (A18 Pro)** and extended in **H18 (A19 Pro, M5)** is the hardware **lossless zero-compression** and **zero-skipping** pipeline:
+
+```
+H16 (M4 Pro / A17 Pro) - Dense Execution:
+[Buffer: 0x00 (Zeros)] ──► [DMA Transfers Full Bytes] ──► [MAC Arrays Execute All Zeros] ──► Dense TOPS (~18.8 / ~38.0)
+
+H17+ (A18 Pro / A19 Pro) with All-Zero Input (Synthetic Shortcut):
+[Buffer: 0x00 (Zeros)] ──► [Lossless Zero-Compression] ──► [Hardware Zero-Skipping Logic] ──► Inflated TOPS (~44.4 / ~63.2)
+                              (DMA Bypassed)              (ALU MACs Dropped)
+
+H17+ with Non-Zero Initialization (True Dense Execution):
+[Buffer: Non-Zero]     ──► [Full DMA Transfers]       ──► [Physical MAC Computation]     ──► True Dense TOPS (~24.5 / ~51.6)
+```
+
+### 6.1 Microarchitectural Mechanism
+1. **DMA Zero-Compression (`[17] kANE_DMA_READWRITE_BYTES`)**:
+   When memory pages are zero-filled (`0x00`), the DMA engine detects zero-blocks and transmits metadata headers without moving the 16-bit or 8-bit payload bytes across Unified Memory. This dramatically suppresses `[17] kANE_DMA_READWRITE_BYTES`.
+2. **ALU Zero-Skipping (`[13] kANE_NE_COMPUTE_CYCLES`)**:
+   The Activation Feeder (AF) and Convolution Engine include zero-detection gates. When either the weight tensor or activation tile is zero, the multiplication and accumulation cycles are bypassed.
+3. **The Benchmarking Trap**:
+   In Objective-C and Swift, allocating buffers via `[NSMutableData dataWithLength:]` or `[device newBufferWithLength:options:]` yields memory that the OS kernel automatically zeroes out for security. On H16 and earlier, this did not affect ALU cycles because the hardware processed all zeros through the MAC matrices. On H17 and later, however, zero-skipping resulted in artificially inflated measurements (e.g. ~44.4 TOPS FP16 and ~63.2 TOPS QDQ).
+
+### 6.2 The Non-Zero Solution
+To benchmark the true dense hardware capacity on H17 and later, all buffers must be populated with non-zero values. To prevent activation values from exploding or underflowing across 20–50 consecutive convolution layers, this repository uses bounded alternating patterns:
+- **FP16**: `+0.0625` (`0x2C00`), `-0.0625` (`0xAC00`), `+0.03125` (`0x2800`), `-0.03125` (`0xA800`)
+- **INT8**: `+1`, `-1`, `+2`, `-2`
+
+Under this dense initialization, H17 and H18 measure true dense capacity: **~24.5 TOPS FP16** and **~51.6 TOPS INT8** (via 1D Winograd $F(2, 3)$).
+
+---
+
+## 7. Performance Diagnostic Playbook
 
 Use this flowchart to interpret metrics from [`measure_ane_pmu`](file:///Users/freedom/work/measure_ane_capacity/measure_ane_pmu.m) on any neural network:
 
@@ -260,7 +293,7 @@ graph TD
 
 ---
 
-## 7. Complete 29-Register Telemetry Reference Table
+## 8. Complete 29-Register Telemetry Reference Table
 
 | Index | Register Constant Name | Subsystem | Physical Semantic Meaning |
 | :---: | :--- | :--- | :--- |

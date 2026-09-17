@@ -177,6 +177,27 @@ static IOSurfaceRef createIOSurface(size_t allocSize) {
     return IOSurfaceCreate((CFDictionaryRef)props);
 }
 
+// --- Helper: Non-Zero Buffer Initialization (Required for H17+ to prevent hardware zero-skipping) ---
+static void fillNonZeroData(void *buffer, size_t byteCount, MPSDataType dataType) {
+    if (!buffer || byteCount == 0) return;
+    if (dataType == MPSDataTypeFloat16) {
+        uint16_t *p = (uint16_t *)buffer;
+        size_t count = byteCount / sizeof(uint16_t);
+        // Alternating small FP16 numbers: +0.0625 (0x2C00), -0.0625 (0xAC00), +0.03125 (0x2800), -0.03125 (0xA800)
+        static const uint16_t fp16_pattern[4] = {0x2C00, 0xAC00, 0x2800, 0xA800};
+        for (size_t i = 0; i < count; i++) {
+            p[i] = fp16_pattern[i % 4];
+        }
+    } else {
+        // INT8 or raw bytes: small alternating values (+1, -1, +2, -2)
+        int8_t *p = (int8_t *)buffer;
+        static const int8_t int8_pattern[4] = {1, -1, 2, -2};
+        for (size_t i = 0; i < byteCount; i++) {
+            p[i] = int8_pattern[i % 4];
+        }
+    }
+}
+
 // --- Helper: Find Latest ANE Temp Directory ---
 static NSSet<NSString *> *getExistingANETempDirs(void) {
     NSFileManager *fm = [NSFileManager defaultManager];
@@ -256,7 +277,7 @@ static BenchResult benchmarkVariant(const BenchConfig *cfg, id<MTLDevice> dev,
     printf("\n========================================================================================================\n");
     printf("🚀 BENCHMARK: %s | Dimensions: [%lu, %lu, %lu, %lu] -> Conv %lux%lu (L=%lu) -> [%lu, %lu, %lu, %lu]\n",
            variantName.UTF8String, B, Ci, H, W, K, K, L, B, Co, H, W);
-    printf("   Workload: %.2f GOPs (%.4f TOPs) per inference pass\n", totalOps / 1e9, totalOps / 1e12);
+    printf("   Workload: %.2f GOPs (%.4f TOPs) per inference pass (Non-Zero Initialized for H17+ Accuracy)\n", totalOps / 1e9, totalOps / 1e12);
     printf("========================================================================================================\n");
 
     // --- 1. Construct MPSGraph ---
@@ -268,6 +289,7 @@ static BenchResult benchmarkVariant(const BenchConfig *cfg, id<MTLDevice> dev,
     NSUInteger weightElementSize = (isQDQ || dataType == MPSDataTypeFloat16) ? 2 : 1;
     MPSDataType weightType = (isQDQ) ? MPSDataTypeFloat16 : dataType;
     NSMutableData *wData = [NSMutableData dataWithLength:Co * Ci * K * K * weightElementSize];
+    fillNonZeroData(wData.mutableBytes, wData.length, weightType);
     MPSGraphTensor *w = [graph constantWithData:wData shape:wShape dataType:weightType];
 
     MPSGraphConvolution2DOpDescriptor *convDesc = [MPSGraphConvolution2DOpDescriptor
@@ -310,6 +332,7 @@ static BenchResult benchmarkVariant(const BenchConfig *cfg, id<MTLDevice> dev,
         MPSGraphExecutable *gpuExe = [graph compileWithDevice:gpuDev feeds:feeds targetTensors:@[cur] targetOperations:nil compilationDescriptor:gpuCd];
         if (gpuExe) {
             id<MTLBuffer> iBuf = [dev newBufferWithLength:B * H * W * Ci * ((dataType == MPSDataTypeFloat16)?2:1) options:0];
+            fillNonZeroData(iBuf.contents, iBuf.length, dataType);
             MPSGraphTensorData *iData = [[MPSGraphTensorData alloc] initWithMTLBuffer:iBuf shape:inShape dataType:dataType];
             id<MTLCommandQueue> q = [dev newCommandQueue];
             MPSGraphExecutableExecutionDescriptor *ed = [MPSGraphExecutableExecutionDescriptor new];
@@ -352,6 +375,7 @@ static BenchResult benchmarkVariant(const BenchConfig *cfg, id<MTLDevice> dev,
 
     // Warm-up dispatch via Metal Queue (triggers ANE region emission to temp storage)
     id<MTLBuffer> mtlInBuf = [dev newBufferWithLength:B * H * W * Ci * ((dataType == MPSDataTypeFloat16)?2:1) options:0];
+    fillNonZeroData(mtlInBuf.contents, mtlInBuf.length, dataType);
     MPSGraphTensorData *mtlInData = [[MPSGraphTensorData alloc] initWithMTLBuffer:mtlInBuf shape:inShape dataType:dataType];
     id<MTLCommandQueue> aneQueue = [dev newCommandQueue];
     MPSGraphExecutableExecutionDescriptor *aneEd = [MPSGraphExecutableExecutionDescriptor new];
@@ -456,6 +480,10 @@ static BenchResult benchmarkVariant(const BenchConfig *cfg, id<MTLDevice> dev,
         size_t outBytes = B * H * W * Co * outElementSize;
 
         IOSurfaceRef inSurf = createIOSurface(inBytes);
+        IOSurfaceLock(inSurf, 0, NULL);
+        fillNonZeroData(IOSurfaceGetBaseAddress(inSurf), inBytes, (isQDQ ? MPSDataTypeInt8 : dataType));
+        IOSurfaceUnlock(inSurf, 0, NULL);
+
         IOSurfaceRef outSurf = createIOSurface(outBytes);
         IOSurfaceRef pmuSurf = createIOSurface(4096);
 

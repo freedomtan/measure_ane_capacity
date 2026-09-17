@@ -9,6 +9,25 @@
 + (instancetype)ANEDevice;
 @end
 
+// Fill buffer with small non-zero values to prevent hardware zero-skipping on H17/H18.
+static void fillNonZeroData(void *buffer, size_t byteCount, MPSDataType dataType) {
+  if (!buffer || byteCount == 0) return;
+  if (dataType == MPSDataTypeFloat16) {
+    uint16_t *p = (uint16_t *)buffer;
+    size_t count = byteCount / sizeof(uint16_t);
+    static const uint16_t fp16_pattern[4] = {0x2C00, 0xAC00, 0x2800, 0xA800};
+    for (size_t i = 0; i < count; i++) {
+      p[i] = fp16_pattern[i % 4];
+    }
+  } else {
+    int8_t *p = (int8_t *)buffer;
+    static const int8_t int8_pattern[4] = {1, -1, 2, -2};
+    for (size_t i = 0; i < byteCount; i++) {
+      p[i] = int8_pattern[i % 4];
+    }
+  }
+}
+
 /**
  * Runs the Conv2D benchmark with QDQ (Quantization/Dequantization) on the
  * specified device. Input is INT8, dequantized to FP16 for FP16 convolution,
@@ -37,8 +56,9 @@ void run_bench_qdq(id<MTLDevice> device, bool useANE) {
 
     MPSGraphTensor *cur = input;
 
-    // Weights tensor: FP16
+    // Weights tensor: FP16 (non-zero initialized to prevent hardware zero-skipping on H17+)
     NSMutableData *wData = [NSMutableData dataWithLength:Co * Ci * K * K * 2];
+    fillNonZeroData(wData.mutableBytes, wData.length, MPSDataTypeFloat16);
     MPSGraphTensor *w = [graph constantWithData:wData
                                           shape:wShape
                                        dataType:MPSDataTypeFloat16];
@@ -83,8 +103,9 @@ void run_bench_qdq(id<MTLDevice> device, bool useANE) {
     }
 
     // --- Compilation ---
-    MPSGraphDevice *mDev = useANE ? [MPSGraphDevice ANEDevice]
-                                  : [MPSGraphDevice deviceWithMTLDevice:device];
+    MPSGraphDevice *mDev =
+        useANE ? [MPSGraphDevice ANEDevice]
+               : [MPSGraphDevice deviceWithMTLDevice:device];
 
     NSDictionary *feeds = @{
       input : [[MPSGraphShapedType alloc] initWithShape:inShape
@@ -107,6 +128,7 @@ void run_bench_qdq(id<MTLDevice> device, bool useANE) {
 
     // --- Execution ---
     id<MTLBuffer> iBuf = [device newBufferWithLength:B * H * W * Ci options:0];
+    fillNonZeroData(iBuf.contents, iBuf.length, MPSDataTypeInt8);
     MPSGraphTensorData *iData =
         [[MPSGraphTensorData alloc] initWithMTLBuffer:iBuf
                                                 shape:inShape
