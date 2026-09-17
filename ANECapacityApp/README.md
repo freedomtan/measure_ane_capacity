@@ -68,20 +68,18 @@ Open `ANECapacityApp.xcodeproj` in Xcode:
 ```bash
 open ANECapacityApp/ANECapacityApp.xcodeproj
 ```
-Select your connected iPhone or an iOS Simulator, and press **Run (Cmd+R)**.
+Select your connected iPhone or iPad, and press **Run (Cmd+R)**.
 
 ### Method 2: Command Line (Makefile)
 From `~/work/measure_ane_capacity/`:
-
-- **Build for iOS Simulator**:
-  ```bash
-  make app-sim
-  ```
 
 - **Build for Connected iOS Physical Device**:
   ```bash
   make app
   ```
+
+> [!NOTE]
+> Physical Apple Neural Engine (ANE) silicon and PMU performance counters require a physical iPhone or iPad device (not supported in the iOS Simulator).
 
 ---
 
