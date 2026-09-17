@@ -41,7 +41,7 @@ struct BenchmarkView: View {
                     .padding()
                 }
             }
-            .navigationTitle("ANE Capacity Benchmark")
+            .navigationTitle("ANE Capacity")
             .toolbar {
                 ToolbarItem(placement: .navigationBarTrailing) {
                     Button(action: { showConsole.toggle() }) {

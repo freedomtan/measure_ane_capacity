@@ -43,7 +43,65 @@ final class BenchmarkViewModel: ObservableObject {
         if !ANECapacityEngine.shared.hasANE {
             self.selectedTarget = .gpu
         }
+        #if targetEnvironment(simulator)
+        loadSampleResults()
+        #endif
     }
+    
+    #if targetEnvironment(simulator)
+    private func loadSampleResults() {
+        let channelSteps = [32, 64, 128, 256, 512, 1024]
+        let fp16Tops = [3.12, 6.84, 11.45, 14.82, 15.61, 15.84]
+        let int8Tops = [6.24, 13.52, 22.81, 29.64, 31.22, 31.85]
+        
+        for (i, c) in channelSteps.enumerated() {
+            let dims = ConvDimensions(batch: 1, height: 256, width: 256, inChannels: c, outChannels: c, kernelSize: 1, layers: 20)
+            let ops = dims.totalOperations
+            
+            let fpTops = fp16Tops[i]
+            let fpDurSec = ops / (fpTops * 1e12)
+            results.append(BenchmarkResult(
+                dimensions: dims,
+                precision: .fp16,
+                target: .ane,
+                avgDurationMs: fpDurSec * 1000.0,
+                tops: fpTops,
+                iterations: 20,
+                sweepType: .channels,
+                sweepValue: Double(c),
+                sweepLabel: "\(c)c",
+                computeCycles: UInt64(Double(c) * 4200 + 120_000),
+                nominalCycles: UInt64(Double(c) * 4500 + 130_000),
+                outputStallCycles: UInt64(15_000 + i * 8_000),
+                inputStallCycles: UInt64(10_000 + i * 5_000),
+                dmaRwBytes: UInt64(dims.weightsBytes(precision: .fp16) + dims.inputBytes(precision: .fp16)),
+                aluSaturation: min(94.5, 30.0 + Double(i) * 12.5),
+                effectiveClockGhz: 1.80
+            ))
+            
+            let inTops = int8Tops[i]
+            let inDurSec = ops / (inTops * 1e12)
+            results.append(BenchmarkResult(
+                dimensions: dims,
+                precision: .int8,
+                target: .ane,
+                avgDurationMs: inDurSec * 1000.0,
+                tops: inTops,
+                iterations: 20,
+                sweepType: .channels,
+                sweepValue: Double(c),
+                sweepLabel: "\(c)c",
+                computeCycles: UInt64(Double(c) * 3800 + 100_000),
+                nominalCycles: UInt64(Double(c) * 4100 + 110_000),
+                outputStallCycles: UInt64(12_000 + i * 6_000),
+                inputStallCycles: UInt64(8_000 + i * 4_000),
+                dmaRwBytes: UInt64(dims.weightsBytes(precision: .int8) + dims.inputBytes(precision: .int8)),
+                aluSaturation: min(95.2, 32.0 + Double(i) * 12.2),
+                effectiveClockGhz: 1.82
+            ))
+        }
+    }
+    #endif
     
     // Peak metrics
     var peakFP16TOPS: Double {
