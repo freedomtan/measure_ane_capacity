@@ -21,8 +21,29 @@ To clean the build artifacts:
 make clean
 ```
 
-### iOS Build
-To build for iOS, you need to use the `xcrun` command to target the iPhone SDK and sign the binary.
+### iOS Build & ANECapacityApp
+
+The easiest and most comprehensive way to measure ANE capacity and profile silicon PMU registers on an iPhone or iPad is using the bundled SwiftUI application, [**`ANECapacityApp`**](ANECapacityApp/).
+
+#### 1. ANECapacityApp (SwiftUI, Swift Charts & Live PMU Counters)
+
+`ANECapacityApp` provides automated capacity sweeps (Channel, Spatial, Depth, and Kernel sizes), interactive Swift Charts with peak TOPS callouts, dynamic CSV export, and real-time Apple Neural Engine PMU performance counters (Compute Cycles, Memory Stalls, DMA traffic, ALU Saturation).
+
+| 1. Capacity Sweeps | 2. Performance Figures | 3. History & PMU Telemetry | 4. Device Specs & Info |
+| :---: | :---: | :---: | :---: |
+| <img src="ANECapacityApp/screenshots/01_benchmark_tab.png" width="200" alt="Benchmark Tab" /> | <img src="ANECapacityApp/screenshots/02_figures_tab.png" width="200" alt="Figures Tab" /> | <img src="ANECapacityApp/screenshots/03_history_tab.png" width="200" alt="History Tab" /> | <img src="ANECapacityApp/screenshots/04_info_tab.png" width="200" alt="Info Tab" /> |
+
+To build the app for a connected physical device:
+```bash
+make app
+```
+Or open [`ANECapacityApp/ANECapacityApp.xcodeproj`](ANECapacityApp/ANECapacityApp.xcodeproj) in Xcode and press **Run (Cmd+R)** targeting your connected device.
+
+> [!NOTE]
+> Physical Apple Neural Engine silicon and PMU performance counters require a physical iPhone or iPad (not supported in the iOS Simulator).
+
+#### 2. Standalone iOS Command-Line Binary
+To compile a standalone binary for jailbroken or test environments using the iPhone SDK:
 
 ```bash
 # Compile for iOS (arm64)
@@ -31,22 +52,6 @@ xcrun -sdk iphoneos clang -fobjc-arc -O3 -framework Foundation -framework Metal 
 # Sign the binary (replace 'Apple Development' with your identity)
 codesign -s "Apple Development" measure_conv_ios
 ```
-
-> **Note**: Running a standalone binary on a non-jailbroken iPhone is restricted. The easiest way to run this on a device is to wrap it in an iOS App.
-
-#### Method 1: Create an Xcode Project (GUI)
-1. Open Xcode and create a new **iOS App** (Objective-C).
-2. **Delete** the following default files: `AppDelegate.h/m`, `SceneDelegate.h/m`, and `ViewController.h/m`.
-3. **Replace** the contents of `main.m` with the code from `measure_conv_gui.m`.
-4. **Info.plist** (Scene Manifest):
-    - In the **Info** tab, find **Application Scene Manifest**.
-    - **Delete** that entire row (to prevent the app from trying to use a SceneDelegate).
-5. Add `Metal` and `MetalPerformanceShadersGraph` to the **Frameworks, Libraries, and Embedded Content**.
-6. Run the app on your connected iPhone.
-
-#### Method 2: Xcode Project (Console Only)
-1. Follow the steps above but use `measure_conv_universal.m` instead.
-2. Check the Xcode **Console** for the output.
 
 ## Running the Benchmark
 
