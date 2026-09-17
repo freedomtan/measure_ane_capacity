@@ -25,3 +25,9 @@ measure_conv_swift: measure_conv.swift
 clean:
 	rm -f ${TARGETS} measure_conv_ios
 	rm -rf packages/
+
+app:
+	xcodebuild -project ANECapacityApp/ANECapacityApp.xcodeproj -scheme ANECapacityApp -sdk iphoneos -destination 'generic/platform=iOS' CODE_SIGNING_ALLOWED=NO CODE_SIGN_IDENTITY="" CODE_SIGNING_REQUIRED=NO build
+
+app-sim:
+	xcodebuild -project ANECapacityApp/ANECapacityApp.xcodeproj -scheme ANECapacityApp -sdk iphonesimulator -destination 'generic/platform=iOS Simulator' build

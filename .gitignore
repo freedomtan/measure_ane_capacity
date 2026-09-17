@@ -12,3 +12,5 @@ measure_ane_pmu
 *.dSYM
 packages/
 .DS_Store
+xcuserdata/
+*.xcuserstate
