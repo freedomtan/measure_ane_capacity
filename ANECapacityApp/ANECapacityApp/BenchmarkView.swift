@@ -14,6 +14,21 @@ struct BenchmarkView: View {
                         // Hardware status banner
                         hardwareStatusBanner
                         
+                        // Workload Operation Type Selector (Conv2D vs MatMul)
+                        VStack(alignment: .leading, spacing: 6) {
+                            Text("Workload Operation")
+                                .font(.caption)
+                                .fontWeight(.semibold)
+                                .foregroundColor(.secondary)
+                            
+                            Picker("Operation", selection: $viewModel.selectedOperation) {
+                                ForEach(OperationType.allCases) { op in
+                                    Label(op.rawValue, systemImage: op.icon).tag(op)
+                                }
+                            }
+                            .pickerStyle(.segmented)
+                        }
+                        
                         // Mode Selector: Presets vs Custom
                         Picker("Run Mode", selection: $isCustomMode) {
                             Text("Capacity Sweeps").tag(false)
@@ -111,12 +126,20 @@ struct BenchmarkView: View {
     }
     
     // MARK: - Preset Sweeps Card
+    private var availableSweepsForCurrentOp: [SweepType] {
+        if viewModel.selectedOperation == .matmul {
+            return [.matmulDimensions, .matmulDepth]
+        } else {
+            return [.channels, .spatial, .depth, .kernels, .fullCapacity]
+        }
+    }
+    
     private var presetSweepsCard: some View {
         VStack(alignment: .leading, spacing: 14) {
             Text("Select Capacity Sweep")
                 .font(.headline)
             
-            ForEach([SweepType.channels, SweepType.spatial, SweepType.depth, SweepType.kernels, SweepType.fullCapacity], id: \.self) { sweep in
+            ForEach(availableSweepsForCurrentOp, id: \.self) { sweep in
                 Button(action: { viewModel.selectedSweep = sweep }) {
                     HStack {
                         VStack(alignment: .leading, spacing: 3) {
@@ -157,6 +180,8 @@ struct BenchmarkView: View {
         case .depth: return "Sweeps L = 1, 5, 10, 20, 30, 40 (Measures dispatch latency amortization)"
         case .kernels: return "Tests K=1x1 (GEMM) vs K=3x3 vs K=5x5 (2D Spatial Conv)"
         case .fullCapacity: return "Evaluates FP16 and INT8 across all major tensor footprints"
+        case .matmulDimensions: return "Sweeps M=K=N = 128, 256, 512, 1024, 2048 (Tests dense GEMM array scaling)"
+        case .matmulDepth: return "Sweeps L = 1, 5, 10, 20, 30, 40 (Measures GEMM pipeline latency amortization)"
         }
     }
     
@@ -164,7 +189,7 @@ struct BenchmarkView: View {
     private var customDimensionsCard: some View {
         VStack(alignment: .leading, spacing: 14) {
             HStack {
-                Text("Custom Dimensions")
+                Text(viewModel.selectedOperation == .matmul ? "Custom GEMM Dimensions" : "Custom Dimensions")
                     .font(.headline)
                 Spacer()
                 Text("\(String(format: "%.1f", viewModel.dimensions.gflops)) GFLOPs/iter")
@@ -173,82 +198,158 @@ struct BenchmarkView: View {
                     .foregroundColor(.accentColor)
             }
             
-            // Channels
-            VStack(alignment: .leading, spacing: 4) {
+            if viewModel.selectedOperation == .matmul {
+                // MatMul Controls: M, K, N, Layers
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack {
+                        Text("Matrix Row Dimension (M):")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                        Spacer()
+                        Text("\(viewModel.dimensions.m)")
+                            .font(.caption)
+                            .fontWeight(.bold)
+                    }
+                    Picker("M", selection: $viewModel.dimensions.m) {
+                        ForEach([128, 256, 512, 1024, 2048], id: \.self) { val in
+                            Text("\(val)").tag(val)
+                        }
+                    }
+                    .pickerStyle(.segmented)
+                }
+                
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack {
+                        Text("Contracting Dimension (K):")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                        Spacer()
+                        Text("\(viewModel.dimensions.k)")
+                            .font(.caption)
+                            .fontWeight(.bold)
+                    }
+                    Picker("K", selection: $viewModel.dimensions.k) {
+                        ForEach([128, 256, 512, 1024, 2048], id: \.self) { val in
+                            Text("\(val)").tag(val)
+                        }
+                    }
+                    .pickerStyle(.segmented)
+                }
+                
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack {
+                        Text("Column Dimension (N):")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                        Spacer()
+                        Text("\(viewModel.dimensions.n)")
+                            .font(.caption)
+                            .fontWeight(.bold)
+                    }
+                    Picker("N", selection: $viewModel.dimensions.n) {
+                        ForEach([128, 256, 512, 1024, 2048], id: \.self) { val in
+                            Text("\(val)").tag(val)
+                        }
+                    }
+                    .pickerStyle(.segmented)
+                }
+                
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack {
+                        Text("Chained Layers (L):")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                        Spacer()
+                        Text("\(viewModel.dimensions.layers) layers")
+                            .font(.caption)
+                            .fontWeight(.bold)
+                    }
+                    Picker("Layers", selection: $viewModel.dimensions.layers) {
+                        ForEach([1, 5, 10, 20, 30, 40], id: \.self) { l in
+                            Text("\(l)").tag(l)
+                        }
+                    }
+                    .pickerStyle(.segmented)
+                }
+            } else {
+                // Conv2D Controls
+                // Channels
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack {
+                        Text("Input / Output Channels:")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                        Spacer()
+                        Text("\(viewModel.dimensions.inChannels) c")
+                            .font(.caption)
+                            .fontWeight(.bold)
+                    }
+                    Picker("Channels", selection: $viewModel.dimensions.inChannels) {
+                        ForEach([16, 32, 64, 128, 256, 512, 1024], id: \.self) { c in
+                            Text("\(c)").tag(c)
+                        }
+                    }
+                    .pickerStyle(.segmented)
+                    .onChange(of: viewModel.dimensions.inChannels) { newC in
+                        viewModel.dimensions.outChannels = newC
+                    }
+                }
+                
+                // Spatial Dimensions (H x W)
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack {
+                        Text("Spatial Resolution (H = W):")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                        Spacer()
+                        Text("\(viewModel.dimensions.height) x \(viewModel.dimensions.width)")
+                            .font(.caption)
+                            .fontWeight(.bold)
+                    }
+                    Picker("Resolution", selection: $viewModel.dimensions.height) {
+                        ForEach([64, 128, 256, 512, 768, 1024], id: \.self) { res in
+                            Text("\(res)").tag(res)
+                        }
+                    }
+                    .pickerStyle(.segmented)
+                    .onChange(of: viewModel.dimensions.height) { newH in
+                        viewModel.dimensions.width = newH
+                    }
+                }
+                
+                // Chained Layers (L)
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack {
+                        Text("Chained Layers (L):")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                        Spacer()
+                        Text("\(viewModel.dimensions.layers) layers")
+                            .font(.caption)
+                            .fontWeight(.bold)
+                    }
+                    Picker("Layers", selection: $viewModel.dimensions.layers) {
+                        ForEach([1, 5, 10, 20, 30, 40], id: \.self) { l in
+                            Text("\(l)").tag(l)
+                        }
+                    }
+                    .pickerStyle(.segmented)
+                }
+                
+                // Kernel Size
                 HStack {
-                    Text("Input / Output Channels:")
+                    Text("Kernel Size (KxK):")
                         .font(.caption)
                         .foregroundColor(.secondary)
                     Spacer()
-                    Text("\(viewModel.dimensions.inChannels) c")
-                        .font(.caption)
-                        .fontWeight(.bold)
-                }
-                Picker("Channels", selection: $viewModel.dimensions.inChannels) {
-                    ForEach([16, 32, 64, 128, 256, 512, 1024], id: \.self) { c in
-                        Text("\(c)").tag(c)
+                    Picker("Kernel", selection: $viewModel.dimensions.kernelSize) {
+                        Text("1x1").tag(1)
+                        Text("3x3").tag(3)
+                        Text("5x5").tag(5)
                     }
+                    .pickerStyle(.segmented)
+                    .frame(width: 180)
                 }
-                .pickerStyle(.segmented)
-                .onChange(of: viewModel.dimensions.inChannels) { newC in
-                    viewModel.dimensions.outChannels = newC
-                }
-            }
-            
-            // Spatial Dimensions (H x W)
-            VStack(alignment: .leading, spacing: 4) {
-                HStack {
-                    Text("Spatial Resolution (H = W):")
-                        .font(.caption)
-                        .foregroundColor(.secondary)
-                    Spacer()
-                    Text("\(viewModel.dimensions.height) x \(viewModel.dimensions.width)")
-                        .font(.caption)
-                        .fontWeight(.bold)
-                }
-                Picker("Resolution", selection: $viewModel.dimensions.height) {
-                    ForEach([64, 128, 256, 512, 768, 1024], id: \.self) { res in
-                        Text("\(res)").tag(res)
-                    }
-                }
-                .pickerStyle(.segmented)
-                .onChange(of: viewModel.dimensions.height) { newH in
-                    viewModel.dimensions.width = newH
-                }
-            }
-            
-            // Chained Layers (L)
-            VStack(alignment: .leading, spacing: 4) {
-                HStack {
-                    Text("Chained Layers (L):")
-                        .font(.caption)
-                        .foregroundColor(.secondary)
-                    Spacer()
-                    Text("\(viewModel.dimensions.layers) layers")
-                        .font(.caption)
-                        .fontWeight(.bold)
-                }
-                Picker("Layers", selection: $viewModel.dimensions.layers) {
-                    ForEach([1, 5, 10, 20, 30, 40], id: \.self) { l in
-                        Text("\(l)").tag(l)
-                    }
-                }
-                .pickerStyle(.segmented)
-            }
-            
-            // Kernel Size
-            HStack {
-                Text("Kernel Size (KxK):")
-                    .font(.caption)
-                    .foregroundColor(.secondary)
-                Spacer()
-                Picker("Kernel", selection: $viewModel.dimensions.kernelSize) {
-                    Text("1x1").tag(1)
-                    Text("3x3").tag(3)
-                    Text("5x5").tag(5)
-                }
-                .pickerStyle(.segmented)
-                .frame(width: 180)
             }
         }
         .padding()

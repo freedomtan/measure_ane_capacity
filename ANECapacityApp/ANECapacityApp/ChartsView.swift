@@ -435,8 +435,8 @@ struct ChartsView: View {
                         .fontWeight(.semibold)
                 }
                 VStack(alignment: .leading) {
-                    Text("Tensor Shape").font(.caption2).foregroundColor(.secondary)
-                    Text("\(r.dimensions.inChannels)c \(r.dimensions.height)x\(r.dimensions.width)")
+                    Text(r.dimensions.opType == .matmul ? "Dimensions" : "Tensor Shape").font(.caption2).foregroundColor(.secondary)
+                    Text(r.dimensions.opType == .matmul ? "[\(r.dimensions.m)x\(r.dimensions.k)x\(r.dimensions.n)]" : "\(r.dimensions.inChannels)c \(r.dimensions.height)x\(r.dimensions.width)")
                         .font(.subheadline)
                         .fontWeight(.semibold)
                 }

@@ -27,7 +27,7 @@ The easiest and most comprehensive way to measure ANE capacity and profile silic
 
 #### 1. ANECapacityApp (SwiftUI, Swift Charts & Live PMU Counters)
 
-`ANECapacityApp` provides automated capacity sweeps (Channel, Spatial, Depth, and Kernel sizes), interactive Swift Charts with peak TOPS callouts, dynamic CSV export, and real-time Apple Neural Engine PMU performance counters (Compute Cycles, Memory Stalls, DMA traffic, ALU Saturation).
+`ANECapacityApp` provides dual workload benchmarking (2D Convolutions and dense Matrix Multiplication / GEMM), automated capacity sweeps (Channels, Spatial, Depth, Kernel sizes, and Matrix dimensions), interactive Swift Charts with peak TOPS callouts, dynamic CSV export, and real-time Apple Neural Engine PMU performance counters (Compute Cycles, Memory Stalls, DMA traffic, ALU Saturation).
 
 | 1. Capacity Sweeps | 2. Performance Figures | 3. History & PMU Telemetry | 4. Device Specs & Info |
 | :---: | :---: | :---: | :---: |

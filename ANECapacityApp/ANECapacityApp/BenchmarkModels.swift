@@ -40,6 +40,21 @@ enum DeviceTarget: String, CaseIterable, Identifiable, Codable {
     }
 }
 
+// MARK: - Operation Type
+enum OperationType: String, CaseIterable, Identifiable, Codable {
+    case conv2d = "Conv2D"
+    case matmul = "MatMul (GEMM)"
+    
+    var id: String { rawValue }
+    
+    var icon: String {
+        switch self {
+        case .conv2d: return "square.grid.3x3.fill"
+        case .matmul: return "rectangle.split.2x2.fill"
+        }
+    }
+}
+
 // MARK: - Sweep Type
 enum SweepType: String, CaseIterable, Identifiable, Codable {
     case none = "Single Run"
@@ -48,6 +63,8 @@ enum SweepType: String, CaseIterable, Identifiable, Codable {
     case depth = "Chained Layer Depth Sweep"
     case kernels = "Kernel Size Sweep (1x1 vs 3x3)"
     case fullCapacity = "Full Capacity Comparison"
+    case matmulDimensions = "Matrix Dimension (M=K=N) Sweep"
+    case matmulDepth = "GEMM Chained Depth Sweep"
     
     var id: String { rawValue }
     
@@ -59,13 +76,18 @@ enum SweepType: String, CaseIterable, Identifiable, Codable {
         case .depth: return "Chained Layers (L)"
         case .kernels: return "Kernel Size (KxK)"
         case .fullCapacity: return "Channels (Ci = Co)"
+        case .matmulDimensions: return "Matrix Size (M=K=N)"
+        case .matmulDepth: return "Chained Layers (L)"
         }
     }
 }
 
-// MARK: - Convolution Dimensions & Hyperparameters
+// MARK: - Convolution & GEMM Dimensions / Hyperparameters
 struct ConvDimensions: Codable, Equatable {
+    var opType: OperationType = .conv2d
     var batch: Int = 1
+    
+    // Conv2D dimensions
     var height: Int = 256
     var width: Int = 256
     var inChannels: Int = 128
@@ -73,11 +95,20 @@ struct ConvDimensions: Codable, Equatable {
     var kernelSize: Int = 3
     var layers: Int = 20
     
-    // Theoretical operations per single iteration: 2 * B * H * W * Ci * Co * K * K * L
+    // MatMul (GEMM) dimensions: [B, M, K] x [B, K, N]
+    var m: Int = 1024
+    var k: Int = 1024
+    var n: Int = 1024
+    
+    // Theoretical operations per single iteration
     var totalOperations: Double {
-        return 2.0 * Double(batch) * Double(height) * Double(width) *
-               Double(inChannels) * Double(outChannels) *
-               Double(kernelSize * kernelSize) * Double(layers)
+        if opType == .matmul {
+            return 2.0 * Double(batch) * Double(m) * Double(k) * Double(n) * Double(layers)
+        } else {
+            return 2.0 * Double(batch) * Double(height) * Double(width) *
+                   Double(inChannels) * Double(outChannels) *
+                   Double(kernelSize * kernelSize) * Double(layers)
+        }
     }
     
     var gflops: Double {
@@ -85,18 +116,32 @@ struct ConvDimensions: Codable, Equatable {
     }
     
     func weightsBytes(precision: PrecisionMode) -> Int {
+        if opType == .matmul {
+            // MatMul uses FP16 weights
+            return batch * k * n * 2
+        }
         return outChannels * inChannels * kernelSize * kernelSize * (precision == .fp16 ? 2 : 1)
     }
     
     func inputBytes(precision: PrecisionMode) -> Int {
-        return batch * height * width * inChannels * (precision == .fp16 ? 2 : 1)
+        let elem = (precision == .fp16 ? 2 : 1)
+        if opType == .matmul {
+            return batch * m * k * elem
+        }
+        return batch * height * width * inChannels * elem
     }
     
     var shortDescription: String {
+        if opType == .matmul {
+            return "GEMM [\(m)x\(k)x\(n)] L\(layers)"
+        }
         return "\(inChannels)c \(height)x\(width) k\(kernelSize) L\(layers)"
     }
     
     var detailedDescription: String {
+        if opType == .matmul {
+            return "MatMul B:\(batch) | M:\(m) K:\(k) N:\(n) | L:\(layers)"
+        }
         return "B:\(batch) | H:\(height) W:\(width) | Cin:\(inChannels) Cout:\(outChannels) | K:\(kernelSize)x\(kernelSize) | L:\(layers)"
     }
 }

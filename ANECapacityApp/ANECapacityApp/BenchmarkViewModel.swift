@@ -4,6 +4,18 @@ import Combine
 
 @MainActor
 final class BenchmarkViewModel: ObservableObject {
+    // Current operation type
+    @Published var selectedOperation: OperationType = .conv2d {
+        didSet {
+            dimensions.opType = selectedOperation
+            if selectedOperation == .matmul {
+                selectedSweep = .matmulDimensions
+            } else {
+                selectedSweep = .channels
+            }
+        }
+    }
+    
     // Current custom dimensions
     @Published var dimensions: ConvDimensions = ConvDimensions()
     @Published var selectedPrecision: PrecisionMode = .both
@@ -17,6 +29,7 @@ final class BenchmarkViewModel: ObservableObject {
     @Published var customChannelSteps: [Int] = [32, 64, 128, 256, 512, 1024]
     @Published var customSpatialSteps: [Int] = [64, 128, 256, 384, 512, 768]
     @Published var customDepthSteps: [Int] = [1, 5, 10, 20, 30, 40]
+    @Published var customMatMulSteps: [Int] = [128, 256, 512, 1024, 2048]
     
     // Benchmark execution state
     @Published var isRunning: Bool = false
@@ -97,6 +110,57 @@ final class BenchmarkViewModel: ObservableObject {
                 inputStallCycles: UInt64(8_000 + i * 4_000),
                 dmaRwBytes: UInt64(dims.weightsBytes(precision: .int8) + dims.inputBytes(precision: .int8)),
                 aluSaturation: min(95.2, 32.0 + Double(i) * 12.2),
+                effectiveClockGhz: 1.82
+            ))
+        }
+
+        let matmulSteps = [128, 256, 512, 1024, 2048]
+        let matmulFp16Tops = [2.85, 6.40, 12.10, 15.30, 15.90]
+        let matmulInt8Tops = [5.60, 12.80, 24.10, 30.50, 31.80]
+        
+        for (i, sz) in matmulSteps.enumerated() {
+            let dims = ConvDimensions(opType: .matmul, batch: 1, layers: 20, m: sz, k: sz, n: sz)
+            let ops = dims.totalOperations
+            
+            let fpTops = matmulFp16Tops[i]
+            let fpDurSec = ops / (fpTops * 1e12)
+            results.append(BenchmarkResult(
+                dimensions: dims,
+                precision: .fp16,
+                target: .ane,
+                avgDurationMs: fpDurSec * 1000.0,
+                tops: fpTops,
+                iterations: 20,
+                sweepType: .matmulDimensions,
+                sweepValue: Double(sz),
+                sweepLabel: "\(sz)",
+                computeCycles: UInt64(Double(sz) * 3500 + 80_000),
+                nominalCycles: UInt64(Double(sz) * 3800 + 90_000),
+                outputStallCycles: UInt64(10_000 + i * 5_000),
+                inputStallCycles: UInt64(8_000 + i * 4_000),
+                dmaRwBytes: UInt64(dims.weightsBytes(precision: .fp16) + dims.inputBytes(precision: .fp16)),
+                aluSaturation: min(95.0, 28.0 + Double(i) * 13.0),
+                effectiveClockGhz: 1.80
+            ))
+            
+            let inTops = matmulInt8Tops[i]
+            let inDurSec = ops / (inTops * 1e12)
+            results.append(BenchmarkResult(
+                dimensions: dims,
+                precision: .int8,
+                target: .ane,
+                avgDurationMs: inDurSec * 1000.0,
+                tops: inTops,
+                iterations: 20,
+                sweepType: .matmulDimensions,
+                sweepValue: Double(sz),
+                sweepLabel: "\(sz)",
+                computeCycles: UInt64(Double(sz) * 3200 + 70_000),
+                nominalCycles: UInt64(Double(sz) * 3500 + 80_000),
+                outputStallCycles: UInt64(8_000 + i * 4_000),
+                inputStallCycles: UInt64(6_000 + i * 3_000),
+                dmaRwBytes: UInt64(dims.weightsBytes(precision: .int8) + dims.inputBytes(precision: .int8)),
+                aluSaturation: min(96.0, 30.0 + Double(i) * 13.0),
                 effectiveClockGhz: 1.82
             ))
         }
@@ -245,8 +309,24 @@ final class BenchmarkViewModel: ObservableObject {
         case .fullCapacity:
             // Comprehensive sweep across channels with fixed H=256, W=256, K=3, L=20
             for ch in [32, 64, 128, 256, 512, 1024] {
-                var d = ConvDimensions(batch: 1, height: 256, width: 256, inChannels: ch, outChannels: ch, kernelSize: 3, layers: 20)
+                var d = ConvDimensions(opType: .conv2d, batch: 1, height: 256, width: 256, inChannels: ch, outChannels: ch, kernelSize: 3, layers: 20)
                 points.append(SweepPoint(dims: d, value: Double(ch), label: "\(ch)c"))
+            }
+        case .matmulDimensions:
+            for sz in customMatMulSteps {
+                var d = dimensions
+                d.opType = .matmul
+                d.m = sz
+                d.k = sz
+                d.n = sz
+                points.append(SweepPoint(dims: d, value: Double(sz), label: "\(sz)"))
+            }
+        case .matmulDepth:
+            for layers in customDepthSteps {
+                var d = dimensions
+                d.opType = .matmul
+                d.layers = layers
+                points.append(SweepPoint(dims: d, value: Double(layers), label: "L=\(layers)"))
             }
         }
         
@@ -291,8 +371,8 @@ final class BenchmarkViewModel: ObservableObject {
     // Generate CSV string of results
     func exportCSV() -> String {
         var headers = [
-            "Timestamp", "Device", "Precision", "Batch", "Height", "Width",
-            "InChannels", "OutChannels", "KernelSize", "Layers", "TotalGFLOPs",
+            "Timestamp", "Device", "Precision", "Operation", "Batch", "Height", "Width",
+            "InChannels", "OutChannels", "KernelSize", "M", "K", "N", "Layers", "TotalGFLOPs",
             "AvgDurationMs", "TOPS", "HWExecutionTimeNs", "MACsPerCoreCycle",
             "TotalChipMACs", "ALUSaturationPct", "EffectiveClockGHz",
             "SweepType", "SweepValue", "SweepLabel", "Iterations",
@@ -311,12 +391,16 @@ final class BenchmarkViewModel: ObservableObject {
                 df.string(from: r.timestamp),
                 r.target.shortName,
                 r.precision.rawValue,
+                r.dimensions.opType.rawValue,
                 "\(r.dimensions.batch)",
                 "\(r.dimensions.height)",
                 "\(r.dimensions.width)",
                 "\(r.dimensions.inChannels)",
                 "\(r.dimensions.outChannels)",
                 "\(r.dimensions.kernelSize)",
+                "\(r.dimensions.m)",
+                "\(r.dimensions.k)",
+                "\(r.dimensions.n)",
                 "\(r.dimensions.layers)",
                 String(format: "%.2f", r.dimensions.gflops),
                 String(format: "%.3f", r.avgDurationMs),

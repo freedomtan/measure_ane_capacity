@@ -130,49 +130,87 @@ final class ANECapacityEngine {
         // 2. Build MPSGraph
         let graph = MPSGraph()
         
-        let inShape: [NSNumber] = [
-            NSNumber(value: dims.batch),
-            NSNumber(value: dims.inChannels),
-            NSNumber(value: dims.height),
-            NSNumber(value: dims.width)
-        ]
-        let wShape: [NSNumber] = [
-            NSNumber(value: dims.outChannels),
-            NSNumber(value: dims.inChannels),
-            NSNumber(value: dims.kernelSize),
-            NSNumber(value: dims.kernelSize)
-        ]
+        let inShape: [NSNumber]
+        let input: MPSGraphTensor
+        var cur: MPSGraphTensor
+        let inputBufferLen: Int
         
-        let input = graph.placeholder(shape: inShape, dataType: mpsType, name: "in")
-        var cur = input
-        
-        // Constant weights
-        let wLength = dims.outChannels * dims.inChannels * dims.kernelSize * dims.kernelSize * elementSize
-        let wData = createNonZeroData(byteCount: wLength, dataType: mpsType)
-        let w = graph.constant(wData, shape: wShape, dataType: mpsType)
-        
-        // Chain L layers
-        for _ in 0..<dims.layers {
-            guard let d = MPSGraphConvolution2DOpDescriptor(
-                strideInX: 1,
-                strideInY: 1,
-                dilationRateInX: 1,
-                dilationRateInY: 1,
-                groups: 1,
-                paddingStyle: .TF_SAME,
-                dataLayout: .NCHW,
-                weightsLayout: .OIHW
-            ) else {
-                throw BenchmarkError.graphCompilationFailed("Invalid convolution descriptor")
-            }
+        if dims.opType == .matmul {
+            inShape = [
+                NSNumber(value: dims.batch),
+                NSNumber(value: dims.m),
+                NSNumber(value: dims.k)
+            ]
+            let wShape: [NSNumber] = [
+                NSNumber(value: dims.batch),
+                NSNumber(value: dims.k),
+                NSNumber(value: dims.n)
+            ]
             
-            cur = graph.convolution2D(cur, weights: w, descriptor: d, name: nil)
+            input = graph.placeholder(shape: inShape, dataType: mpsType, name: "in")
+            cur = input
             
-            // Int8 simulated quantized flow: Int8 -> Conv -> FP16 dequant -> Int8 requant
-            if mpsType == .int8 {
-                let fp = graph.cast(cur, to: .float16, name: "dequant")
-                cur = graph.cast(fp, to: .int8, name: "requant")
+            let wLength = dims.batch * dims.k * dims.n * 2
+            let wData = createNonZeroData(byteCount: wLength, dataType: .float16)
+            let w = graph.constant(wData, shape: wShape, dataType: .float16)
+            
+            for _ in 0..<dims.layers {
+                var lhs = cur
+                if mpsType == .int8 {
+                    lhs = graph.cast(cur, to: .float16, name: "dequant")
+                }
+                cur = graph.matrixMultiplication(primary: lhs, secondary: w, name: nil)
+                if mpsType == .int8 {
+                    cur = graph.cast(cur, to: .int8, name: "requant")
+                }
             }
+            inputBufferLen = dims.batch * dims.m * dims.k * elementSize
+        } else {
+            inShape = [
+                NSNumber(value: dims.batch),
+                NSNumber(value: dims.inChannels),
+                NSNumber(value: dims.height),
+                NSNumber(value: dims.width)
+            ]
+            let wShape: [NSNumber] = [
+                NSNumber(value: dims.outChannels),
+                NSNumber(value: dims.inChannels),
+                NSNumber(value: dims.kernelSize),
+                NSNumber(value: dims.kernelSize)
+            ]
+            
+            input = graph.placeholder(shape: inShape, dataType: mpsType, name: "in")
+            cur = input
+            
+            // Constant weights
+            let wLength = dims.outChannels * dims.inChannels * dims.kernelSize * dims.kernelSize * elementSize
+            let wData = createNonZeroData(byteCount: wLength, dataType: mpsType)
+            let w = graph.constant(wData, shape: wShape, dataType: mpsType)
+            
+            // Chain L layers
+            for _ in 0..<dims.layers {
+                guard let d = MPSGraphConvolution2DOpDescriptor(
+                    strideInX: 1,
+                    strideInY: 1,
+                    dilationRateInX: 1,
+                    dilationRateInY: 1,
+                    groups: 1,
+                    paddingStyle: .TF_SAME,
+                    dataLayout: .NCHW,
+                    weightsLayout: .OIHW
+                ) else {
+                    throw BenchmarkError.graphCompilationFailed("Invalid convolution descriptor")
+                }
+                
+                cur = graph.convolution2D(cur, weights: w, descriptor: d, name: nil)
+                
+                // Int8 simulated quantized flow: Int8 -> Conv -> FP16 dequant -> Int8 requant
+                if mpsType == .int8 {
+                    let fp = graph.cast(cur, to: .float16, name: "dequant")
+                    cur = graph.cast(fp, to: .int8, name: "requant")
+                }
+            }
+            inputBufferLen = dims.batch * dims.height * dims.width * dims.inChannels * elementSize
         }
         
         if Task.isCancelled { throw BenchmarkError.executionCancelled }
@@ -206,7 +244,6 @@ final class ANECapacityEngine {
         }
         
         // 4. Allocate I/O buffers
-        let inputBufferLen = dims.batch * dims.height * dims.width * dims.inChannels * elementSize
         guard let iBuf = device.makeBuffer(length: inputBufferLen, options: []) else {
             throw BenchmarkError.bufferAllocationFailed
         }

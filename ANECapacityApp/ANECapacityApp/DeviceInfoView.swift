@@ -25,16 +25,16 @@ struct DeviceInfoView: View {
                 
                 Section(header: Text("How ANE Capacity is Measured")) {
                     VStack(alignment: .leading, spacing: 8) {
-                        Text("Silicon Throughput Formula:")
+                        Text("Silicon Throughput Formulas:")
                             .font(.caption)
                             .fontWeight(.bold)
-                        Text("Throughput (TOPS) = (2 * B * H * W * Ci * Co * K² * L) / (avg_seconds * 10¹²)")
+                        Text("Conv2D: (2 * B * H * W * Ci * Co * K² * L) / (t * 10¹²)\nMatMul: (2 * B * M * K * N * L) / (t * 10¹²)")
                             .font(.system(size: 11, design: .monospaced))
                             .padding(8)
                             .background(Color(.tertiarySystemBackground))
                             .cornerRadius(6)
                         
-                        Text("• Ci, Co: Input and output channel dimensions (ANE matrix tiles typically 64x64 or 128x128).\n• H, W: Spatial feature map resolution.\n• K: 2D Convolution kernel size (K=3 for spatial conv, K=1 for GEMM).\n• L: Number of chained layers in graph (amortizes driver & command dispatch overhead to measure true silicon saturation).\n• INT8 Flow: Uses simulated dequantize-conv-requantize matching measure_conv_universal.m.")
+                        Text("• Ci, Co / M, K, N: Channel or matrix dimensions (ANE tiles typically 64x64 or 128x128).\n• H, W: Spatial feature map resolution.\n• K: 2D Convolution kernel size.\n• L: Number of chained layers in graph (amortizes driver & command dispatch overhead to measure true silicon saturation).\n• INT8 Flow: Uses simulated dequantize-compute-requantize matching measure_conv_universal.m and measure_matmul_universal.m.")
                             .font(.caption)
                             .foregroundColor(.secondary)
                     }

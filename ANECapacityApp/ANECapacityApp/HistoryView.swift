@@ -122,6 +122,13 @@ struct HistoryView: View {
     private func resultRow(_ r: BenchmarkResult) -> some View {
         VStack(alignment: .leading, spacing: 6) {
             HStack {
+                Text(r.dimensions.opType.rawValue)
+                    .font(.system(size: 10, weight: .bold))
+                    .padding(.horizontal, 5)
+                    .padding(.vertical, 2)
+                    .background(Color(.systemGray4))
+                    .cornerRadius(5)
+                
                 Text("\(r.target.shortName) \(r.precision.rawValue)")
                     .font(.caption)
                     .fontWeight(.bold)
