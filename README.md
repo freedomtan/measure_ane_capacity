@@ -60,13 +60,29 @@ codesign -s "Apple Development" measure_conv_ios
 ./measure_conv
 ```
 
+### Universal Matrix Multiplication Benchmark (`measure_matmul_universal`)
+`measure_matmul_universal` benchmarks dense Matrix Multiplication (GEMM) using the native MPSGraph `matrixMultiplicationWithPrimaryTensor:secondaryTensor:` API across Metal GPU and the Apple Neural Engine (ANE).
+
+```bash
+# Compile and run
+make measure_matmul_universal
+./measure_matmul_universal
+```
+- **Workload**: 20 chained GEMM layers ($B=1, M=1024, K=1024, N=1024, L=20$) generating 42.95 GOPs per pass.
+- **Supported Modes**:
+  - `GPU FP16`: Metal GPU GEMM baseline.
+  - `ANE FP16`: Native ANE dense matrix multiplication via `matrixMultiplicationWithPrimaryTensor:secondaryTensor:`.
+  - `ANE INT8`: Quantized INT8 GEMM workflow (`INT8 input -> FP16 dequantize -> MatMul -> INT8 requantize`). *(Note: In MPSGraph, `mps.matmul` strictly requires floating-point operands, requiring the dequantize/requantize boundary around the multiplication).*
+- **Robust Multi-OS Targeting**: Dynamically targets ANE via `preferredDevice = 2` on modern macOS (macOS 15+, 26+) while supporting fallback to `[MPSGraphDevice ANEDevice]` on older runtimes.
+- **Non-Zero Initialization**: Initialized with alternating non-zero values to prevent false zero-skipping on H17/H18 silicon.
+
 ### Advanced Silicon PMU Profiler & MPSGraphPackage Exporter (`measure_ane_pmu`)
 `measure_ane_pmu` provides deep physical hardware profiling for Apple Neural Engine via `_ANEClient` and Apple PMU registers (`com.apple.ane.hardware-counters`), comparing FP16, INT8, QDQ, and GPU baselines while exporting self-contained `.mpsgraphpackage` bundles.
 
 > **Note / Attribution**:
 > `measure_ane_pmu` is based on and adapted from [**ane_pmu_profiler**](https://github.com/freedomtan/ane_pmu_profiler/), reusing its low-level Apple Neural Engine silicon PMU profiling, private `_ANEClient` telemetry interfaces, and hardware register mapping.
 >
-> For an in-depth microarchitectural analysis explaining how these counters behave under different tensor dimensions, see the [**Guide to Interpreting measure_ane_pmu Numbers**](How_to_Interpret_measure_ane_pmu_Numbers.md).
+> For an in-depth microarchitectural analysis explaining how these counters behave under different tensor dimensions, see the [**Guide to Interpreting measure_ane_pmu Numbers**](docs/How_to_Interpret_measure_ane_pmu_Numbers.md).
 
 ```bash
 # Build and codesign with PMU entitlements
@@ -143,7 +159,7 @@ When `--save-package` is enabled, `measure_ane_pmu` serializes each variant into
 > 5. **L2 SRAM Fitting**: Reducing spatial dimensions to fit inside L2 SRAM ($H=64, W=64$) collapses output writeback stalls by >16× (15.5M cycles). Note that dividing Total MACs by `COMPUTE_CYCLES` (`[13]`) yields an inflated ratio because `[13]` is gated during stalls; the physically bounded metric is Throughput per Nominal Cycle (`[10]`).
 > 6. **QDQ Execution**: In QDQ (`dequantize -> conv -> quantize`), the internal convolution arithmetic executes in FP16 precision, matching FP16 throughput (~18.60 TOPS) and FP16 DMA footprint (~35.27 MB).
 >
-> *(For an exhaustive breakdown of each register, see [`How_to_Interpret_measure_ane_pmu_Numbers.md`](How_to_Interpret_measure_ane_pmu_Numbers.md).)*
+> *(For an exhaustive breakdown of each register, see [`How_to_Interpret_measure_ane_pmu_Numbers.md`](docs/How_to_Interpret_measure_ane_pmu_Numbers.md).)*
 
 ### Non-Zero Tensor Initialization (Required for H17 and Later)
 
@@ -153,7 +169,7 @@ When `--save-package` is enabled, `measure_ane_pmu` serializes each variant into
 > - **Zero-Skipping on H17+**: In H16 (A17 Pro, M4) and earlier generations, zero-filled buffers (`0x00`) are computed through the full physical MAC arrays without hardware-skipping or lossless compression bypass, reflecting true dense capacity (~18.8 TOPS FP16, ~38.0 TOPS INT8).
 > - **Hardware Zero-Skipping & Lossless Compression**: Starting in H17, Apple introduced hardware-level zero-skipping logic and lossless zero-compression in the DMA controller, cache, and activation feeder. When tensors are zero-initialized, MAC operations and memory transfers are bypassed, causing benchmarks to record artificially inflated throughput (e.g. historical tests falsely showed ~44.4 TOPS FP16 and ~63.2 TOPS QDQ on iPhone 17 Pro).
 > - **True Dense Silicon Capacity**: With dense non-zero inputs and weights, both H17 and H18 sustain their true dense capacity of **~24.5 TOPS (FP16)** and **~51.6 TOPS (INT8)** via 1D Winograd $F(2, 3)$.
-> - **Implementation**: All benchmark binaries (`measure_ane_pmu`, `measure_conv_universal`, `measure_conv_fp16`, `measure_conv`, `measure_conv_qdq`, `measure_conv_gui`, `measure_conv.swift`, and `ANECapacityEngine.swift`) now initialize both weights and inputs with small non-zero alternating values (`+0.0625, -0.0625, +0.03125, -0.03125` for FP16; `+1, -1, +2, -2` for INT8). This ensures no zero-skipping occurs while maintaining numerical stability without overflow or underflow across 20–50 consecutive convolution layers.
+> - **Implementation**: All benchmark binaries (`measure_ane_pmu`, `measure_conv_universal`, `measure_matmul_universal`, `measure_conv_fp16`, `measure_conv`, `measure_conv_qdq`, `measure_conv_gui`, `measure_conv.swift`, and `ANECapacityEngine.swift`) now initialize both weights and inputs with small non-zero alternating values (`+0.0625, -0.0625, +0.03125, -0.03125` for FP16; `+1, -1, +2, -2` for INT8). This ensures no zero-skipping occurs while maintaining numerical stability without overflow or underflow across 20–50 consecutive convolution layers.
 
 ### Historical Multi-Device Comparison Table
 

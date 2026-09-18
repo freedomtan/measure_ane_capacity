@@ -5,8 +5,7 @@
 #import <MetalPerformanceShadersGraph/MetalPerformanceShadersGraph.h>
 
 // Extend MPSGraphDevice to include the private API for ANE (Apple Neural
-// Engine) device. This interface allows us to use the private API *if* it is
-// available.
+// Engine) device on older OS versions.
 @interface MPSGraphDevice (ANE)
 + (instancetype)ANEDevice;
 @end
@@ -36,7 +35,15 @@ static void fillNonZeroData(void *buffer, size_t byteCount, MPSDataType dataType
 }
 
 /**
- * Runs the Conv2D benchmark on the specified device with the given data type.
+ * Runs the Matrix Multiplication (GEMM) benchmark on the specified device with the given data type
+ * using the native MPSGraph `matrixMultiplicationWithPrimaryTensor:secondaryTensor:` API.
+ *
+ * NOTE ON INT8 IN MPSGRAPH:
+ * Unlike MPSGraph convolution (which allows INT8 operands directly), MPSGraph's underlying
+ * `mps.matmul` MLIR operator strictly requires floating-point operands:
+ *   "error: 'mps.matmul' op operand #0 must be tensor of floating point values or tensor of complex values"
+ * Therefore, in MPSGraph, INT8 matrix multiplication requires the standard Quantize-Dequantize
+ * flow: INT8 inputs are dequantized to FP16 before matmul, and requantized to INT8 afterwards.
  */
 void run_bench(id<MTLDevice> device, bool useANE, MPSDataType dataType,
                NSString *name) {
@@ -46,48 +53,40 @@ void run_bench(id<MTLDevice> device, bool useANE, MPSDataType dataType,
 
     MPSGraph *graph = [MPSGraph new];
 
-    // Settings for high-throughput
-    NSUInteger B = 1, H = 256, W = 256, Ci = 128, Co = 128, K = 3, L = 20;
-    NSArray *inShape = @[ @(B), @(Ci), @(H), @(W) ];
-    NSArray *wShape = @[ @(Co), @(Ci), @(K), @(K) ];
+    // High-throughput GEMM dimensions: B x M x K multiplied by B x K x N
+    // Output shape matches input shape (B x M x N where M == N) allowing seamless chaining of L layers.
+    NSUInteger B = 1, M = 1024, K = 1024, N = 1024, L = 20;
+    NSArray *inShape = @[ @(B), @(M), @(K) ];
+    NSArray *wShape = @[ @(B), @(K), @(N) ];
 
     MPSGraphTensor *input = [graph placeholderWithShape:inShape
                                                dataType:dataType
                                                    name:@"in"];
     MPSGraphTensor *cur = input;
 
-    // Determine element size based on data type
-    NSUInteger elementSize = (dataType == MPSDataTypeFloat16) ? 2 : 1;
-
     // Weights allocation (non-zero initialized to prevent hardware zero-skipping on H17+)
+    // MPSGraph matrixMultiplication requires floating point operands.
     NSMutableData *wData =
-        [NSMutableData dataWithLength:Co * Ci * K * K * elementSize];
-    fillNonZeroData(wData.mutableBytes, wData.length, dataType);
+        [NSMutableData dataWithLength:B * K * N * sizeof(uint16_t)];
+    fillNonZeroData(wData.mutableBytes, wData.length, MPSDataTypeFloat16);
     MPSGraphTensor *w = [graph constantWithData:wData
                                           shape:wShape
-                                       dataType:dataType];
+                                       dataType:MPSDataTypeFloat16];
 
     for (int i = 0; i < L; i++) {
-      MPSGraphConvolution2DOpDescriptor *d = [MPSGraphConvolution2DOpDescriptor
-          descriptorWithStrideInX:1
-                        strideInY:1
-                  dilationRateInX:1
-                  dilationRateInY:1
-                           groups:1
-                     paddingStyle:MPSGraphPaddingStyleTF_SAME
-                       dataLayout:MPSGraphTensorNamedDataLayoutNCHW
-                    weightsLayout:MPSGraphTensorNamedDataLayoutOIHW];
-      cur = [graph convolution2DWithSourceTensor:cur
-                                   weightsTensor:w
-                                      descriptor:d
-                                            name:nil];
-      // Realistic Quantized flow: Int8 -> (Conv) -> Int32/FP16 ->
-      // (Select/Scale) -> Int8
+      MPSGraphTensor *lhs = cur;
+      // MPSGraph's mps.matmul requires floating-point operands. For INT8 mode,
+      // cast INT8 to FP16 before matrixMultiplication and requantize back to INT8.
       if (dataType == MPSDataTypeInt8) {
-        MPSGraphTensor *fp = [graph castTensor:cur
-                                        toType:MPSDataTypeFloat16
-                                          name:@"dequant"];
-        cur = [graph castTensor:fp toType:MPSDataTypeInt8 name:@"requant"];
+        lhs = [graph castTensor:cur toType:MPSDataTypeFloat16 name:@"dequant"];
+      }
+
+      cur = [graph matrixMultiplicationWithPrimaryTensor:lhs
+                                         secondaryTensor:w
+                                                    name:nil];
+
+      if (dataType == MPSDataTypeInt8) {
+        cur = [graph castTensor:cur toType:MPSDataTypeInt8 name:@"requant"];
       }
     }
 
@@ -124,8 +123,9 @@ void run_bench(id<MTLDevice> device, bool useANE, MPSDataType dataType,
       return;
     }
 
+    NSUInteger inElementSize = (dataType == MPSDataTypeFloat16) ? sizeof(uint16_t) : sizeof(int8_t);
     id<MTLBuffer> iBuf =
-        [device newBufferWithLength:B * H * W * Ci * elementSize options:0];
+        [device newBufferWithLength:B * M * K * inElementSize options:0];
     fillNonZeroData(iBuf.contents, iBuf.length, dataType);
     MPSGraphTensorData *iData =
         [[MPSGraphTensorData alloc] initWithMTLBuffer:iBuf
@@ -158,7 +158,8 @@ void run_bench(id<MTLDevice> device, bool useANE, MPSDataType dataType,
         (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
     double avg = duration / iterations;
 
-    double tops = (2.0 * B * H * W * Ci * Co * K * K * L) / (avg * 1e12);
+    // 2.0 * B * M * K * N FLOPs per layer * L layers
+    double tops = (2.0 * B * M * K * N * L) / (avg * 1e12);
     NSLog(@"[%@] Avg: %.2f ms, Speed: %.4f TOPS", name, avg * 1000.0, tops);
   }
 }
@@ -175,11 +176,8 @@ int main(int argc, char *argv[]) {
   run_bench(device, true, MPSDataTypeFloat16, @"ANE FP16");
 
   // Benchmark INT8 (Signed Int 8)
-  // Check runtime environment or compile macros if specific GPU skipping is
-  // needed for iOS vs macOS. Generally, ANE supports INT8. GPU support depends
-  // on the specific GPU family. For safety, we keep the previous logic: GPU
-  // INT8 is likely unsupported on Apple GPUs for MPSGraph convolution.
-
   // run_bench(device, false, MPSDataTypeInt8, @"GPU INT8");
   run_bench(device, true, MPSDataTypeInt8, @"ANE INT8");
+
+  return 0;
 }

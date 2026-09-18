@@ -3,7 +3,7 @@ CFLAGS = -fobjc-arc -O3
 FRAMEWORKS = -framework Foundation -framework Metal -framework MetalPerformanceShadersGraph
 LDFLAGS = ${FRAMEWORKS}
 ANE_FRAMEWORKS = -F/System/Library/PrivateFrameworks -framework AppleNeuralEngine -framework IOSurface -framework IOKit -framework Security
-TARGETS  = measure_conv_fp16 measure_conv measure_conv_universal measure_conv_qdq measure_conv_swift measure_ane_pmu
+TARGETS  = measure_conv_fp16 measure_conv measure_conv_universal measure_matmul_universal measure_conv_qdq measure_conv_swift measure_ane_pmu
 
 all: ${TARGETS}
 
@@ -16,6 +16,8 @@ measure_conv_fp16: measure_conv_fp16.m
 measure_conv: measure_conv.m
 
 measure_conv_universal: measure_conv_universal.m
+
+measure_matmul_universal: measure_matmul_universal.m
 
 measure_conv_qdq: measure_conv_qdq.m
 
