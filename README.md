@@ -1,6 +1,6 @@
 # MPSGraph Convolution Benchmark
 
-This project benchmarks the performance of 2D convolutions on Apple Silicon using Metal Performance Shaders Graph (MPSGraph). It measures the compute capacity in TOPS (Trillions of Operations Per Second) for both the GPU and the Apple Neural Engine (ANE).
+This project benchmarks the performance of 2D convolutions on Apple Silicon using Metal Performance Shaders Graph (MPSGraph). It measures the compute capacity in TOPS (Trillions of Operations Per Second) for both the GPU and the Apple Neural Engine (ANE). A second, independent path measures the same workload through **CoreML with MIL-authored models** ([`measure_conv_coreml`](#coreml-mil-convolution-benchmark-measure_conv_coreml)), which cross-checks the MPSGraph numbers and verifies ANE op placement via `MLComputePlan`.
 
 ## Build Instructions
 
@@ -13,6 +13,12 @@ make
 To build just the Swift version:
 ```bash
 make measure_conv_swift
+```
+
+The CoreML benchmark additionally needs its MIL-authored models generated first, which requires [coremltools](https://github.com/apple/coremltools):
+```bash
+make models                 # python3 tools/gen_conv_mil.py -> models/*.mlpackage
+make measure_conv_coreml
 ```
 
 To clean the build artifacts:
@@ -59,6 +65,55 @@ codesign -s "Apple Development" measure_conv_ios
 ```bash
 ./measure_conv
 ```
+
+### CoreML MIL Convolution Benchmark (`measure_conv_coreml`)
+`measure_conv_coreml` measures the same convolution workload through **CoreML** instead of MPSGraph, so the two frameworks can be compared on identical arithmetic. Models are authored directly in **MIL** (Model Intermediate Language) by [`tools/gen_conv_mil.py`](tools/gen_conv_mil.py) using `coremltools.converters.mil.Builder` — no PyTorch/TensorFlow conversion in the path.
+
+Two things this gives us that MPSGraph cannot:
+- **Verified op placement.** `--plan` uses `MLComputePlan` (macOS 14.4+) to report the preferred compute device for every operation in the program. MPSGraph requires the private `preferredDevice = 2` property and offers no confirmation the work reached the ANE — we infer it from latency.
+- **No private API.** The entire ANE path is public CoreML. The binary links only `CoreML` (`otool -L` shows no MetalPerformanceShadersGraph), so the comparison isn't muddied by a shared framework.
+
+```bash
+# Generate the .mlpackage models (requires coremltools), then build and run
+make models
+make measure_conv_coreml
+./measure_conv_coreml --plan --check
+
+# Non-default configuration: generate a matching model, then point at it
+python3 tools/gen_conv_mil.py --size 64 --layers 10 --no-default-copy
+./measure_conv_coreml --model models/conv_fp16_B1_C128_H64_K3_L10.mlpackage --size 64 --layers 10
+```
+
+The CLI refuses to run if the `--size`/`--channels`/`--batch` flags disagree with the model's actual input shape, or if the model's I/O is not Float16 — either would produce a plausible-looking but wrong TOPS figure.
+
+#### CLI Options
+| Flag | Description | Default |
+| :--- | :--- | :--- |
+| `--model <path>` | `.mlpackage` or `.mlmodelc` to benchmark | `models/conv_fp16.mlpackage` |
+| `--units <target>` | `ane`, `gpu`, `cpu`, or `all` | `ane` |
+| `--input <mode>` | `dense` (random-sign) or `repeat` (tiled, matches the MPSGraph binaries) | `dense` |
+| `--batch/--size/--channels/--kernel/--layers` | Workload dimensions, validated against the model | `1 / 256 / 128 / 3 / 20` |
+| `--iterations <N>` / `--warmup <N>` | Timed and warmup prediction counts | `20` / `3` |
+| `--plan` | Dump per-operation compute device placement | Disabled |
+| `--check` | Verify output is finite and non-zero across the conv chain | Disabled |
+| `--verbose` | Per-operation detail in the compute plan | Disabled |
+
+#### CoreML vs. MPSGraph on Apple M4 Pro (H16g)
+*Same workload ($B=1, C=128, H=W=256, K=3, L=20$, 386.55 GOPs/pass), same machine, same session:*
+
+| Path | Device | Latency | Speed (TOPS) | Placement |
+| :--- | :--- | ---: | ---: | :--- |
+| **CoreML (MIL)** | ANE | 21.32 ms | **18.13** | `conv ops on ANE: 20/20` (verified via `MLComputePlan`) |
+| MPSGraph | ANE | 20.91 ms | 18.49 | inferred from latency |
+| **CoreML (MIL)** | GPU | 40.47 ms | **9.55** | — |
+| MPSGraph | GPU | 39.20 ms | 9.86 | — |
+
+CoreML lands within **~2–3%** of MPSGraph on both devices, and `MLComputePlan` confirms all 20 convolutions were dispatched to the Neural Engine. The residual gap is per-prediction dispatch overhead, not arithmetic throughput: on the cache-resident configuration ($H=W=64, L=10$) CoreML is actually *faster* (1.06 ms / 11.39 TOPS vs. MPSGraph's 1.15 ms / 10.50 TOPS), where lower fixed overhead matters more than sustained bandwidth. Conclusion: **the ~18.5 TOPS FP16 ceiling on H16g is a property of the silicon, not of MPSGraph.**
+
+> [!WARNING]
+> **The tiled `fillNonZeroData` pattern cancels to exactly zero under the convolution reduction.** Verified on hardware with a single-layer model: the tiled `+0.0625, -0.0625, +0.03125, -0.03125` sequence used by every MPSGraph binary in this repo produces an all-zero output tensor (8,388,608 / 8,388,608 elements exactly zero), because the alternating signs cancel across the $C_i \times K \times K$ reduction window. **Only layer 1 ever sees non-zero activations; layers 2…L consume a zero tensor** — precisely the condition the section below warns inflates TOPS on H17+.
+>
+> On **H16g (M4 Pro) this is harmless** — measured directly, `--input repeat` (17.59 TOPS) is if anything marginally *slower* than `--input dense` (18.13 TOPS), confirming H16g does not zero-skip. But on **H17/H18 the published "Dense (Non-Zero)" iPhone figures below may still be partially zero-skipped** and warrant re-measurement. `measure_conv_coreml` therefore defaults to `--input dense` with random-sign weights, RMS-scaled so activation magnitude stays roughly constant (measured $|v| \in [1.5\times10^{-5}, 1.41]$ after 20 layers, zero NaN/Inf). The MPSGraph binaries are unchanged.
 
 ### Universal Matrix Multiplication Benchmark (`measure_matmul_universal`)
 `measure_matmul_universal` benchmarks dense Matrix Multiplication (GEMM) using the native MPSGraph `matrixMultiplicationWithPrimaryTensor:secondaryTensor:` API across Metal GPU and the Apple Neural Engine (ANE).
@@ -170,6 +225,7 @@ When `--save-package` is enabled, `measure_ane_pmu` serializes each variant into
 > - **Hardware Zero-Skipping & Lossless Compression**: Starting in H17, Apple introduced hardware-level zero-skipping logic and lossless zero-compression in the DMA controller, cache, and activation feeder. When tensors are zero-initialized, MAC operations and memory transfers are bypassed, causing benchmarks to record artificially inflated throughput (e.g. historical tests falsely showed ~44.4 TOPS FP16 and ~63.2 TOPS QDQ on iPhone 17 Pro).
 > - **True Dense Silicon Capacity**: With dense non-zero inputs and weights, both H17 and H18 sustain their true dense capacity of **~24.5 TOPS (FP16)** and **~51.6 TOPS (INT8)** via 1D Winograd $F(2, 3)$.
 > - **Implementation**: All benchmark binaries (`measure_ane_pmu`, `measure_conv_universal`, `measure_matmul_universal`, `measure_conv_fp16`, `measure_conv`, `measure_conv_qdq`, `measure_conv_gui`, `measure_conv.swift`, and `ANECapacityEngine.swift`) now initialize both weights and inputs with small non-zero alternating values (`+0.0625, -0.0625, +0.03125, -0.03125` for FP16; `+1, -1, +2, -2` for INT8). This ensures no zero-skipping occurs while maintaining numerical stability without overflow or underflow across 20–50 consecutive convolution layers.
+> - **Correction — the tiled pattern only protects layer 1.** As documented in the [`measure_conv_coreml`](#coreml-mil-convolution-benchmark-measure_conv_coreml) warning above, the alternating FP16 pattern cancels exactly across the $C_i \times K \times K$ reduction, so the *output* of layer 1 is all zeros and layers 2…L run on a zero tensor. Verified on hardware. This does not affect H16g results (which do not zero-skip), but the H17/H18 rows below should be re-measured with a non-cancelling initialization — `measure_conv_coreml --input dense` implements one.
 
 ### Historical Multi-Device Comparison Table
 

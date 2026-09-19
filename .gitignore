@@ -7,11 +7,14 @@ measure_conv_qdq
 measure_conv_swift
 measure_conv_ios
 measure_ane_pmu
+measure_conv_coreml
 
 # Build artifacts and packages
 *.o
 *.dSYM
 packages/
+models/
+__pycache__/
 .DS_Store
 xcuserdata/
 *.xcuserstate
