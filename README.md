@@ -155,6 +155,28 @@ make measure_matmul_universal
 - **Robust Multi-OS Targeting**: Dynamically targets ANE via `preferredDevice = 2` on modern macOS (macOS 15+, 26+) while supporting fallback to `[MPSGraphDevice ANEDevice]` on older runtimes.
 - **Non-Zero Initialization**: Initialized with alternating non-zero values to prevent false zero-skipping on H17/H18 silicon.
 
+### Quantization-Dequantization Benchmark (`measure_conv_qdq`)
+`measure_conv_qdq` benchmarks and analyzes **Quantize / Dequantize (QDQ)** convolution execution across both the Apple Neural Engine (ANE) and Metal GPU.
+
+```bash
+# Compile and run
+make measure_conv_qdq
+./measure_conv_qdq
+```
+
+It systematically evaluates 5 distinct quantization patterns on Apple Silicon ($B=1, H=W=256, C_i=C_o=128, K=3\times 3, L=20$ layers, 386.55 GOPs/pass):
+
+| Pattern | Pipeline | ANE Speed | GPU Speed | Hardware Behavior |
+| :--- | :--- | :---: | :---: | :--- |
+| **0. Native INT8** | `conv(int8, int8) -> cast(fp16) -> cast(int8)` | **36.46 TOPS** (10.60 ms) | *Unsupported* | Hardware INT8 MAC units; unsupported on GPU |
+| **1. Cast QDQ** | `cast(fp16) -> conv(w_fp16) -> cast(int8)` | **3.24 TOPS** (119.38 ms) | 9.91 TOPS | Naive casts lack quantization metadata; causes tensor thrashing on ANE |
+| **2. Scalar QDQ Ops** | `dequant(x_int8) * dequant(w_int8) -> conv -> quant` | **36.81 TOPS** (10.50 ms) | **9.82 TOPS** | **True W8A8 QDQ**: Fuses to native INT8 MACs on ANE; runs FP16 on GPU |
+| **3. Channel-wise QDQ** | `dequant(scaleTensor) -> conv -> quant(scaleTensor)` | 17.41 TOPS (22.20 ms) | 9.80 TOPS | Per-channel vector scaling introduces broadcast overhead on ANE |
+| **4. FP16 Weight QDQ** | `dequant(x_int8) -> conv(w_fp16) -> quant(int8)` | 18.81 TOPS (20.55 ms) | 9.82 TOPS | Legacy QDQ pattern; keeping weights FP16 caps ANE at FP16 roofline |
+
+> [!NOTE]
+> **Key Architectural Insight**: In MPSGraph, **True W8A8 QDQ (Pattern 2)** allows the Apple ANE compiler to fuse the operations directly into native INT8 execution, matching Native INT8 convolution (~36.5 TOPS) and CoreML MIL INT8 (~34.7 TOPS) clock-for-clock. Furthermore, while native INT8 convolution is unsupported on Metal GPU, all QDQ patterns run gracefully on GPU at full FP16 compute capacity (~9.8 TOPS).
+
 ### Advanced Silicon PMU Profiler & MPSGraphPackage Exporter (`measure_ane_pmu`)
 `measure_ane_pmu` provides deep physical hardware profiling for Apple Neural Engine via `_ANEClient` and Apple PMU registers (`com.apple.ane.hardware-counters`), comparing FP16, INT8, QDQ, and GPU baselines while exporting self-contained `.mpsgraphpackage` bundles.
 
@@ -236,7 +258,7 @@ When `--save-package` is enabled, `measure_ane_pmu` serializes each variant into
 > 3. **Integer Scaling & DMA Reduction**: INT8 doubles throughput over FP16 and cuts Unified Memory DMA traffic directly in half.
 > 4. **Output Backpressure Stalls**: Because large feature maps exceed on-chip L2 SRAM (~4–8 MB), large spatial maps incur output backpressure to DRAM (`kANE_NE_OUTPUT_STALL_CYCLES`). Halving tensor size in INT8 cuts output stalls by >2.1× (503M → 233M cycles).
 > 5. **L2 SRAM Fitting**: Reducing spatial dimensions to fit inside L2 SRAM ($H=64, W=64$) collapses output writeback stalls by >16× (15.5M cycles). Note that dividing Total MACs by `COMPUTE_CYCLES` (`[13]`) yields an inflated ratio because `[13]` is gated during stalls; the physically bounded metric is Throughput per Nominal Cycle (`[10]`).
-> 6. **QDQ Execution**: In QDQ (`dequantize -> conv -> quantize`), the internal convolution arithmetic executes in FP16 precision, matching FP16 throughput (~18.60 TOPS) and FP16 DMA footprint (~35.27 MB).
+> 6. **QDQ Execution**: When weights remain in FP16 (as profiled in `measure_ane_pmu`), the ANE compiler is forced into FP16 arithmetic (~18.60 TOPS). However, when True W8A8 QDQ is used (`measure_conv_qdq`), dequantizing both INT8 weights and INT8 activations with scalar scales fuses directly into native INT8 execution on ANE, reaching **~36.8 TOPS** (matching Native INT8).
 >
 > *(For an exhaustive breakdown of each register, see [`How_to_Interpret_measure_ane_pmu_Numbers.md`](docs/How_to_Interpret_measure_ane_pmu_Numbers.md).)*
 

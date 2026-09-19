@@ -211,21 +211,38 @@ Large Tensors (H=256, W=256 | 16 MB/layer)         Cache-Resident Tensors (H=64,
 
 ## 5. Native INT8 vs. Quantize-Dequantize (QDQ)
 
-A common point of confusion is why QDQ (`dequantizeTensor` → `conv2D` → `quantizeTensor`) does not match Native INT8 performance. The PMU counters explain this unambiguously:
+A common point of confusion in earlier benchmarks was why QDQ (`dequantizeTensor` → `conv2D` → `quantizeTensor`) did not appear to match Native INT8 performance. The silicon PMU counters and subsequent compiler profiling clarify the exact distinction:
+
+### 5.1 Legacy FP16-Weight QDQ (Profiled Above in `measure_ane_pmu`)
 
 ```
 Native INT8 Pipeline:
 [INT8 Input in L2] ──► [Dual INT8 Multipliers (MULA+MULB)] ──► [INT8 Output in L2]
                       └─► Realized: 35.87 TOPS | Latency: 10.78 ms | DMA: 18.35 MB
 
-QDQ Pipeline:
+FP16-Weight QDQ Pipeline (Legacy):
 [INT8 Input] ──► [Dequantize to FP16] ──► [FP16 Multiplier MULA] ──► [Quantize to INT8]
+[FP16 Constant Weights] ─────────────────┘
                                           └─► Realized: 18.60 TOPS | Latency: 20.78 ms | DMA: 35.27 MB
 ```
 
-1. **Arithmetic Precision**: In QDQ, `MPSGraph` unrolls the convolution into **FP16 arithmetic**. The supplemental integer multiplier `MULB` is clock-gated OFF, halving peak compute throughput.
+1. **Arithmetic Precision**: When weights remain as FP16 constants, `MPSGraph` is forced to unroll the convolution into **FP16 arithmetic**. The supplemental integer multiplier `MULB` is clock-gated OFF, halving peak compute throughput.
 2. **DMA Footprint**: The intermediate dequantized activations are expanded to 16-bit floating-point, resulting in **35.27 MB of DMA traffic** (virtually identical to pure FP16's 34.99 MB).
-3. **Conclusion**: To unlock the 38 TOPS ceiling on Apple M4, models **must use Native INT8 tensor contracts** (`MPSDataTypeInt8` input and weights) rather than simulated float dequantization wrappers.
+
+### 5.2 True W8A8 QDQ (`measure_conv_qdq`)
+
+When **both** activations and weights are stored in `MPSDataTypeInt8` and dequantized with scalar parameters (`dequantizeTensor:scale:zeroPoint:` with `scale = 1/32, zeroPoint = 0`):
+
+```
+True W8A8 QDQ Pipeline (Scalar Ops):
+[INT8 Input]   ──► [Dequantize(scale=1/32)] ──► [Dual INT8 Multipliers (MULA+MULB)] ──► [Quantize(scale=1/32)] ──► [INT8 Output]
+[INT8 Weights] ──► [Dequantize(scale=1/32)] ──┘   (Fused by ANE Compiler into Native INT8)
+                                                  └─► Realized: 36.81 TOPS | Latency: 10.50 ms
+```
+
+1. **Compiler Fusion**: The Apple Neural Engine compiler detects symmetric INT8 operands across both activation and weight inputs. It folds the scalar scale multiplications into the post-accumulator scaling unit and binds the convolution to the native INT8 MAC hardware units (`MULA` + `MULB`).
+2. **Performance Parity**: True W8A8 QDQ reaches **36.81 TOPS (10.50 ms)** on Apple M4 Pro—matching Native INT8 convolution (**36.46 TOPS / 10.60 ms**) and CoreML MIL INT8 (**34.70 TOPS / 11.14 ms**) clock-for-clock.
+3. **Cross-Platform Portability**: Unlike native INT8 convolution (which fails on Metal GPU because Metal only supports FP16/FP32 convolution), True W8A8 QDQ executes universally across both the ANE (at ~37 TOPS) and Metal GPU (at ~9.8 TOPS).
 
 ---
 
