@@ -35,6 +35,7 @@ typedef struct {
   MLComputeUnits units;
   NSString *unitsName;
   MILWeightMode weightMode;
+  MILPrecision precision;
   BOOL showPlan;
   BOOL showMIL;
   BOOL checkOutput;
@@ -187,6 +188,15 @@ static BOOL resolveDimensions(MLModel *model, BenchConfig *cfg, BOOL *fromMetada
 
   NSString *co = meta[@"workload.channels_out"];
   cfg->Co = co ? (NSUInteger)co.integerValue : cfg->Ci;
+
+  NSString *prec = meta[@"workload.precision"];
+  if (prec) {
+    if ([prec isEqualToString:@"INT8"]) {
+      cfg->precision = MILPrecisionINT8;
+    } else {
+      cfg->precision = MILPrecisionFP16;
+    }
+  }
   return YES;
 }
 
@@ -288,8 +298,13 @@ static void dumpComputePlan(MLModelAsset *asset, NSURL *compiledURL,
 
       if (cfg.verbose) {
         NSString *outName = op.outputs.firstObject.name ?: @"?";
-        printf("   %-24s %-12s -> %-4s (cost weight %.4f)\n",
+        NSMutableArray *devNames = [NSMutableArray array];
+        for (id dev in usage.supportedComputeDevices) {
+          [devNames addObject:deviceLabel(dev)];
+        }
+        printf("   %-24s %-20s -> %-4s (supported: %s, cost weight %.4f)\n",
                outName.UTF8String, op.operatorName.UTF8String, label.UTF8String,
+               [devNames componentsJoinedByString:@", "].UTF8String,
                cost ? cost.weight : 0.0);
       }
     }
@@ -311,6 +326,7 @@ static void printUsage(const char *argv0) {
   printf("process at runtime, so every dimension below is just a flag.\n\n");
   printf("Options:\n");
   printf("  --units <target>   ane | gpu | cpu | all (default: ane)\n");
+  printf("  --precision <mode> fp16 (default) or int8 (W8A8 simulated QDQ)\n");
   printf("  --batch <B>        batch dimension (default: 1)\n");
   printf("  --size <H>         spatial height and width (default: 256)\n");
   printf("  --channels <C>     input and output channels (default: 128)\n");
@@ -369,6 +385,7 @@ static BOOL runBenchmark(BenchConfig cfg) {
           .kernel = cfg.K,
           .layers = cfg.L,
           .weightMode = cfg.weightMode,
+          .precision = cfg.precision,
       };
       if (cfg.showMIL) printf("\n%s\n", MILConvChainText(spec).UTF8String);
 
@@ -379,14 +396,32 @@ static BOOL runBenchmark(BenchConfig cfg) {
                 error.localizedDescription.UTF8String);
         return NO;
       }
-      // No file ever hits disk: the serialized spec goes straight into CoreML.
-      asset = [MLModelAsset modelAssetWithSpecificationData:specData
-                                                     error:&error];
-      prepMs = (nowSeconds() - buildStart) * 1000.0;
-      if (!asset) {
-        fprintf(stderr, "error: CoreML rejected the generated spec: %s\n",
-                error.localizedDescription.UTF8String);
-        return NO;
+      if (cfg.precision == MILPrecisionINT8) {
+        NSString *tempPath = [NSTemporaryDirectory()
+            stringByAppendingPathComponent:[NSString stringWithFormat:@"spec_int8_%d.mlmodel", getpid()]];
+        if (![specData writeToFile:tempPath options:0 error:&error]) {
+          fprintf(stderr, "error: failed to write temporary model: %s\n",
+                  error.localizedDescription.UTF8String);
+          return NO;
+        }
+        prepLabel = "Compile";
+        compiledURL = compileModel(tempPath, &prepMs, &error);
+        [[NSFileManager defaultManager] removeItemAtPath:tempPath error:nil];
+        if (!compiledURL) {
+          fprintf(stderr, "error: failed to compile INT8 model: %s\n",
+                  error.localizedDescription.UTF8String);
+          return NO;
+        }
+      } else {
+        // No file ever hits disk for FP16: the serialized spec goes straight into CoreML.
+        asset = [MLModelAsset modelAssetWithSpecificationData:specData
+                                                       error:&error];
+        prepMs = (nowSeconds() - buildStart) * 1000.0;
+        if (!asset) {
+          fprintf(stderr, "error: CoreML rejected the generated spec: %s\n",
+                  error.localizedDescription.UTF8String);
+          return NO;
+        }
       }
       if (cfg.verbose) {
         printf("Spec: %.1f KB (weights inline)\n", specData.length / 1024.0);
@@ -535,9 +570,10 @@ static BOOL runBenchmark(BenchConfig cfg) {
         2.0 * cfg.B * cfg.H * cfg.W * cfg.Ci * cfg.Co * cfg.K * cfg.K * cfg.L;
     double tops = (totalOps / 1e12) / avg;
 
-    printf("[CoreML %s FP16] %s: %.2f ms, Load: %.2f ms, Avg: %.2f ms, "
+    printf("[CoreML %s %s] %s: %.2f ms, Load: %.2f ms, Avg: %.2f ms, "
            "Speed: %.4f TOPS (%.1f FPS)\n",
-           cfg.unitsName.UTF8String, prepLabel, prepMs, loadMs, avg * 1000.0,
+           cfg.unitsName.UTF8String, MILPrecisionName(cfg.precision).UTF8String,
+           prepLabel, prepMs, loadMs, avg * 1000.0,
            tops, 1.0 / avg);
 
     if (cfg.checkOutput) {
@@ -650,6 +686,7 @@ int main(int argc, char *argv[]) {
       .units = MLComputeUnitsCPUAndNeuralEngine,
       .unitsName = @"ANE",
       .weightMode = MILWeightModeDense,
+      .precision = MILPrecisionFP16,
       .showPlan = NO,
       .showMIL = NO,
       .checkOutput = NO,
@@ -679,6 +716,16 @@ int main(int argc, char *argv[]) {
         cfg.unitsName = @"All";
       } else {
         fprintf(stderr, "error: unknown --units value '%s'\n", u.UTF8String);
+        return 1;
+      }
+    } else if ([arg isEqualToString:@"--precision"] && i + 1 < argc) {
+      NSString *v = [[NSString stringWithUTF8String:argv[++i]] lowercaseString];
+      if ([v isEqualToString:@"fp16"]) {
+        cfg.precision = MILPrecisionFP16;
+      } else if ([v isEqualToString:@"int8"]) {
+        cfg.precision = MILPrecisionINT8;
+      } else {
+        fprintf(stderr, "error: unknown --precision value '%s' (expected fp16 or int8)\n", v.UTF8String);
         return 1;
       }
     } else if ([arg isEqualToString:@"--batch"] && i + 1 < argc) {
@@ -753,7 +800,8 @@ int main(int argc, char *argv[]) {
     return 1;
   }
 
-  printf("CoreML Conv2D Capacity Benchmark\n");
+  printf("CoreML Conv2D Capacity Benchmark (%s)\n",
+         MILPrecisionName(cfg.precision).UTF8String);
   if (cfg.modelPath) {
     printf("Model: %s\n", cfg.modelPath.UTF8String);
   } else {

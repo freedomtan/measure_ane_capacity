@@ -92,6 +92,24 @@ static mil::Value Int32Value(const std::vector<int32_t> &values, bool scalar) {
   return value;
 }
 
+static mil::Value Float16ScalarValue(uint16_t rawBits) {
+  mil::Value value;
+  *value.mutable_type() = TensorValueType(mil::FLOAT16, {});
+  std::string bytes((const char *)&rawBits, sizeof(uint16_t));
+  value.mutable_immediatevalue()->mutable_tensor()->mutable_bytes()->set_values(
+      bytes);
+  return value;
+}
+
+static mil::Value Int8ScalarValue(int8_t val) {
+  mil::Value value;
+  *value.mutable_type() = TensorValueType(mil::INT8, {});
+  std::string bytes((const char *)&val, sizeof(int8_t));
+  value.mutable_immediatevalue()->mutable_tensor()->mutable_bytes()->set_values(
+      bytes);
+  return value;
+}
+
 #pragma mark - Operations
 
 // A const op carries its payload in attributes["val"], not in inputs. That is
@@ -107,6 +125,42 @@ static void AddConstOp(mil::Block *block, const std::string &name,
   *value.mutable_type() = type;
   (*op->mutable_attributes())["val"] = std::move(value);
   (*op->mutable_attributes())["name"] = StringValue(name);
+}
+
+static void AddConstexprBlockwiseShiftScaleOp(
+    mil::Block *block, const std::string &outputName,
+    const std::vector<uint64_t> &weightShape, std::string weightBytes,
+    uint16_t scaleFP16) {
+  mil::Operation *op = block->add_operations();
+  op->set_type("constexpr_blockwise_shift_scale");
+
+  // data input with inline INT8 bytes
+  {
+    auto *arg = (*op->mutable_inputs())["data"].add_arguments();
+    mil::Value *val = arg->mutable_value();
+    SetTensorType(val->mutable_type(), mil::INT8, weightShape);
+    val->mutable_immediatevalue()->mutable_tensor()->mutable_bytes()->set_values(
+        std::move(weightBytes));
+  }
+
+  // scale input with rank-4 [Co, 1, 1, 1] shape
+  {
+    uint64_t Co = weightShape.empty() ? 1 : weightShape[0];
+    auto *arg = (*op->mutable_inputs())["scale"].add_arguments();
+    mil::Value *val = arg->mutable_value();
+    SetTensorType(val->mutable_type(), mil::FLOAT16, {Co, 1, 1, 1});
+    std::string scaleBytes(Co * sizeof(uint16_t), '\0');
+    uint16_t *p = (uint16_t *)scaleBytes.data();
+    for (size_t i = 0; i < Co; i++) p[i] = scaleFP16;
+    val->mutable_immediatevalue()->mutable_tensor()->mutable_bytes()->set_values(
+        std::move(scaleBytes));
+  }
+
+  mil::NamedValueType *out = op->add_outputs();
+  out->set_name(outputName);
+  SetTensorType(out->mutable_type(), mil::FLOAT16, weightShape);
+
+  (*op->mutable_attributes())["name"] = StringValue(outputName);
 }
 
 // Every input of a non-const op binds to a previously defined value by name.
@@ -160,6 +214,29 @@ static std::string WeightBytes(MILConvChainConfig config) {
   return bytes;
 }
 
+static std::string WeightBytesINT8(MILConvChainConfig config) {
+  size_t count = (size_t)config.channelsOut * config.channelsIn *
+                 config.kernel * config.kernel;
+  std::string bytes(count * sizeof(int8_t), '\0');
+  int8_t *p = (int8_t *)bytes.data();
+
+  if (config.weightMode == MILWeightModeRepeat) {
+    static const int8_t pattern[4] = {1, -1, 2, -2};
+    for (size_t i = 0; i < count; i++) p[i] = pattern[i % 4];
+    return bytes;
+  }
+
+  // Non-cancelling random signs {-1, 1}
+  uint64_t state = kWeightSeed;
+  for (size_t i = 0; i < count; i++) {
+    state ^= state << 13;
+    state ^= state >> 7;
+    state ^= state << 17;
+    p[i] = (state & 1) ? -1 : 1;
+  }
+  return bytes;
+}
+
 #pragma mark - Model description
 
 static void SetArrayFeature(ms::FeatureDescription *desc,
@@ -177,13 +254,14 @@ static void SetArrayFeature(ms::FeatureDescription *desc,
 // input shape. Without them a stale --kernel/--layers silently scales TOPS.
 static void SetMetadata(ms::Metadata *metadata, MILConvChainConfig config) {
   NSString *summary = [NSString
-      stringWithFormat:@"%lux conv%lux%lu on [%lu, %lu, %lu, %lu], fp16, "
+      stringWithFormat:@"%lux conv%lux%lu on [%lu, %lu, %lu, %lu], %@, "
                        @"weights=%@",
                        (unsigned long)config.layers,
                        (unsigned long)config.kernel,
                        (unsigned long)config.kernel, (unsigned long)config.batch,
                        (unsigned long)config.channelsIn,
                        (unsigned long)config.height, (unsigned long)config.width,
+                       MILPrecisionName(config.precision),
                        MILWeightModeName(config.weightMode)];
   metadata->set_shortdescription(summary.UTF8String);
 
@@ -195,6 +273,8 @@ static void SetMetadata(ms::Metadata *metadata, MILConvChainConfig config) {
   userDefined["workload.width"] = std::to_string(config.width);
   userDefined["workload.kernel"] = std::to_string(config.kernel);
   userDefined["workload.layers"] = std::to_string(config.layers);
+  userDefined["workload.precision"] =
+      MILPrecisionName(config.precision).UTF8String;
   userDefined["workload.weights"] =
       MILWeightModeName(config.weightMode).UTF8String;
   userDefined["builder"] = "MILSpecBuilder (native, no coremltools)";
@@ -211,6 +291,10 @@ NSString *MILConvChainOutputName(MILConvChainConfig config) {
 
 NSString *MILWeightModeName(MILWeightMode mode) {
   return mode == MILWeightModeRepeat ? @"repeat" : @"dense";
+}
+
+NSString *MILPrecisionName(MILPrecision precision) {
+  return precision == MILPrecisionINT8 ? @"INT8" : @"FP16";
 }
 
 static NSError *MILError(NSInteger code, NSString *message) {
@@ -284,15 +368,28 @@ NSData *MILBuildConvChainSpec(MILConvChainConfig config, NSError **error) {
   mil::Block &block = (*function.mutable_block_specializations())[kOpset];
   block.add_outputs(outputName);
 
-  // One weight constant shared by every layer, as in the MPSGraph version.
-  mil::Value weights;
-  weights.mutable_immediatevalue()->mutable_tensor()->mutable_bytes()->set_values(
-      WeightBytes(config));
-  AddConstOp(&block, "weights",
-             TensorValueType(mil::FLOAT16,
-                             {config.channelsOut, config.channelsIn,
-                              config.kernel, config.kernel}),
-             std::move(weights));
+  if (config.precision == MILPrecisionINT8) {
+    // Weights: constexpr_blockwise_shift_scale with INT8 inline data
+    AddConstexprBlockwiseShiftScaleOp(
+        &block, "weights",
+        {config.channelsOut, config.channelsIn, config.kernel, config.kernel},
+        WeightBytesINT8(config), kFP16PlusOneThirtySecond);
+
+    // Activation scale const: scalar fp16 1/32
+    AddConstOp(&block, "act_scale", TensorValueType(mil::FLOAT16, {}),
+               Float16ScalarValue(kFP16PlusOneThirtySecond));
+    AddConstOp(&block, "dtype_int8", StringScalarType(), StringValue("int8"));
+  } else {
+    // One weight constant shared by every layer, as in the MPSGraph version.
+    mil::Value weights;
+    weights.mutable_immediatevalue()->mutable_tensor()->mutable_bytes()->set_values(
+        WeightBytes(config));
+    AddConstOp(&block, "weights",
+               TensorValueType(mil::FLOAT16,
+                               {config.channelsOut, config.channelsIn,
+                                config.kernel, config.kernel}),
+               std::move(weights));
+  }
 
   // Constants the conv ops bind to. NCHW plus "same" padding matches the
   // MPSGraph descriptor (NCHW / OIHW / TF_SAME) in measure_conv_universal.m, so
@@ -309,11 +406,30 @@ NSData *MILBuildConvChainSpec(MILConvChainConfig config, NSError **error) {
 
   const mil::ValueType activationType =
       TensorValueType(mil::FLOAT16, outputShape);
+  const mil::ValueType quantizedType =
+      TensorValueType(mil::INT8, outputShape);
   std::string current = MILConvChainInputName().UTF8String;
   for (NSUInteger i = 0; i < config.layers; i++) {
+    std::string convInput = current;
+    if (config.precision == MILPrecisionINT8) {
+      std::string qName = "quant_" + std::to_string(i);
+      AddOp(&block, "quantize",
+            {{"input", current},
+             {"scale", "act_scale"},
+             {"output_dtype", "dtype_int8"}},
+            qName, quantizedType);
+
+      std::string dqName = "dequant_" + std::to_string(i);
+      AddOp(&block, "dequantize",
+            {{"input", qName},
+             {"scale", "act_scale"}},
+            dqName, activationType);
+      convInput = std::move(dqName);
+    }
+
     std::string name = "conv_" + std::to_string(i);
     AddOp(&block, "conv",
-          {{"x", current},
+          {{"x", convInput},
            {"weight", "weights"},
            {"strides", "strides"},
            {"pad_type", "pad_type"},
@@ -339,22 +455,47 @@ NSString *MILConvChainText(MILConvChainConfig config) {
                      (unsigned long)config.batch,
                      (unsigned long)config.channelsIn,
                      (unsigned long)config.height, (unsigned long)config.width];
-  [text appendFormat:@"  weights = const(fp16[%lu, %lu, %lu, %lu])  // %@, "
-                     @"%lu bytes inline\n",
-                     (unsigned long)config.channelsOut,
-                     (unsigned long)config.channelsIn,
-                     (unsigned long)config.kernel, (unsigned long)config.kernel,
-                     MILWeightModeName(config.weightMode),
-                     (unsigned long)(config.channelsOut * config.channelsIn *
-                                     config.kernel * config.kernel * 2)];
+  if (config.precision == MILPrecisionINT8) {
+    [text appendFormat:@"  weights_int8 = const(int8[%lu, %lu, %lu, %lu])  // %@, "
+                       @"%lu bytes inline\n",
+                       (unsigned long)config.channelsOut,
+                       (unsigned long)config.channelsIn,
+                       (unsigned long)config.kernel, (unsigned long)config.kernel,
+                       MILWeightModeName(config.weightMode),
+                       (unsigned long)(config.channelsOut * config.channelsIn *
+                                       config.kernel * config.kernel)];
+    [text appendFormat:@"  weights = dequantize(input=weights_int8, scale=1/32, zero_point=0)\n"];
+  } else {
+    [text appendFormat:@"  weights = const(fp16[%lu, %lu, %lu, %lu])  // %@, "
+                       @"%lu bytes inline\n",
+                       (unsigned long)config.channelsOut,
+                       (unsigned long)config.channelsIn,
+                       (unsigned long)config.kernel, (unsigned long)config.kernel,
+                       MILWeightModeName(config.weightMode),
+                       (unsigned long)(config.channelsOut * config.channelsIn *
+                                       config.kernel * config.kernel * 2)];
+  }
   NSString *current = MILConvChainInputName();
   for (NSUInteger i = 0; i < config.layers; i++) {
-    NSString *name = [NSString stringWithFormat:@"conv_%lu", (unsigned long)i];
-    [text appendFormat:@"  %@ = conv(x=%@, weight=weights, strides=[1, 1], "
-                       @"pad_type=same, pad=[0, 0, 0, 0], dilations=[1, 1], "
-                       @"groups=1)\n",
-                       name, current];
-    current = name;
+    NSString *convName = [NSString stringWithFormat:@"conv_%lu", (unsigned long)i];
+    if (config.precision == MILPrecisionINT8) {
+      NSString *qName = [NSString stringWithFormat:@"quant_%lu", (unsigned long)i];
+      NSString *dqName = [NSString stringWithFormat:@"dequant_%lu", (unsigned long)i];
+      [text appendFormat:@"  %@ = quantize(input=%@, scale=1/32, zero_point=0, output_dtype=\"int8\")\n",
+                         qName, current];
+      [text appendFormat:@"  %@ = dequantize(input=%@, scale=1/32, zero_point=0)\n",
+                         dqName, qName];
+      [text appendFormat:@"  %@ = conv(x=%@, weight=weights, strides=[1, 1], "
+                         @"pad_type=same, pad=[0, 0, 0, 0], dilations=[1, 1], "
+                         @"groups=1)\n",
+                         convName, dqName];
+    } else {
+      [text appendFormat:@"  %@ = conv(x=%@, weight=weights, strides=[1, 1], "
+                         @"pad_type=same, pad=[0, 0, 0, 0], dilations=[1, 1], "
+                         @"groups=1)\n",
+                         convName, current];
+    }
+    current = convName;
   }
   [text appendFormat:@"  -> %@\n", current];
   return text;

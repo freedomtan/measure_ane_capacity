@@ -30,9 +30,16 @@ typedef NS_ENUM(NSInteger, MILWeightMode) {
   MILWeightModeRepeat = 1,
 };
 
+/// Precision mode for the benchmark.
+typedef NS_ENUM(NSInteger, MILPrecision) {
+  MILPrecisionFP16 = 0,
+  /// Quantized INT8 / W8A8 QDQ: activation quantize/dequantize, INT8 weights
+  /// dequantized to FP16, and FP16 conv executed on the ANE matrix engine.
+  MILPrecisionINT8 = 1,
+};
+
 /// The workload: `layers` chained KxK convolutions over [batch, channelsIn,
-/// height, width], NCHW layout, SAME padding, fp16 throughout. Mirrors the
-/// MPSGraph graph in measure_conv_universal.m.
+/// height, width], NCHW layout, SAME padding.
 typedef struct {
   NSUInteger batch;
   NSUInteger channelsIn;
@@ -42,6 +49,7 @@ typedef struct {
   NSUInteger kernel;
   NSUInteger layers;
   MILWeightMode weightMode;
+  MILPrecision precision;
 } MILConvChainConfig;
 
 FOUNDATION_EXPORT NSString *const MILSpecBuilderErrorDomain;
@@ -53,6 +61,7 @@ FOUNDATION_EXPORT NSString *MILConvChainInputName(void);
 FOUNDATION_EXPORT NSString *MILConvChainOutputName(MILConvChainConfig config);
 
 FOUNDATION_EXPORT NSString *MILWeightModeName(MILWeightMode mode);
+FOUNDATION_EXPORT NSString *MILPrecisionName(MILPrecision precision);
 
 /// Serialize a complete CoreML `Model` protobuf for `config`.
 /// Returns nil and fills `error` if any dimension is zero.
