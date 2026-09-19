@@ -27,6 +27,9 @@ typedef struct {
   BOOL checkOutput;
   BOOL verbose;
   BOOL denseInput;
+  // Which dimensions the user set explicitly. Anything left unset is taken from
+  // the model's own metadata, so the common case needs no dimension flags.
+  BOOL setB, setSize, setChannels, setKernel, setLayers;
 } BenchConfig;
 
 // Fill buffer with the tiled non-zero pattern used by measure_conv_universal.m,
@@ -124,6 +127,54 @@ static NSString *soleInputName(MLModel *model) {
 
 static NSString *soleOutputName(MLModel *model) {
   return model.modelDescription.outputDescriptionsByName.allKeys.firstObject;
+}
+
+// Adopt the workload dimensions stamped into the model by tools/gen_conv_mil.py.
+// K and L cannot be recovered from the input shape, so without this a stale
+// --kernel or --layers would silently scale the reported TOPS. Flags the user set
+// explicitly are honoured but must agree with the model.
+static BOOL resolveDimensions(MLModel *model, BenchConfig *cfg, BOOL *fromMetadata) {
+  NSDictionary *meta =
+      model.modelDescription.metadata[MLModelCreatorDefinedKey];
+  *fromMetadata = NO;
+  if (![meta isKindOfClass:[NSDictionary class]] || !meta[@"workload.layers"]) {
+    return YES;  // Foreign model: fall back to flags plus the shape check below.
+  }
+  *fromMetadata = YES;
+
+  struct {
+    NSString *key;
+    NSUInteger *slot;
+    BOOL wasSet;
+    const char *flag;
+  } fields[] = {
+      {@"workload.batch", &cfg->B, cfg->setB, "--batch"},
+      {@"workload.channels_in", &cfg->Ci, cfg->setChannels, "--channels"},
+      {@"workload.height", &cfg->H, cfg->setSize, "--size"},
+      {@"workload.width", &cfg->W, cfg->setSize, "--size"},
+      {@"workload.kernel", &cfg->K, cfg->setKernel, "--kernel"},
+      {@"workload.layers", &cfg->L, cfg->setLayers, "--layers"},
+  };
+
+  for (size_t i = 0; i < sizeof(fields) / sizeof(fields[0]); i++) {
+    NSString *raw = meta[fields[i].key];
+    if (!raw) continue;
+    NSUInteger value = (NSUInteger)raw.integerValue;
+    if (fields[i].wasSet && *fields[i].slot != value) {
+      fprintf(stderr,
+              "error: %s=%lu disagrees with the model's own %s=%lu.\n"
+              "       Omit the flag to use the model's value, or generate a "
+              "matching model.\n",
+              fields[i].flag, (unsigned long)*fields[i].slot,
+              fields[i].key.UTF8String, (unsigned long)value);
+      return NO;
+    }
+    *fields[i].slot = value;
+  }
+
+  NSString *co = meta[@"workload.channels_out"];
+  cfg->Co = co ? (NSUInteger)co.integerValue : cfg->Ci;
+  return YES;
 }
 
 // A dimension mismatch between the model and the --size/--channels/--layers
@@ -241,11 +292,13 @@ static void printUsage(const char *argv0) {
   printf("  --model <path>     .mlpackage or .mlmodelc to benchmark "
          "(default: models/conv_fp16.mlpackage)\n");
   printf("  --units <target>   ane | gpu | cpu | all (default: ane)\n");
-  printf("  --batch <B>        batch dimension (default: 1)\n");
-  printf("  --size <H>         spatial height and width (default: 256)\n");
-  printf("  --channels <C>     input and output channels (default: 128)\n");
-  printf("  --kernel <K>       kernel size (default: 3)\n");
-  printf("  --layers <L>       number of chained conv layers (default: 20)\n");
+  printf("\n  Dimensions are read from the model's own metadata; the flags below\n");
+  printf("  are only needed for models without it, and must agree if given.\n");
+  printf("  --batch <B>        batch dimension\n");
+  printf("  --size <H>         spatial height and width\n");
+  printf("  --channels <C>     input and output channels\n");
+  printf("  --kernel <K>       kernel size\n");
+  printf("  --layers <L>       number of chained conv layers\n\n");
   printf("  --input <mode>     dense (random-sign, non-cancelling) | repeat "
          "(tiled pattern matching the MPSGraph binaries) (default: dense)\n");
   printf("  --iterations <N>   timed prediction count (default: 20)\n");
@@ -304,7 +357,18 @@ static BOOL runBenchmark(BenchConfig cfg) {
       return NO;
     }
 
+    BOOL fromMetadata = NO;
+    if (!resolveDimensions(model, &cfg, &fromMetadata)) return NO;
     if (!validateShape(model, cfg)) return NO;
+
+    printf("Workload: [%lu, %lu, %lu, %lu] x %lu conv%lux%lu (Co=%lu), "
+           "%.2f GOPs/pass, %lu iterations%s\n",
+           (unsigned long)cfg.B, (unsigned long)cfg.Ci, (unsigned long)cfg.H,
+           (unsigned long)cfg.W, (unsigned long)cfg.L, (unsigned long)cfg.K,
+           (unsigned long)cfg.K, (unsigned long)cfg.Co,
+           2.0 * cfg.B * cfg.H * cfg.W * cfg.Ci * cfg.Co * cfg.K * cfg.K * cfg.L / 1e9,
+           (unsigned long)cfg.iterations,
+           fromMetadata ? " (dimensions from model metadata)" : "");
 
     NSString *inputName = soleInputName(model);
     NSString *outputName = soleOutputName(model);
@@ -468,14 +532,19 @@ int main(int argc, char *argv[]) {
       }
     } else if ([arg isEqualToString:@"--batch"] && i + 1 < argc) {
       cfg.B = atoi(argv[++i]);
+      cfg.setB = YES;
     } else if ([arg isEqualToString:@"--size"] && i + 1 < argc) {
       cfg.H = cfg.W = atoi(argv[++i]);
+      cfg.setSize = YES;
     } else if ([arg isEqualToString:@"--channels"] && i + 1 < argc) {
       cfg.Ci = cfg.Co = atoi(argv[++i]);
+      cfg.setChannels = YES;
     } else if ([arg isEqualToString:@"--kernel"] && i + 1 < argc) {
       cfg.K = atoi(argv[++i]);
+      cfg.setKernel = YES;
     } else if ([arg isEqualToString:@"--layers"] && i + 1 < argc) {
       cfg.L = atoi(argv[++i]);
+      cfg.setLayers = YES;
     } else if ([arg isEqualToString:@"--iterations"] && i + 1 < argc) {
       cfg.iterations = atoi(argv[++i]);
     } else if ([arg isEqualToString:@"--warmup"] && i + 1 < argc) {
@@ -514,13 +583,6 @@ int main(int argc, char *argv[]) {
   printf("CoreML Conv2D Capacity Benchmark\n");
   printf("Model: %s\n", cfg.modelPath.UTF8String);
   printf("Input: %s\n", cfg.denseInput ? "dense (random-sign)" : "repeat (tiled)");
-  printf("Workload: [%lu, %lu, %lu, %lu] x %lu conv%lux%lu (Co=%lu), "
-         "%.2f GOPs/pass, %lu iterations\n",
-         (unsigned long)cfg.B, (unsigned long)cfg.Ci, (unsigned long)cfg.H,
-         (unsigned long)cfg.W, (unsigned long)cfg.L, (unsigned long)cfg.K,
-         (unsigned long)cfg.K, (unsigned long)cfg.Co,
-         2.0 * cfg.B * cfg.H * cfg.W * cfg.Ci * cfg.Co * cfg.K * cfg.K * cfg.L / 1e9,
-         (unsigned long)cfg.iterations);
 
   return runBenchmark(cfg) ? 0 : 1;
 }

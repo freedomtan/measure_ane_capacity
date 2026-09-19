@@ -79,12 +79,36 @@ make models
 make measure_conv_coreml
 ./measure_conv_coreml --plan --check
 
-# Non-default configuration: generate a matching model, then point at it
+# Non-default configuration: generate a model, then just point at it
 python3 tools/gen_conv_mil.py --size 64 --layers 10 --no-default-copy
-./measure_conv_coreml --model models/conv_fp16_B1_C128_H64_K3_L10.mlpackage --size 64 --layers 10
+./measure_conv_coreml --model models/conv_fp16_B1_C128_H64_K3_L10.mlpackage
+
+# Sweep an axis: one model per point, then run each
+python3 tools/gen_conv_mil.py --sweep kernel --size 128 --layers 10
+for m in models/conv_fp16_B1_C128_H128_K*_L10.mlpackage; do ./measure_conv_coreml --model "$m"; done
 ```
 
-The CLI refuses to run if the `--size`/`--channels`/`--batch` flags disagree with the model's actual input shape, or if the model's I/O is not Float16 — either would produce a plausible-looking but wrong TOPS figure.
+#### Changing parameters
+A CoreML model has a **static input shape**, and the layer count is baked into the graph, so unlike the MPSGraph binaries (which build their graph at runtime) each configuration needs its own generated `.mlpackage`. All dimensions are parameterized on the generator: `--batch`, `--size`, `--channels`, `--kernel`, `--layers`. `--sweep {channels,spatial,depth,kernel}` generates a model per point along one axis (override the points with `--sweep-values 32,64,128`); the axes mirror `SweepType` in the app's [`BenchmarkModels.swift`](ANECapacityApp/ANECapacityApp/BenchmarkModels.swift).
+
+You do **not** repeat the dimensions when running. The generator stamps the workload into the model's user-defined metadata, and `measure_conv_coreml` reads it back, so `--model <path>` is sufficient and the TOPS numerator always matches the graph actually being executed. This matters because $K$ and $L$ are not recoverable from the input shape — a stale `--layers` would otherwise silently scale the reported throughput. Passing a dimension flag that disagrees with the model is a hard error:
+
+```
+$ ./measure_conv_coreml --layers 50
+error: --layers=50 disagrees with the model's own workload.layers=20.
+       Omit the flag to use the model's value, or generate a matching model.
+```
+
+The CLI likewise refuses to run if the model's I/O is not Float16, since an FP32 boundary would add a per-prediction CPU cast and invalidate the measurement.
+
+*Example — kernel-size sweep at $C=128, H=W=128, L=10$, showing arithmetic intensity saturating the ANE (dimensions read from each model, no flags):*
+
+| Kernel | GOPs/pass | Latency | Speed (TOPS) |
+| :--- | ---: | ---: | ---: |
+| $1\times1$ | 5.37 | 0.82 ms | 6.55 |
+| $3\times3$ | 48.32 | 3.23 ms | 14.95 |
+| $5\times5$ | 134.22 | 7.44 ms | 18.04 |
+| $7\times7$ | 263.07 | 14.25 ms | **18.46** |
 
 #### CLI Options
 | Flag | Description | Default |
@@ -92,7 +116,7 @@ The CLI refuses to run if the `--size`/`--channels`/`--batch` flags disagree wit
 | `--model <path>` | `.mlpackage` or `.mlmodelc` to benchmark | `models/conv_fp16.mlpackage` |
 | `--units <target>` | `ane`, `gpu`, `cpu`, or `all` | `ane` |
 | `--input <mode>` | `dense` (random-sign) or `repeat` (tiled, matches the MPSGraph binaries) | `dense` |
-| `--batch/--size/--channels/--kernel/--layers` | Workload dimensions, validated against the model | `1 / 256 / 128 / 3 / 20` |
+| `--batch/--size/--channels/--kernel/--layers` | Workload dimensions. Only needed for models lacking metadata; must agree with the model if given | from model metadata |
 | `--iterations <N>` / `--warmup <N>` | Timed and warmup prediction counts | `20` / `3` |
 | `--plan` | Dump per-operation compute device placement | Disabled |
 | `--check` | Verify output is finite and non-zero across the conv chain | Disabled |

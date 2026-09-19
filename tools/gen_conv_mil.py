@@ -113,46 +113,18 @@ def mil_text(mlmodel):
     return "\n".join(lines) + "\n"
 
 
-def main():
-    p = argparse.ArgumentParser(
-        description="Generate MIL-authored CoreML conv models for ANE benchmarking"
-    )
-    p.add_argument("--batch", type=int, default=1, help="batch dimension B")
-    p.add_argument("--size", type=int, default=256, help="spatial height and width H=W")
-    p.add_argument("--channels", type=int, default=128, help="input/output channels Ci=Co")
-    p.add_argument("--kernel", type=int, default=3, help="kernel size K")
-    p.add_argument("--layers", type=int, default=20, help="number of chained conv layers")
-    p.add_argument("--variant", default="fp16", choices=["fp16"], help="precision variant")
-    p.add_argument(
-        "--weights",
-        default="dense",
-        choices=["dense", "repeat"],
-        help="weight init: dense (random-sign, non-cancelling) or repeat "
-        "(tiled pattern matching the MPSGraph binaries; cancels to zero)",
-    )
-    p.add_argument("--out", default="models", help="output directory")
-    p.add_argument(
-        "--no-default-copy",
-        action="store_true",
-        help="skip writing the unsuffixed conv_<variant>.mlpackage copy",
-    )
-    args = p.parse_args()
-
-    B, H, W = args.batch, args.size, args.size
-    Ci = Co = args.channels
-    K, L = args.kernel, args.layers
-
+def generate(B, Ci, Co, H, W, K, L, variant, weight_mode, out_dir, default_copy):
     opset = ct.target.iOS18
     print(
         f"Building MIL program: [{B}, {Ci}, {H}, {W}] -> {L}x conv{K}x{K} "
-        f"(Co={Co}), fp16, NCHW/SAME, weights={args.weights}"
+        f"(Co={Co}), fp16, NCHW/SAME, weights={weight_mode}"
     )
-    if args.weights == "repeat":
+    if weight_mode == "repeat":
         print(
             "warning: 'repeat' weights cancel exactly under the conv reduction; "
             "layers 2..L will consume an all-zero tensor."
         )
-    prog = build_program(B, Ci, Co, H, W, K, L, opset, args.weights)
+    prog = build_program(B, Ci, Co, H, W, K, L, opset, weight_mode)
 
     # FP16 input and output types: an FP32 boundary would force CoreML to cast a
     # multi-MB tensor on the CPU every prediction, swamping the measurement.
@@ -173,16 +145,36 @@ def main():
         )
     print(f"Verified {found}/{L} conv ops survived conversion")
 
-    os.makedirs(args.out, exist_ok=True)
+    # Stamp the workload into the model so measure_conv_coreml can derive the
+    # TOPS numerator from the model itself. K and L are not recoverable from the
+    # input shape, so without this a wrong --kernel/--layers would silently
+    # scale the reported throughput.
+    mlmodel.user_defined_metadata.update(
+        {
+            "workload.batch": str(B),
+            "workload.channels_in": str(Ci),
+            "workload.channels_out": str(Co),
+            "workload.height": str(H),
+            "workload.width": str(W),
+            "workload.kernel": str(K),
+            "workload.layers": str(L),
+            "workload.weights": weight_mode,
+        }
+    )
+    mlmodel.short_description = (
+        f"{L}x conv{K}x{K} on [{B}, {Ci}, {H}, {W}], fp16, weights={weight_mode}"
+    )
+
+    os.makedirs(out_dir, exist_ok=True)
     # Only the non-default weight mode is tagged, so the common case reads cleanly.
-    tag = "" if args.weights == "dense" else f"_{args.weights}"
-    stem = f"conv_{args.variant}{tag}_B{B}_C{Ci}_H{H}_K{K}_L{L}"
-    pkg = os.path.join(args.out, stem + ".mlpackage")
+    tag = "" if weight_mode == "dense" else f"_{weight_mode}"
+    stem = f"conv_{variant}{tag}_B{B}_C{Ci}_H{H}_K{K}_L{L}"
+    pkg = os.path.join(out_dir, stem + ".mlpackage")
     if os.path.exists(pkg):
         shutil.rmtree(pkg)
     mlmodel.save(pkg)
 
-    mil_path = os.path.join(args.out, stem + ".mil.txt")
+    mil_path = os.path.join(out_dir, stem + ".mil.txt")
     with open(mil_path, "w") as f:
         f.write(mil_text(mlmodel))
 
@@ -190,12 +182,90 @@ def main():
     print(f"Wrote {mil_path}")
 
     # Stable unsuffixed name so measure_conv_coreml runs with no arguments.
-    if not args.no_default_copy:
-        default_pkg = os.path.join(args.out, f"conv_{args.variant}{tag}.mlpackage")
+    if default_copy:
+        default_pkg = os.path.join(out_dir, f"conv_{variant}{tag}.mlpackage")
         if os.path.exists(default_pkg):
             shutil.rmtree(default_pkg)
         shutil.copytree(pkg, default_pkg)
         print(f"Wrote {default_pkg}")
+    return pkg
+
+
+# Sweep axes mirror SweepType in ANECapacityApp/BenchmarkModels.swift.
+SWEEP_AXES = {
+    "channels": ("channels", [32, 64, 128, 192, 256]),
+    "spatial": ("size", [64, 128, 192, 256]),
+    "depth": ("layers", [1, 5, 10, 20, 50]),
+    "kernel": ("kernel", [1, 3, 5, 7]),
+}
+
+
+def main():
+    p = argparse.ArgumentParser(
+        description="Generate MIL-authored CoreML conv models for ANE benchmarking"
+    )
+    p.add_argument("--batch", type=int, default=1, help="batch dimension B")
+    p.add_argument("--size", type=int, default=256, help="spatial height and width H=W")
+    p.add_argument("--channels", type=int, default=128, help="input/output channels Ci=Co")
+    p.add_argument("--kernel", type=int, default=3, help="kernel size K")
+    p.add_argument("--layers", type=int, default=20, help="number of chained conv layers")
+    p.add_argument("--variant", default="fp16", choices=["fp16"], help="precision variant")
+    p.add_argument(
+        "--weights",
+        default="dense",
+        choices=["dense", "repeat"],
+        help="weight init: dense (random-sign, non-cancelling) or repeat "
+        "(tiled pattern matching the MPSGraph binaries; cancels to zero)",
+    )
+    p.add_argument("--out", default="models", help="output directory")
+    p.add_argument(
+        "--sweep",
+        choices=sorted(SWEEP_AXES),
+        help="generate a model per point along an axis "
+        "(channels, spatial, depth, kernel), holding the other dimensions fixed",
+    )
+    p.add_argument(
+        "--sweep-values",
+        help="comma-separated values overriding the default points for --sweep",
+    )
+    p.add_argument(
+        "--no-default-copy",
+        action="store_true",
+        help="skip writing the unsuffixed conv_<variant>.mlpackage copy",
+    )
+    args = p.parse_args()
+
+    if args.sweep:
+        attr, values = SWEEP_AXES[args.sweep]
+        if args.sweep_values:
+            values = [int(v) for v in args.sweep_values.split(",")]
+        print(f"Sweeping {args.sweep} ({attr}) over {values}\n")
+        written = []
+        for v in values:
+            dims = dict(
+                batch=args.batch, size=args.size, channels=args.channels,
+                kernel=args.kernel, layers=args.layers,
+            )
+            dims[attr] = v
+            written.append(
+                generate(
+                    dims["batch"], dims["channels"], dims["channels"],
+                    dims["size"], dims["size"], dims["kernel"], dims["layers"],
+                    args.variant, args.weights, args.out,
+                    default_copy=False,
+                )
+            )
+            print()
+        print(f"Generated {len(written)} models for the {args.sweep} sweep.")
+        return
+
+    generate(
+        args.batch, args.channels, args.channels, args.size, args.size,
+        args.kernel, args.layers, args.variant, args.weights, args.out,
+        default_copy=not args.no_default_copy,
+    )
+
+
 
 
 if __name__ == "__main__":
