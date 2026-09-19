@@ -3,6 +3,7 @@ CFLAGS = -fobjc-arc -O3
 FRAMEWORKS = -framework Foundation -framework Metal -framework MetalPerformanceShadersGraph
 LDFLAGS = ${FRAMEWORKS}
 ANE_FRAMEWORKS = -F/System/Library/PrivateFrameworks -framework AppleNeuralEngine -framework IOSurface -framework IOKit -framework Security
+<<<<<<< HEAD
 # measure_conv_coreml deliberately links only CoreML: pulling in MPSGraph would
 # muddy a benchmark whose point is to compare the two frameworks.
 COREML_FRAMEWORKS = -framework Foundation -framework CoreML
@@ -27,13 +28,15 @@ PROTOBUF_LIB = $(shell pkg-config --libs protobuf-lite 2>/dev/null || \
 	echo -L/opt/homebrew/lib -L/opt/local/lib -L/usr/local/lib -lprotobuf-lite)
 # protobuf 33's generated code trips absl's own deprecation attributes.
 PROTO_CXXFLAGS = -std=c++17 -O2 -Wno-deprecated-declarations
-TARGETS  = measure_conv_fp16 measure_conv measure_conv_universal measure_matmul_universal measure_conv_qdq measure_conv_swift measure_ane_pmu measure_conv_coreml
+TARGETS  = measure_conv_fp16 measure_conv measure_conv_universal measure_matmul_universal measure_conv_qdq measure_conv_swift measure_ane_pmu measure_conv_coreml measure_conv_fp8
 
 all: ${TARGETS}
 
 measure_ane_pmu: measure_ane_pmu.m
 	$(CC) $(CFLAGS) $(FRAMEWORKS) $(ANE_FRAMEWORKS) measure_ane_pmu.m -o measure_ane_pmu
 	codesign -s - --entitlements entitlements.plist -f measure_ane_pmu
+
+measure_conv_fp8: measure_conv_fp8.m
 
 measure_conv_fp16: measure_conv_fp16.m
 
