@@ -3,7 +3,7 @@ CFLAGS = -fobjc-arc -O3
 FRAMEWORKS = -framework Foundation -framework Metal -framework MetalPerformanceShadersGraph
 LDFLAGS = ${FRAMEWORKS}
 ANE_FRAMEWORKS = -F/System/Library/PrivateFrameworks -framework AppleNeuralEngine -framework IOSurface -framework IOKit -framework Security
-<<<<<<< HEAD
+
 # measure_conv_coreml deliberately links only CoreML: pulling in MPSGraph would
 # muddy a benchmark whose point is to compare the two frameworks.
 COREML_FRAMEWORKS = -framework Foundation -framework CoreML
