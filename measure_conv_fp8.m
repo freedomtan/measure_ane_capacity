@@ -29,6 +29,14 @@
  *    ANECCompile returns an internal error when encountering FP8 MLIR operations:
  *      "MLIR MPS to ANEC conversion failed"
  *    MPSGraph catches this and automatically falls back to Metal GPU execution.
+ *
+ * 5. Weight/Input Fill Pattern:
+ *    Random-sign, magnitude 1/32, RMS-scaled so the expected gain per layer
+ *    (sqrt(Ci*K*K)/32 ~= 1.06 for Ci=128, K=3) stays near 1 across the 20
+ *    chained layers -- same convention as MILSpecBuilder's MILWeightModeDense.
+ *    An earlier same-sign, magnitude-~1 fill grew by ~1152x per layer and
+ *    saturated to NaN/448 by layer 2, silently benchmarking overflow instead
+ *    of real arithmetic for 18 of the 20 layers.
  */
 
 #import <time.h>
@@ -54,24 +62,39 @@ static const char *formatName(MPSDataType dataType) {
   return "Unknown";
 }
 
-static void fillFP8Buffer(void *buffer, size_t byteCount, MPSDataType dataType) {
+// Random-sign, magnitude 1/32 (E4M3 0x10 = +0.03125, 0x90 = -0.03125). Chained
+// through L=20 conv layers with a Ci*K*K=1152 reduction, a same-sign,
+// magnitude-~1 fill (the pattern this file started with) grows by ~1152x per
+// layer: by layer 2 the accumulator already exceeds both FP16 (max 65504) and
+// FP8 E4M3 (max 448), and the Check: values below were consequently NaN
+// (0x7e00) or saturated (0x7e/448) -- every later layer just propagated that,
+// not measuring real arithmetic. Random sign at 1/32 makes the expected
+// per-layer RMS gain sqrt(1152)/32 ~= 1.06, so magnitude stays bounded across
+// the whole chain. Same convention as MILSpecBuilder's MILWeightModeDense and
+// fillDenseFloat16 elsewhere in this repo. Deterministic (fixed-seed
+// xorshift64) so runs are reproducible.
+static void fillFP8Random(void *buffer, size_t byteCount, uint64_t seed) {
   if (!buffer || byteCount == 0) return;
   uint8_t *p = (uint8_t *)buffer;
-  // Non-zero values representing small positive numbers (~0.5 - 1.5)
-  // In E4M3: 0x38 = 1.0, 0x34 = 0.75, 0x3C = 1.5, 0x30 = 0.5
-  static const uint8_t pattern[4] = {0x38, 0x34, 0x3C, 0x30};
+  uint64_t state = seed;
   for (size_t i = 0; i < byteCount; i++) {
-    p[i] = pattern[i % 4];
+    state ^= state << 13;
+    state ^= state >> 7;
+    state ^= state << 17;
+    p[i] = (state & 1) ? 0x90 : 0x10;  // -0.03125 : +0.03125
   }
 }
 
-static void fillFP16Buffer(void *buffer, size_t byteCount) {
+static void fillFP16Random(void *buffer, size_t byteCount, uint64_t seed) {
   if (!buffer || byteCount == 0) return;
   uint16_t *p = (uint16_t *)buffer;
   size_t count = byteCount / sizeof(uint16_t);
-  static const uint16_t fp16_pattern[4] = {0x3C00, 0x3800, 0x3400, 0x3800}; // 1.0, 0.5, 0.25, 0.5
+  uint64_t state = seed;
   for (size_t i = 0; i < count; i++) {
-    p[i] = fp16_pattern[i % 4];
+    state ^= state << 13;
+    state ^= state >> 7;
+    state ^= state << 17;
+    p[i] = (state & 1) ? 0xA800 : 0x2800;  // -0.03125 : +0.03125
   }
 }
 
@@ -100,7 +123,7 @@ static void run_bench_fp8_qdq(id<MTLDevice> device, bool useANE,
 
       // Weights stored in FP8 (1 byte per element)
       NSMutableData *wData = [NSMutableData dataWithLength:Co * Ci * K * K * sizeof(uint8_t)];
-      fillFP8Buffer(wData.mutableBytes, wData.length, fp8Type);
+      fillFP8Random(wData.mutableBytes, wData.length, 0x5EED5EED5EED5EEDULL);
       MPSGraphTensor *wFP8 = [graph constantWithData:wData shape:wShape dataType:fp8Type];
 
       // Dequantize weights from FP8 to FP16 (scale = 1.0, zeroPoint = 0.0)
@@ -174,9 +197,9 @@ static void run_bench_fp8_qdq(id<MTLDevice> device, bool useANE,
       size_t inBytes = B * Ci * H * W * ((mode == FP8BenchModeFullQDQ) ? sizeof(uint8_t) : sizeof(uint16_t));
       id<MTLBuffer> iBuf = [device newBufferWithLength:inBytes options:0];
       if (mode == FP8BenchModeFullQDQ) {
-        fillFP8Buffer(iBuf.contents, inBytes, fp8Type);
+        fillFP8Random(iBuf.contents, inBytes, 0x9E3779B97F4A7C15ULL);
       } else {
-        fillFP16Buffer(iBuf.contents, inBytes);
+        fillFP16Random(iBuf.contents, inBytes, 0x9E3779B97F4A7C15ULL);
       }
       MPSGraphTensorData *iData = [[MPSGraphTensorData alloc] initWithMTLBuffer:iBuf
                                                                           shape:inShape

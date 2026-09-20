@@ -36,10 +36,21 @@ enum BenchmarkError: LocalizedError {
 private func fillNonZeroData(buffer: UnsafeMutableRawPointer, byteCount: Int, dataType: MPSDataType) {
     guard byteCount > 0 else { return }
     if dataType.rawValue == 0x10430008 { // Float8e4m3
+        // Random-sign, magnitude 1/32 (E4M3 0x10 = +0.03125, 0x90 = -0.03125).
+        // A same-sign, magnitude-~1 fill (0x38/0x34/0x3C/0x30, all positive)
+        // grows geometrically across the chained conv/matmul layers -- by
+        // Ci*K*K (~1152) or K (1024) per layer -- and saturates to NaN/448
+        // by layer 2, silently benchmarking overflow for the rest of the
+        // chain. Random sign at 1/32 keeps the expected per-layer RMS gain
+        // near 1 (sqrt(reduction)/32), matching measure_conv_fp8.m /
+        // measure_matmul_fp8.m and MILSpecBuilder's MILWeightModeDense.
         let ptr = buffer.bindMemory(to: UInt8.self, capacity: byteCount)
-        let patterns: [UInt8] = [0x38, 0x34, 0x3C, 0x30]
+        var state: UInt64 = 0x5EED5EED5EED5EED
         for i in 0..<byteCount {
-            ptr[i] = patterns[i & 3]
+            state ^= state << 13
+            state ^= state >> 7
+            state ^= state << 17
+            ptr[i] = (state & 1) != 0 ? 0x90 : 0x10
         }
     } else if dataType == .float16 {
         let ptr = buffer.bindMemory(to: UInt16.self, capacity: byteCount / 2)
