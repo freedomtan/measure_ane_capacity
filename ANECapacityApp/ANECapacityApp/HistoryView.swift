@@ -99,11 +99,8 @@ struct HistoryView: View {
                 filterPill(title: "INT8", isSelected: filterPrecision == .int8) {
                     filterPrecision = .int8
                 }
-                filterPill(title: "E4M3", isSelected: filterPrecision == .fp8E4M3) {
-                    filterPrecision = .fp8E4M3
-                }
-                filterPill(title: "E5M2", isSelected: filterPrecision == .fp8E5M2) {
-                    filterPrecision = .fp8E5M2
+                filterPill(title: "FP8", isSelected: filterPrecision == .fp8) {
+                    filterPrecision = .fp8
                 }
             }
             .padding(.horizontal)

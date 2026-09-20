@@ -176,12 +176,8 @@ final class BenchmarkViewModel: ObservableObject {
         results.filter { $0.precision == .int8 && $0.target == .ane }.map(\.tops).max() ?? 0.0
     }
     
-    var peakFP8E4M3TOPS: Double {
-        results.filter { $0.precision == .fp8E4M3 }.map(\.tops).max() ?? 0.0
-    }
-    
-    var peakFP8E5M2TOPS: Double {
-        results.filter { $0.precision == .fp8E5M2 }.map(\.tops).max() ?? 0.0
+    var peakFP8TOPS: Double {
+        results.filter { $0.precision == .fp8 }.map(\.tops).max() ?? 0.0
     }
     
     var speedupRatio: Double? {
@@ -242,8 +238,8 @@ final class BenchmarkViewModel: ObservableObject {
         case .both:
             return [.fp16, .int8]
         case .all:
-            return [.fp16, .int8, .fp8E4M3, .fp8E5M2]
-        case .fp16, .int8, .fp8E4M3, .fp8E5M2:
+            return [.fp16, .int8, .fp8]
+        case .fp16, .int8, .fp8:
             return [selectedPrecision]
         }
     }

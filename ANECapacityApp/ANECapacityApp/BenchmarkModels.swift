@@ -5,8 +5,7 @@ import MetalPerformanceShadersGraph
 enum PrecisionMode: String, CaseIterable, Identifiable, Codable {
     case fp16 = "FP16"
     case int8 = "INT8"
-    case fp8E4M3 = "FP8 (E4M3)"
-    case fp8E5M2 = "FP8 (E5M2)"
+    case fp8 = "FP8 (E4M3)"
     case both = "Both (FP16 & INT8)"
     case all = "All Precisions"
     
@@ -15,30 +14,24 @@ enum PrecisionMode: String, CaseIterable, Identifiable, Codable {
     var elementSize: Int {
         switch self {
         case .fp16: return 2
-        case .int8, .fp8E4M3, .fp8E5M2: return 1
+        case .int8, .fp8: return 1
         case .both, .all: return 2
         }
     }
     
     var isFP8: Bool {
-        return self == .fp8E4M3 || self == .fp8E5M2
+        return self == .fp8
     }
     
     var mpsDataType: MPSDataType {
         switch self {
         case .fp16, .both, .all: return .float16
         case .int8: return .int8
-        case .fp8E4M3:
+        case .fp8:
             if #available(iOS 27.0, macOS 27.0, *) {
                 return .float8e4m3
             } else {
                 return MPSDataType(rawValue: 0x10430008) ?? .float16
-            }
-        case .fp8E5M2:
-            if #available(iOS 27.0, macOS 27.0, *) {
-                return .float8e5m2
-            } else {
-                return MPSDataType(rawValue: 0x10520008) ?? .float16
             }
         }
     }
@@ -47,8 +40,7 @@ enum PrecisionMode: String, CaseIterable, Identifiable, Codable {
         switch self {
         case .fp16: return .blue
         case .int8: return .orange
-        case .fp8E4M3: return .mint
-        case .fp8E5M2: return .teal
+        case .fp8: return .mint
         case .both, .all: return .purple
         }
     }

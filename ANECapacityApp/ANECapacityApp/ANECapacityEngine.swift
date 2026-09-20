@@ -41,12 +41,6 @@ private func fillNonZeroData(buffer: UnsafeMutableRawPointer, byteCount: Int, da
         for i in 0..<byteCount {
             ptr[i] = patterns[i & 3]
         }
-    } else if dataType.rawValue == 0x10520008 { // Float8e5m2
-        let ptr = buffer.bindMemory(to: UInt8.self, capacity: byteCount)
-        let patterns: [UInt8] = [0x3C, 0x38, 0x40, 0x34]
-        for i in 0..<byteCount {
-            ptr[i] = patterns[i & 3]
-        }
     } else if dataType == .float16 {
         let ptr = buffer.bindMemory(to: UInt16.self, capacity: byteCount / 2)
         let count = byteCount / 2

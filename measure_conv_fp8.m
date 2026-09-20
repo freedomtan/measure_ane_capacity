@@ -1,5 +1,5 @@
 /**
- * measure_conv_fp8.m - MPSGraph FP8 (Float8E4M3 / Float8E5M2) QDQ Convolution Benchmark
+ * measure_conv_fp8.m - MPSGraph FP8 (Float8E4M3) QDQ Convolution Benchmark
  *
  * TECHNICAL BACKGROUND:
  * ---------------------
@@ -21,7 +21,8 @@
  *
  * 3. Supported FP8 Formats (macOS 27+ / iOS 27+):
  *    - MPSDataTypeFloat8e4m3 (E4M3: 1 sign, 4 exp, 3 mantissa; IEEE 754-style for weights/activations)
- *    - MPSDataTypeFloat8e5m2 (E5M2: 1 sign, 5 exp, 2 mantissa; wider dynamic range)
+ *    Note: MPSGraph dequantize/quantize passes only support E4M3. E5M2 is rejected
+ *    with "Unsupported quantization scheme".
  *
  * 4. Apple Neural Engine (ANE) Behavior:
  *    The physical ANE MAC arrays (H13-H16) only possess arithmetic ALUs for FP16 and INT8.
@@ -50,22 +51,15 @@ typedef NS_ENUM(NSInteger, FP8BenchMode) {
 
 static const char *formatName(MPSDataType dataType) {
   if (dataType == MPSDataTypeFloat8e4m3) return "FP8 E4M3";
-  if (dataType == MPSDataTypeFloat8e5m2) return "FP8 E5M2";
   return "Unknown";
 }
 
 static void fillFP8Buffer(void *buffer, size_t byteCount, MPSDataType dataType) {
   if (!buffer || byteCount == 0) return;
   uint8_t *p = (uint8_t *)buffer;
-  // Non-zero values representing small positive numbers (~0.5 - 1.0)
+  // Non-zero values representing small positive numbers (~0.5 - 1.5)
   // In E4M3: 0x38 = 1.0, 0x34 = 0.75, 0x3C = 1.5, 0x30 = 0.5
-  // In E5M2: 0x3C = 1.0, 0x38 = 0.5,  0x40 = 2.0, 0x34 = 0.25
-  uint8_t pattern[4];
-  if (dataType == MPSDataTypeFloat8e4m3) {
-    pattern[0] = 0x38; pattern[1] = 0x34; pattern[2] = 0x3C; pattern[3] = 0x30;
-  } else {
-    pattern[0] = 0x3C; pattern[1] = 0x38; pattern[2] = 0x40; pattern[3] = 0x34;
-  }
+  static const uint8_t pattern[4] = {0x38, 0x34, 0x3C, 0x30};
   for (size_t i = 0; i < byteCount; i++) {
     p[i] = pattern[i % 4];
   }
@@ -260,8 +254,6 @@ int main(int argc, char *argv[]) {
     printf("========================================================\n");
     run_bench_fp8_qdq(device, false, MPSDataTypeFloat8e4m3, FP8BenchModeWeightOnly);
     run_bench_fp8_qdq(device, false, MPSDataTypeFloat8e4m3, FP8BenchModeFullQDQ);
-    run_bench_fp8_qdq(device, false, MPSDataTypeFloat8e5m2, FP8BenchModeWeightOnly);
-    run_bench_fp8_qdq(device, false, MPSDataTypeFloat8e5m2, FP8BenchModeFullQDQ);
 
     printf("\n========================================================\n");
     printf(" 2. Apple Neural Engine (ANE) FP8 QDQ Benchmark\n");
@@ -269,8 +261,6 @@ int main(int argc, char *argv[]) {
     printf("========================================================\n");
     run_bench_fp8_qdq(device, true, MPSDataTypeFloat8e4m3, FP8BenchModeWeightOnly);
     run_bench_fp8_qdq(device, true, MPSDataTypeFloat8e4m3, FP8BenchModeFullQDQ);
-    run_bench_fp8_qdq(device, true, MPSDataTypeFloat8e5m2, FP8BenchModeWeightOnly);
-    run_bench_fp8_qdq(device, true, MPSDataTypeFloat8e5m2, FP8BenchModeFullQDQ);
 
     return 0;
   }

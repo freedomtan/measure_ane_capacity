@@ -16,8 +16,7 @@ enum ChartPrecisionFilter: String, CaseIterable, Identifiable {
     case all = "All Precisions"
     case fp16 = "FP16"
     case int8 = "INT8"
-    case fp8E4M3 = "FP8 (E4M3)"
-    case fp8E5M2 = "FP8 (E5M2)"
+    case fp8 = "FP8 (E4M3)"
     
     var id: String { rawValue }
 }
@@ -38,8 +37,7 @@ struct ChartsView: View {
             case .all: return true
             case .fp16: return r.precision == .fp16
             case .int8: return r.precision == .int8
-            case .fp8E4M3: return r.precision == .fp8E4M3
-            case .fp8E5M2: return r.precision == .fp8E5M2
+            case .fp8: return r.precision == .fp8
             }
         }
     }
@@ -245,8 +243,7 @@ struct ChartsView: View {
                         legendFilterButton(title: "All", filter: .all, color: .secondary)
                         legendFilterButton(title: "FP16", filter: .fp16, color: .blue)
                         legendFilterButton(title: "INT8", filter: .int8, color: .orange)
-                        legendFilterButton(title: "E4M3", filter: .fp8E4M3, color: .mint)
-                        legendFilterButton(title: "E5M2", filter: .fp8E5M2, color: .teal)
+                        legendFilterButton(title: "FP8", filter: .fp8, color: .mint)
                     }
                 }
             }
@@ -308,11 +305,9 @@ struct ChartsView: View {
                 "ANE FP16": Color.blue,
                 "ANE INT8": Color.orange,
                 "ANE FP8 (E4M3)": Color.mint,
-                "ANE FP8 (E5M2)": Color.teal,
                 "GPU FP16": Color.purple,
                 "GPU INT8": Color.indigo,
-                "GPU FP8 (E4M3)": Color.cyan,
-                "GPU FP8 (E5M2)": Color.pink
+                "GPU FP8 (E4M3)": Color.cyan
             ])
             .chartXAxis {
                 AxisMarks(values: .automatic) { value in
