@@ -424,8 +424,7 @@ static void printUsage(const char *argv0) {
 }
 
 // Same 29-register decode as measure_ane_pmu.m's ANECIR path, applied to a
-// CoreML-compiled model.mil instead of an MPSGraph .mpsgraphpackage. Requires
-// codesign -s - --entitlements entitlements.plist -f, same as measure_ane_pmu.
+// CoreML-compiled model.mil instead of an MPSGraph .mpsgraphpackage.
 static BOOL runPMU(BenchConfig cfg) {
   @autoreleasepool {
     NSError *error = nil;

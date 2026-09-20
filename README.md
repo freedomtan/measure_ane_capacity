@@ -164,7 +164,7 @@ CoreML lands within **~1–4%** of MPSGraph across FP16 and INT8 on both devices
 These are the same MACs/cycle/core figures `measure_ane_pmu` reports for MPSGraph (FP16 97.22%, native INT8 100.05%) — confirming, on physical registers rather than inferred latency, that a CoreML-authored MIL program saturates the ANE's convolution engine to essentially the same degree MPSGraph does. The MACs/cycle/core figure is computed against `kANE_NE_NOMINAL_CYCLES` (`[10]`), **not** `kANE_NE_COMPUTE_CYCLES` (`[13]`): the latter is clock-gated off during `OUTPUT_STALL` and is not a valid throughput denominator on memory-bound configurations — `--verbose` prints it as a diagnostic only. See [`ane_pmu_profiler`'s §7 register table](https://github.com/freedomtan/ane_pmu_profiler#7-decoded-silicon-pmu-register-table) and its [§3.4.C throughput-metric pitfall writeup](https://github.com/freedomtan/ane_pmu_profiler/blob/main/ANE_Performance_PMU_Technical_Report.md#34-hardware-counter-gating-l2-sram-thresholds--throughput-metrics) for why. Registers `[24]`–`[28]` are firmware-reserved and read as noise; only `[10]`/`[13]`/`[17]`/`[21]` carry real signal on H16g.
 
 > [!NOTE]
-> `--pmu` requires the same entitlements as `measure_ane_pmu` (`com.apple.ane.hardware-counters`, `com.apple.aned.private.allow`) and is signed automatically by `make measure_conv_coreml`. No boot-arg changes, `sudo`, or root access are needed — `_ANEClient` talks to the root-privileged `aned` daemon, which acts as the entitled proxy.
+> `--pmu` queries hardware performance counters directly via `_ANEClient` talking to the root-privileged `aned` daemon. No boot-arg changes, entitlements, `sudo`, or root access are needed.
 
 > [!WARNING]
 > **The tiled `fillNonZeroData` pattern cancels to exactly zero under the convolution reduction.** Verified on hardware with a single-layer model: the tiled `+0.0625, -0.0625, +0.03125, -0.03125` sequence used by every MPSGraph binary in this repo produces an all-zero output tensor (8,388,608 / 8,388,608 elements exactly zero), because the alternating signs cancel across the $C_i \times K \times K$ reduction window. **Only layer 1 ever sees non-zero activations; layers 2…L consume a zero tensor** — precisely the condition the section below warns inflates TOPS on H17+.
@@ -210,7 +210,7 @@ It systematically evaluates 5 distinct quantization patterns on Apple Silicon ($
 > **Key Architectural Insight**: In MPSGraph, **True W8A8 QDQ (Pattern 2)** allows the Apple ANE compiler to fuse the operations directly into native INT8 execution, matching Native INT8 convolution (~36.5 TOPS) and CoreML MIL INT8 (~34.7 TOPS) clock-for-clock. Furthermore, while native INT8 convolution is unsupported on Metal GPU, all QDQ patterns run gracefully on GPU at full FP16 compute capacity (~9.8 TOPS).
 
 ### Advanced Silicon PMU Profiler & MPSGraphPackage Exporter (`measure_ane_pmu`)
-`measure_ane_pmu` provides deep physical hardware profiling for Apple Neural Engine via `_ANEClient` and Apple PMU registers (`com.apple.ane.hardware-counters`), comparing FP16, INT8, QDQ, and GPU baselines while exporting self-contained `.mpsgraphpackage` bundles.
+`measure_ane_pmu` provides deep physical hardware profiling for Apple Neural Engine via `_ANEClient` performance statistics, comparing FP16, INT8, QDQ, and GPU baselines while exporting self-contained `.mpsgraphpackage` bundles.
 
 > **Note / Attribution**:
 > `measure_ane_pmu` is based on and adapted from [**ane_pmu_profiler**](https://github.com/freedomtan/ane_pmu_profiler/), reusing its low-level Apple Neural Engine silicon PMU profiling, private `_ANEClient` telemetry interfaces, and hardware register mapping.
@@ -218,7 +218,7 @@ It systematically evaluates 5 distinct quantization patterns on Apple Silicon ($
 > For an in-depth microarchitectural analysis explaining how these counters behave under different tensor dimensions, see the [**Guide to Interpreting measure_ane_pmu Numbers**](docs/How_to_Interpret_measure_ane_pmu_Numbers.md).
 
 ```bash
-# Build and codesign with PMU entitlements
+# Build
 make measure_ane_pmu
 
 # Run full benchmark across FP16, INT8, and QDQ with 20 chained layers

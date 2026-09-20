@@ -34,7 +34,6 @@ all: ${TARGETS}
 
 measure_ane_pmu: measure_ane_pmu.m
 	$(CC) $(CFLAGS) $(FRAMEWORKS) $(ANE_FRAMEWORKS) measure_ane_pmu.m -o measure_ane_pmu
-	codesign -s - --entitlements entitlements.plist -f measure_ane_pmu
 
 measure_conv_fp8: measure_conv_fp8.m
 
@@ -75,7 +74,6 @@ measure_conv_coreml: measure_conv_coreml.m MILSpecBuilder.o $(PROTO_OBJS)
 	$(CC) $(CFLAGS) $(COREML_FRAMEWORKS) $(ANE_FRAMEWORKS) $(PROTOBUF_LIB) -lc++ \
 		measure_conv_coreml.m MILSpecBuilder.o $(PROTO_OBJS) \
 		-o measure_conv_coreml
-	codesign -s - --entitlements entitlements.plist -f measure_conv_coreml
 
 .PHONY: all clean app
 
