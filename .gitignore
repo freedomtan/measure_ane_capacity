@@ -9,6 +9,7 @@ measure_conv_ios
 measure_ane_pmu
 measure_conv_coreml
 measure_conv_fp8
+measure_matmul_fp8
 
 # Build artifacts and packages
 *.o

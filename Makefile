@@ -28,7 +28,7 @@ PROTOBUF_LIB = $(shell pkg-config --libs protobuf-lite 2>/dev/null || \
 	echo -L/opt/homebrew/lib -L/opt/local/lib -L/usr/local/lib -lprotobuf-lite)
 # protobuf 33's generated code trips absl's own deprecation attributes.
 PROTO_CXXFLAGS = -std=c++17 -O2 -Wno-deprecated-declarations
-TARGETS  = measure_conv_fp16 measure_conv measure_conv_universal measure_matmul_universal measure_conv_qdq measure_conv_swift measure_ane_pmu measure_conv_coreml measure_conv_fp8
+TARGETS  = measure_conv_fp16 measure_conv measure_conv_universal measure_matmul_universal measure_conv_qdq measure_conv_swift measure_ane_pmu measure_conv_coreml measure_conv_fp8 measure_matmul_fp8
 
 all: ${TARGETS}
 
@@ -37,6 +37,8 @@ measure_ane_pmu: measure_ane_pmu.m
 	codesign -s - --entitlements entitlements.plist -f measure_ane_pmu
 
 measure_conv_fp8: measure_conv_fp8.m
+
+measure_matmul_fp8: measure_matmul_fp8.m
 
 measure_conv_fp16: measure_conv_fp16.m
 
