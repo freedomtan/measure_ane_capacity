@@ -14,8 +14,6 @@ measure_conv_fp8
 *.o
 *.dSYM
 packages/
-models/
-__pycache__/
 .DS_Store
 xcuserdata/
 *.xcuserstate

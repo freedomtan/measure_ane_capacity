@@ -6,7 +6,7 @@ ANE_FRAMEWORKS = -F/System/Library/PrivateFrameworks -framework AppleNeuralEngin
 
 # measure_conv_coreml deliberately links only CoreML: pulling in MPSGraph would
 # muddy a benchmark whose point is to compare the two frameworks.
-COREML_FRAMEWORKS = -framework Foundation -framework CoreML
+COREML_FRAMEWORKS = -framework Foundation -framework CoreML -framework IOSurface
 
 # measure_conv_coreml builds its MIL program at runtime from coremltools' own
 # schema. coremltools ships no C++ builder (mb.program is Python only), but it
@@ -70,9 +70,10 @@ MILSpecBuilder.o: MILSpecBuilder.mm MILSpecBuilder.h $(PROTO_OUT)/.stamp
 		-c MILSpecBuilder.mm -o MILSpecBuilder.o
 
 measure_conv_coreml: measure_conv_coreml.m MILSpecBuilder.o $(PROTO_OBJS)
-	$(CC) $(CFLAGS) $(COREML_FRAMEWORKS) $(PROTOBUF_LIB) -lc++ \
+	$(CC) $(CFLAGS) $(COREML_FRAMEWORKS) $(ANE_FRAMEWORKS) $(PROTOBUF_LIB) -lc++ \
 		measure_conv_coreml.m MILSpecBuilder.o $(PROTO_OBJS) \
 		-o measure_conv_coreml
+	codesign -s - --entitlements entitlements.plist -f measure_conv_coreml
 
 .PHONY: all clean app
 
