@@ -176,6 +176,14 @@ final class BenchmarkViewModel: ObservableObject {
         results.filter { $0.precision == .int8 && $0.target == .ane }.map(\.tops).max() ?? 0.0
     }
     
+    var peakFP8E4M3TOPS: Double {
+        results.filter { $0.precision == .fp8E4M3 }.map(\.tops).max() ?? 0.0
+    }
+    
+    var peakFP8E5M2TOPS: Double {
+        results.filter { $0.precision == .fp8E5M2 }.map(\.tops).max() ?? 0.0
+    }
+    
     var speedupRatio: Double? {
         guard peakFP16TOPS > 0, peakINT8TOPS > 0 else { return nil }
         return peakINT8TOPS / peakFP16TOPS
@@ -229,15 +237,26 @@ final class BenchmarkViewModel: ObservableObject {
         log("⚠️ Execution cancelled by user.")
     }
     
+    private var precisionsToRun: [PrecisionMode] {
+        switch selectedPrecision {
+        case .both:
+            return [.fp16, .int8]
+        case .all:
+            return [.fp16, .int8, .fp8E4M3, .fp8E5M2]
+        case .fp16, .int8, .fp8E4M3, .fp8E5M2:
+            return [selectedPrecision]
+        }
+    }
+    
     // MARK: - Single Run Flow
     private func runSingleBenchmarkFlow() async {
-        let precisionsToRun: [PrecisionMode] = (selectedPrecision == .both) ? [.fp16, .int8] : [selectedPrecision]
-        let totalSteps = Double(precisionsToRun.count)
+        let precisions = precisionsToRun
+        let totalSteps = Double(precisions.count)
         var currentStep = 0.0
         
         log("=== Starting Single Benchmark: \(dimensions.detailedDescription) ===")
         
-        for prec in precisionsToRun {
+        for prec in precisions {
             if Task.isCancelled { break }
             statusMessage = "Running \(selectedTarget.shortName) \(prec.rawValue)..."
             
@@ -266,7 +285,7 @@ final class BenchmarkViewModel: ObservableObject {
     
     // MARK: - Sweep Benchmark Flow
     private func runSweepBenchmarkFlow() async {
-        let precisionsToRun: [PrecisionMode] = (selectedPrecision == .both) ? [.fp16, .int8] : [selectedPrecision]
+        let precisions = precisionsToRun
         
         // Define sweep points
         struct SweepPoint {

@@ -16,6 +16,8 @@ enum ChartPrecisionFilter: String, CaseIterable, Identifiable {
     case all = "All Precisions"
     case fp16 = "FP16"
     case int8 = "INT8"
+    case fp8E4M3 = "FP8 (E4M3)"
+    case fp8E5M2 = "FP8 (E5M2)"
     
     var id: String { rawValue }
 }
@@ -36,6 +38,8 @@ struct ChartsView: View {
             case .all: return true
             case .fp16: return r.precision == .fp16
             case .int8: return r.precision == .int8
+            case .fp8E4M3: return r.precision == .fp8E4M3
+            case .fp8E5M2: return r.precision == .fp8E5M2
             }
         }
     }
@@ -236,10 +240,14 @@ struct ChartsView: View {
                 Spacer()
                 
                 // Interactive Legend Filters
-                HStack(spacing: 6) {
-                    legendFilterButton(title: "All", filter: .all, color: .secondary)
-                    legendFilterButton(title: "ANE FP16", filter: .fp16, color: .blue)
-                    legendFilterButton(title: "ANE INT8", filter: .int8, color: .orange)
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 6) {
+                        legendFilterButton(title: "All", filter: .all, color: .secondary)
+                        legendFilterButton(title: "FP16", filter: .fp16, color: .blue)
+                        legendFilterButton(title: "INT8", filter: .int8, color: .orange)
+                        legendFilterButton(title: "E4M3", filter: .fp8E4M3, color: .mint)
+                        legendFilterButton(title: "E5M2", filter: .fp8E5M2, color: .teal)
+                    }
                 }
             }
             
@@ -275,7 +283,7 @@ struct ChartsView: View {
                         x: .value(selectedSweepFilter.axisLabel, sp.sweepValue),
                         y: .value(selectedMetric.rawValue, spY)
                     )
-                    .foregroundStyle(sp.precision == .fp16 ? Color.blue : Color.orange)
+                    .foregroundStyle(sp.precision.themeColor)
                     .symbolSize(140)
                 }
                 
@@ -299,8 +307,12 @@ struct ChartsView: View {
             .chartForegroundStyleScale([
                 "ANE FP16": Color.blue,
                 "ANE INT8": Color.orange,
+                "ANE FP8 (E4M3)": Color.mint,
+                "ANE FP8 (E5M2)": Color.teal,
                 "GPU FP16": Color.purple,
-                "GPU INT8": Color.indigo
+                "GPU INT8": Color.indigo,
+                "GPU FP8 (E4M3)": Color.cyan,
+                "GPU FP8 (E5M2)": Color.pink
             ])
             .chartXAxis {
                 AxisMarks(values: .automatic) { value in
@@ -400,7 +412,7 @@ struct ChartsView: View {
                                     .fontWeight(.bold)
                                     .padding(.horizontal, 8)
                                     .padding(.vertical, 4)
-                                    .background(selectedPoint?.id == item.id ? (item.precision == .fp16 ? Color.blue : Color.orange) : Color(.tertiarySystemBackground))
+                                    .background(selectedPoint?.id == item.id ? item.precision.themeColor : Color(.tertiarySystemBackground))
                                     .foregroundColor(selectedPoint?.id == item.id ? .white : .primary)
                                     .cornerRadius(8)
                             }
@@ -410,7 +422,7 @@ struct ChartsView: View {
                     Text("\(r.target.shortName) \(r.precision.rawValue)")
                         .font(.caption)
                         .fontWeight(.bold)
-                        .foregroundColor(r.precision == .fp16 ? .blue : .orange)
+                        .foregroundColor(r.precision.themeColor)
                         .padding(.horizontal, 8)
                         .padding(.vertical, 3)
                         .background(Color(.tertiarySystemBackground))
@@ -426,7 +438,7 @@ struct ChartsView: View {
                     Text(r.formattedTOPS)
                         .font(.subheadline)
                         .fontWeight(.bold)
-                        .foregroundColor(r.precision == .fp16 ? .blue : .orange)
+                        .foregroundColor(r.precision.themeColor)
                 }
                 VStack(alignment: .leading) {
                     Text("Latency").font(.caption2).foregroundColor(.secondary)
@@ -497,7 +509,7 @@ struct ChartsView: View {
         .cornerRadius(12)
         .overlay(
             RoundedRectangle(cornerRadius: 12)
-                .stroke((r.precision == .fp16 ? Color.blue : Color.orange).opacity(0.5), lineWidth: 1.5)
+                .stroke(r.precision.themeColor.opacity(0.5), lineWidth: 1.5)
         )
     }
     
@@ -530,7 +542,7 @@ struct ChartsView: View {
                         Text("\(item.target.shortName) \(item.precision.rawValue)")
                             .font(.caption2)
                             .fontWeight(.medium)
-                            .foregroundColor(item.precision == .fp16 ? .blue : .orange)
+                            .foregroundColor(item.precision.themeColor)
                             .frame(width: 70, alignment: .leading)
                         
                         Text(item.formattedDuration)

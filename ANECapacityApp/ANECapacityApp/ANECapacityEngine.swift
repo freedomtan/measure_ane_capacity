@@ -35,7 +35,19 @@ enum BenchmarkError: LocalizedError {
 // MARK: - Benchmark Engine
 private func fillNonZeroData(buffer: UnsafeMutableRawPointer, byteCount: Int, dataType: MPSDataType) {
     guard byteCount > 0 else { return }
-    if dataType == .float16 {
+    if dataType.rawValue == 0x10430008 { // Float8e4m3
+        let ptr = buffer.bindMemory(to: UInt8.self, capacity: byteCount)
+        let patterns: [UInt8] = [0x38, 0x34, 0x3C, 0x30]
+        for i in 0..<byteCount {
+            ptr[i] = patterns[i & 3]
+        }
+    } else if dataType.rawValue == 0x10520008 { // Float8e5m2
+        let ptr = buffer.bindMemory(to: UInt8.self, capacity: byteCount)
+        let patterns: [UInt8] = [0x3C, 0x38, 0x40, 0x34]
+        for i in 0..<byteCount {
+            ptr[i] = patterns[i & 3]
+        }
+    } else if dataType == .float16 {
         let ptr = buffer.bindMemory(to: UInt16.self, capacity: byteCount / 2)
         let count = byteCount / 2
         let patterns: [UInt16] = [0x2C00, 0xAC00, 0x2800, 0xA800]
@@ -150,18 +162,34 @@ final class ANECapacityEngine {
             input = graph.placeholder(shape: inShape, dataType: mpsType, name: "in")
             cur = input
             
-            let wLength = dims.batch * dims.k * dims.n * 2
-            let wData = createNonZeroData(byteCount: wLength, dataType: .float16)
-            let w = graph.constant(wData, shape: wShape, dataType: .float16)
-            
-            for _ in 0..<dims.layers {
-                var lhs = cur
-                if mpsType == .int8 {
-                    lhs = graph.cast(cur, to: .float16, name: "dequant")
+            if precision.isFP8 {
+                guard #available(iOS 27.0, macOS 27.0, *) else {
+                    throw BenchmarkError.executionFailed("FP8 requires iOS 27.0 / macOS 27.0 or newer.")
                 }
-                cur = graph.matrixMultiplication(primary: lhs, secondary: w, name: nil)
-                if mpsType == .int8 {
-                    cur = graph.cast(cur, to: .int8, name: "requant")
+                let wLength = dims.batch * dims.k * dims.n * 1
+                let wData = createNonZeroData(byteCount: wLength, dataType: mpsType)
+                let wFP8 = graph.constant(wData, shape: wShape, dataType: mpsType)
+                let w = graph.dequantize(wFP8, scale: 1.0, zeroPoint: 0.0, dataType: .float16, name: "w_dequant")
+                
+                for _ in 0..<dims.layers {
+                    let lhs = graph.dequantize(cur, scale: 1.0, zeroPoint: 0.0, dataType: .float16, name: "act_dequant")
+                    let outFP16 = graph.matrixMultiplication(primary: lhs, secondary: w, name: nil)
+                    cur = graph.quantize(outFP16, scale: 1.0, zeroPoint: 0.0, dataType: mpsType, name: "act_quant")
+                }
+            } else {
+                let wLength = dims.batch * dims.k * dims.n * 2
+                let wData = createNonZeroData(byteCount: wLength, dataType: .float16)
+                let w = graph.constant(wData, shape: wShape, dataType: .float16)
+                
+                for _ in 0..<dims.layers {
+                    var lhs = cur
+                    if mpsType == .int8 {
+                        lhs = graph.cast(cur, to: .float16, name: "dequant")
+                    }
+                    cur = graph.matrixMultiplication(primary: lhs, secondary: w, name: nil)
+                    if mpsType == .int8 {
+                        cur = graph.cast(cur, to: .int8, name: "requant")
+                    }
                 }
             }
             inputBufferLen = dims.batch * dims.m * dims.k * elementSize
@@ -182,32 +210,48 @@ final class ANECapacityEngine {
             input = graph.placeholder(shape: inShape, dataType: mpsType, name: "in")
             cur = input
             
-            // Constant weights
-            let wLength = dims.outChannels * dims.inChannels * dims.kernelSize * dims.kernelSize * elementSize
-            let wData = createNonZeroData(byteCount: wLength, dataType: mpsType)
-            let w = graph.constant(wData, shape: wShape, dataType: mpsType)
+            guard let d = MPSGraphConvolution2DOpDescriptor(
+                strideInX: 1,
+                strideInY: 1,
+                dilationRateInX: 1,
+                dilationRateInY: 1,
+                groups: 1,
+                paddingStyle: .TF_SAME,
+                dataLayout: .NCHW,
+                weightsLayout: .OIHW
+            ) else {
+                throw BenchmarkError.graphCompilationFailed("Invalid convolution descriptor")
+            }
             
-            // Chain L layers
-            for _ in 0..<dims.layers {
-                guard let d = MPSGraphConvolution2DOpDescriptor(
-                    strideInX: 1,
-                    strideInY: 1,
-                    dilationRateInX: 1,
-                    dilationRateInY: 1,
-                    groups: 1,
-                    paddingStyle: .TF_SAME,
-                    dataLayout: .NCHW,
-                    weightsLayout: .OIHW
-                ) else {
-                    throw BenchmarkError.graphCompilationFailed("Invalid convolution descriptor")
+            if precision.isFP8 {
+                guard #available(iOS 27.0, macOS 27.0, *) else {
+                    throw BenchmarkError.executionFailed("FP8 requires iOS 27.0 / macOS 27.0 or newer.")
                 }
+                let wLength = dims.outChannels * dims.inChannels * dims.kernelSize * dims.kernelSize * 1
+                let wData = createNonZeroData(byteCount: wLength, dataType: mpsType)
+                let wFP8 = graph.constant(wData, shape: wShape, dataType: mpsType)
+                let w = graph.dequantize(wFP8, scale: 1.0, zeroPoint: 0.0, dataType: .float16, name: "w_dequant")
                 
-                cur = graph.convolution2D(cur, weights: w, descriptor: d, name: nil)
+                for _ in 0..<dims.layers {
+                    let actFP16 = graph.dequantize(cur, scale: 1.0, zeroPoint: 0.0, dataType: .float16, name: "act_dequant")
+                    let outFP16 = graph.convolution2D(actFP16, weights: w, descriptor: d, name: nil)
+                    cur = graph.quantize(outFP16, scale: 1.0, zeroPoint: 0.0, dataType: mpsType, name: "act_quant")
+                }
+            } else {
+                // Constant weights
+                let wLength = dims.outChannels * dims.inChannels * dims.kernelSize * dims.kernelSize * elementSize
+                let wData = createNonZeroData(byteCount: wLength, dataType: mpsType)
+                let w = graph.constant(wData, shape: wShape, dataType: mpsType)
                 
-                // Int8 simulated quantized flow: Int8 -> Conv -> FP16 dequant -> Int8 requant
-                if mpsType == .int8 {
-                    let fp = graph.cast(cur, to: .float16, name: "dequant")
-                    cur = graph.cast(fp, to: .int8, name: "requant")
+                // Chain L layers
+                for _ in 0..<dims.layers {
+                    cur = graph.convolution2D(cur, weights: w, descriptor: d, name: nil)
+                    
+                    // Int8 simulated quantized flow: Int8 -> Conv -> FP16 dequant -> Int8 requant
+                    if mpsType == .int8 {
+                        let fp = graph.cast(cur, to: .float16, name: "dequant")
+                        cur = graph.cast(fp, to: .int8, name: "requant")
+                    }
                 }
             }
             inputBufferLen = dims.batch * dims.height * dims.width * dims.inChannels * elementSize

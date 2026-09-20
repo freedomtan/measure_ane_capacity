@@ -367,16 +367,28 @@ struct BenchmarkView: View {
                 .font(.headline)
             
             // Precision
-            VStack(alignment: .leading, spacing: 4) {
+            VStack(alignment: .leading, spacing: 6) {
                 Text("Data Type / Precision")
                     .font(.caption)
                     .foregroundColor(.secondary)
-                Picker("Precision", selection: $viewModel.selectedPrecision) {
-                    ForEach(PrecisionMode.allCases) { p in
-                        Text(p.rawValue).tag(p)
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 8) {
+                        ForEach(PrecisionMode.allCases) { p in
+                            Button(action: {
+                                viewModel.selectedPrecision = p
+                            }) {
+                                Text(p.rawValue)
+                                    .font(.caption)
+                                    .fontWeight(viewModel.selectedPrecision == p ? .bold : .medium)
+                                    .padding(.horizontal, 10)
+                                    .padding(.vertical, 6)
+                                    .background(viewModel.selectedPrecision == p ? p.themeColor : Color(.tertiarySystemBackground))
+                                    .foregroundColor(viewModel.selectedPrecision == p ? .white : .primary)
+                                    .cornerRadius(8)
+                            }
+                        }
                     }
                 }
-                .pickerStyle(.segmented)
             }
             
             // Target Device
