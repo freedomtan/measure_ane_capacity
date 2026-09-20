@@ -1027,12 +1027,24 @@ static NSArray<NSString *> *getANETempBaseDirectories(void) {
 
 + (NSString * _Nullable)findNewANETempDirectorySince:(NSSet<NSString *> * _Nullable)beforeDirs {
     NSFileManager *fm = [NSFileManager defaultManager];
-    
-    // 1. Check for newly created directories under any base
+
+    // Only ever return a directory that did not exist in beforeDirs. There
+    // used to be a second fallback pass here that, when no *new* bundle was
+    // found, returned the most-recently-modified bundle from ANY prior run --
+    // with no check against beforeDirs or "now" at all. That meant a config
+    // whose ANE compile silently fails and falls back to GPU (e.g. every FP8
+    // benchmark: MPSGraph's dequantize/quantize passes reject FP8 MLIR on the
+    // ANE compiler) would silently be attributed the PMU telemetry of
+    // whatever real ANE bundle a previous, unrelated benchmark happened to
+    // leave behind in /tmp -- reporting a plausible-looking but fabricated
+    // TOPS/ALU-saturation number instead of "no ANE bundle for this run."
+    // Returning nil here instead surfaces the honest
+    // "[PMU Note] No temporary ANE bundle emitted..." log path in
+    // ANECapacityEngine.swift.
     for (NSString *base in getANETempBaseDirectories()) {
         BOOL isDir = NO;
         if (![fm fileExistsAtPath:base isDirectory:&isDir] || !isDir) continue;
-        
+
         NSArray *subdirs = [fm contentsOfDirectoryAtPath:base error:nil];
         for (NSString *sub in subdirs) {
             NSString *full = [base stringByAppendingPathComponent:sub];
@@ -1049,35 +1061,8 @@ static NSArray<NSString *> *getANETempBaseDirectories(void) {
             }
         }
     }
-    
-    // 2. Fallback: Find most recent directory containing .bc.mlir, .hwx, or .mil
-    NSString *bestDir = nil;
-    NSDate *bestDate = [NSDate distantPast];
-    for (NSString *base in getANETempBaseDirectories()) {
-        BOOL isDir = NO;
-        if (![fm fileExistsAtPath:base isDirectory:&isDir] || !isDir) continue;
-        
-        NSArray *subdirs = [fm contentsOfDirectoryAtPath:base error:nil];
-        for (NSString *sub in subdirs) {
-            NSString *full = [base stringByAppendingPathComponent:sub];
-            BOOL subIsDir = NO;
-            if ([fm fileExistsAtPath:full isDirectory:&subIsDir] && subIsDir) {
-                NSArray *files = [fm contentsOfDirectoryAtPath:full error:nil];
-                for (NSString *f in files) {
-                    if ([f hasSuffix:@".bc.mlir"] || [f hasSuffix:@".hwx"] || [f hasSuffix:@".mil"]) {
-                        NSDictionary *attrs = [fm attributesOfItemAtPath:full error:nil];
-                        NSDate *mod = attrs[NSFileModificationDate];
-                        if (mod && [mod compare:bestDate] == NSOrderedDescending) {
-                            bestDate = mod;
-                            bestDir = full;
-                        }
-                        break;
-                    }
-                }
-            }
-        }
-    }
-    return bestDir;
+
+    return nil;
 }
 
 + (NSString * _Nullable)findANETempDirectorySince:(NSDate * _Nullable)sinceDate {
