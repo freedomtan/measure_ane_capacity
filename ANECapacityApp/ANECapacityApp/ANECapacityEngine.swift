@@ -126,7 +126,7 @@ final class ANECapacityEngine {
         
         let mpsType = precision.mpsDataType
         let elementSize = precision.elementSize
-        
+
         logHandler("[\(target.shortName) \(precision.rawValue)] Building graph: \(dims.shortDescription)...")
         
         // 1. Device and Compilation Descriptor Setup
@@ -242,16 +242,35 @@ final class ANECapacityEngine {
                     let outFP16 = graph.convolution2D(actFP16, weights: w, descriptor: d, name: nil)
                     cur = graph.quantize(outFP16, scale: 1.0, zeroPoint: 0.0, dataType: mpsType, name: "act_quant")
                 }
+            } else if mpsType == .int8 && target != .ane {
+                // MPS's GPU convolution kernel only supports FP32/FP16
+                // operands -- unlike ANE, which has a native INT8 conv path.
+                // Passing raw INT8 tensors to convolution2D here does not
+                // throw a catchable NSException; it hits a hard assertion
+                // inside MPSNDArrayConvolutionPreG13.mm ("Only FP32 or FP16
+                // convolution supported") and calls abort(), taking the whole
+                // app down. Route through the same QDQ pattern matmul's INT8
+                // path already uses below: dequantize activations to FP16,
+                // convolve in FP16 with FP16 weights, requantize the output.
+                let wLength = dims.outChannels * dims.inChannels * dims.kernelSize * dims.kernelSize * 2
+                let wData = createNonZeroData(byteCount: wLength, dataType: .float16)
+                let w = graph.constant(wData, shape: wShape, dataType: .float16)
+
+                for _ in 0..<dims.layers {
+                    let lhs = graph.cast(cur, to: .float16, name: "dequant")
+                    let outFP16 = graph.convolution2D(lhs, weights: w, descriptor: d, name: nil)
+                    cur = graph.cast(outFP16, to: .int8, name: "requant")
+                }
             } else {
                 // Constant weights
                 let wLength = dims.outChannels * dims.inChannels * dims.kernelSize * dims.kernelSize * elementSize
                 let wData = createNonZeroData(byteCount: wLength, dataType: mpsType)
                 let w = graph.constant(wData, shape: wShape, dataType: mpsType)
-                
+
                 // Chain L layers
                 for _ in 0..<dims.layers {
                     cur = graph.convolution2D(cur, weights: w, descriptor: d, name: nil)
-                    
+
                     // Int8 simulated quantized flow: Int8 -> Conv -> FP16 dequant -> Int8 requant
                     if mpsType == .int8 {
                         let fp = graph.cast(cur, to: .float16, name: "dequant")
