@@ -25,10 +25,25 @@
  *    with "Unsupported quantization scheme".
  *
  * 4. Apple Neural Engine (ANE) Behavior:
- *    The physical ANE MAC arrays (H13-H16) only possess arithmetic ALUs for FP16 and INT8.
- *    ANECCompile returns an internal error when encountering FP8 MLIR operations:
- *      "MLIR MPS to ANEC conversion failed"
- *    MPSGraph catches this and automatically falls back to Metal GPU execution.
+ *    On H13-H16 (up through M4 Pro), the physical ANE MAC arrays only possess
+ *    arithmetic ALUs for FP16 and INT8. ANECCompile returns an internal error
+ *    when encountering FP8 MLIR operations ("MLIR MPS to ANEC conversion
+ *    failed"), and MPSGraph catches this, falling back to Metal GPU
+ *    execution automatically.
+ *
+ *    On H18 (iPhone 18 Pro), FP8 MLIR compiles for the ANE -- but W8A8 QDQ's
+ *    *runtime* activation quantize/dequantize (the FP8 tensor comes from a
+ *    placeholder, fed at execution time) produces degenerate all-zero output
+ *    on real ANE hardware, confirmed at --layers 1 (a single round-trip) and
+ *    independent of the FP8 storage magnitude or the quantize/dequantize
+ *    scale (see kLogicalShiftDefault/kPhysicalShiftDefault below). Weight-
+ *    Only QDQ's dequantize of a *compile-time-constant* FP8 weight is
+ *    unaffected -- MPSGraph likely constant-folds that at compile time,
+ *    meaning it may never actually exercise the ANE's FP8 datapath at all.
+ *    This looks like a genuine H18 hardware/driver limitation specific to
+ *    dynamic-tensor FP8 QDQ, not something fixable from this benchmark; the
+ *    all-zero-output warning below flags it rather than reporting the
+ *    resulting (H17+ zero-skip-inflated) TOPS number as real.
  *
  * 5. Weight/Input Fill Pattern:
  *    Random-sign, magnitude 1/32, RMS-scaled so the expected gain per layer
@@ -36,7 +51,11 @@
  *    chained layers -- same convention as MILSpecBuilder's MILWeightModeDense.
  *    An earlier same-sign, magnitude-~1 fill grew by ~1152x per layer and
  *    saturated to NaN/448 by layer 2, silently benchmarking overflow instead
- *    of real arithmetic for 18 of the 20 layers.
+ *    of real arithmetic for 18 of the 20 layers. W8A8 QDQ's per-layer
+ *    requantization does NOT reset magnitude to a constant -- layer N+1's
+ *    input is layer N's actual output -- so this growth-stability
+ *    requirement applies to it too; verified directly that only 1/32 (of
+ *    1/32..1/2) stays unsaturated across the full 20-layer chain.
  */
 
 #import <limits.h>
@@ -305,6 +324,17 @@ static void run_bench_fp8_qdq(id<MTLDevice> device, bool useANE,
               target, fName, mName, avg * 1000.0, tops,
               outPtr[0], outPtr[1], outPtr[2], outPtr[3],
               (unsigned long)zeroCount, (unsigned long)totalElem);
+        if (zeroCount == totalElem) {
+          NSLog(@"[%s | %s | %s] WARNING: 100%% zero output -- this is not a "
+                @"real measurement. On iPhone 18 Pro (H18), ANE runtime "
+                @"activation quantize/dequantize (as opposed to a "
+                @"compile-time-constant weight dequantize, which is fine) "
+                @"produces degenerate all-zero output regardless of scale or "
+                @"magnitude -- confirmed at --layers 1, i.e. a single "
+                @"round-trip. The TOPS above is H17+ zero-skip inflating a "
+                @"degenerate result, not real ANE FP8 throughput.",
+                target, fName, mName);
+        }
       } else {
         uint16_t *outPtr = (uint16_t *)oBuf.contents;
         size_t totalElem = B * Co * H * W;
@@ -378,15 +408,13 @@ int main(int argc, char *argv[]) {
     printf("\n========================================================\n");
     printf(" 2. Apple Neural Engine (ANE) FP8 QDQ Benchmark\n");
     printf("    (Note: on H16g this falls back to GPU -- ANECCompile rejects FP8\n");
-    printf("    MLIR. Newer silicon (H17+) may have a real ANE FP8 datapath; on\n");
-    printf("    iPhone 18 Pro, storing FP8 bytes at the logical 1/32 magnitude\n");
-    printf("    directly (physical-shift == logical-shift, scale=1.0) hit a\n");
-    printf("    confirmed all-zero underflow cliff on W8A8 QDQ's ANE path. The\n");
-    printf("    default --physical-shift -1 avoids it by construction (scale\n");
-    printf("    bridges physical and logical magnitude). If Check: is still\n");
-    printf("    all-zero here with an implausibly high TOPS, that's the classic\n");
-    printf("    hardware zero-skip signature -- sweep --physical-shift to\n");
-    printf("    rebracket the cliff on this device.)\n");
+    printf("    MLIR. On iPhone 18 Pro (H18), FP8 compiles for the ANE, but W8A8\n");
+    printf("    QDQ's runtime activation quantize/dequantize reproducibly zeroes\n");
+    printf("    its output regardless of scale/magnitude (confirmed at --layers 1)\n");
+    printf("    -- see point 4 in the file header. Weight-Only QDQ is unaffected\n");
+    printf("    (its FP8 tensor is compile-time-constant, likely folded away\n");
+    printf("    before it ever reaches the ANE FP8 datapath). This looks like an\n");
+    printf("    H18 hardware/driver limitation, not a benchmark parameter to tune.)\n");
     printf("========================================================\n");
     run_bench_fp8_qdq(device, true, MPSDataTypeFloat8e4m3, FP8BenchModeWeightOnly, layers, logicalShift, physicalShift);
     run_bench_fp8_qdq(device, true, MPSDataTypeFloat8e4m3, FP8BenchModeFullQDQ, layers, logicalShift, physicalShift);
