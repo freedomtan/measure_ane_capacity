@@ -68,6 +68,27 @@ private func fillNonZeroData(buffer: UnsafeMutableRawPointer, byteCount: Int, da
     }
 }
 
+private func countZeroElements(buffer: UnsafeMutableRawPointer, elementCount: Int, dataType: MPSDataType) -> Int {
+    guard elementCount > 0 else { return 0 }
+    if dataType == .float16 {
+        let ptr = buffer.bindMemory(to: UInt16.self, capacity: elementCount)
+        var zeros = 0
+        for i in 0..<elementCount {
+            // FP16 zero is 0x0000 (+0) or 0x8000 (-0).
+            if ptr[i] == 0x0000 || ptr[i] == 0x8000 { zeros += 1 }
+        }
+        return zeros
+    } else {
+        // Int8 and FP8 E4M3 both encode zero as the single byte 0x00.
+        let ptr = buffer.bindMemory(to: UInt8.self, capacity: elementCount)
+        var zeros = 0
+        for i in 0..<elementCount {
+            if ptr[i] == 0 { zeros += 1 }
+        }
+        return zeros
+    }
+}
+
 private func createNonZeroData(byteCount: Int, dataType: MPSDataType) -> Data {
     var data = Data(count: byteCount)
     data.withUnsafeMutableBytes { rawBuf in
@@ -151,6 +172,8 @@ final class ANECapacityEngine {
         let input: MPSGraphTensor
         var cur: MPSGraphTensor
         let inputBufferLen: Int
+        let outputBufferLen: Int
+        let outShape: [NSNumber]
         
         if dims.opType == .matmul {
             inShape = [
@@ -198,6 +221,12 @@ final class ANECapacityEngine {
                 }
             }
             inputBufferLen = dims.batch * dims.m * dims.k * elementSize
+            outputBufferLen = dims.batch * dims.m * dims.n * elementSize
+            outShape = [
+                NSNumber(value: dims.batch),
+                NSNumber(value: dims.m),
+                NSNumber(value: dims.n)
+            ]
         } else {
             inShape = [
                 NSNumber(value: dims.batch),
@@ -279,6 +308,13 @@ final class ANECapacityEngine {
                 }
             }
             inputBufferLen = dims.batch * dims.height * dims.width * dims.inChannels * elementSize
+            outputBufferLen = dims.batch * dims.height * dims.width * dims.outChannels * elementSize
+            outShape = [
+                NSNumber(value: dims.batch),
+                NSNumber(value: dims.outChannels),
+                NSNumber(value: dims.height),
+                NSNumber(value: dims.width)
+            ]
         }
         
         if Task.isCancelled { throw BenchmarkError.executionCancelled }
@@ -317,41 +353,52 @@ final class ANECapacityEngine {
         }
         fillNonZeroData(buffer: iBuf.contents(), byteCount: inputBufferLen, dataType: mpsType)
         let iData = MPSGraphTensorData(iBuf, shape: inShape, dataType: mpsType)
-        
+
+        // Captured (not results: nil) so the result can be checked for
+        // degenerate all-zero output below -- a plausible-looking TOPS
+        // number computed from wall-clock latency alone cannot distinguish
+        // real work from H17+ zero-skip inflating a degenerate result, which
+        // is exactly what FP8 W8A8 QDQ hits on some ANE generations (see
+        // measure_conv_fp8.m's file-header note on H18).
+        guard let oBuf = device.makeBuffer(length: outputBufferLen, options: []) else {
+            throw BenchmarkError.bufferAllocationFailed
+        }
+        let oData = MPSGraphTensorData(oBuf, shape: outShape, dataType: mpsType)
+
         guard let queue = device.makeCommandQueue() else {
             throw BenchmarkError.commandQueueCreationFailed
         }
-        
+
         let ed = MPSGraphExecutableExecutionDescriptor()
         ed.waitUntilCompleted = true
-        
+
         // 5. Warmup with Exception Protection
         logHandler("[\(target.shortName) \(precision.rawValue)] Warming up pipeline...")
         do {
             try ANEClientBridge.catchException {
-                exe.run(with: queue, inputs: [iData], results: nil, executionDescriptor: ed)
+                exe.run(with: queue, inputs: [iData], results: [oData], executionDescriptor: ed)
             }
         } catch {
             throw BenchmarkError.executionFailed("Warmup failed: \(error.localizedDescription)")
         }
-        
+
         if Task.isCancelled { throw BenchmarkError.executionCancelled }
-        
+
         // 6. Timed Benchmarking loop
         logHandler("[\(target.shortName) \(precision.rawValue)] Benchmarking \(iterations) iterations...")
         let startNanos = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW)
-        
+
         for i in 0..<iterations {
             if Task.isCancelled { throw BenchmarkError.executionCancelled }
-            
+
             do {
                 try ANEClientBridge.catchException {
-                    exe.run(with: queue, inputs: [iData], results: nil, executionDescriptor: ed)
+                    exe.run(with: queue, inputs: [iData], results: [oData], executionDescriptor: ed)
                 }
             } catch {
                 throw BenchmarkError.executionFailed("Iteration \(i) failed: \(error.localizedDescription)")
             }
-            
+
             // Yield every 5 iterations to allow UI updates
             if (i + 1) % 5 == 0 {
                 await Task.yield()
@@ -366,7 +413,24 @@ final class ANECapacityEngine {
         
         // Calculate TOPS: totalOps / (avgSec * 1e12)
         var tops = dims.totalOperations / (avgSec * 1e12)
-        
+
+        // A degenerate all-zero result reads as a plausible, even fast,
+        // number here -- wall-clock latency alone can't tell real work from
+        // H17+ zero-skip inflating throughput on garbage output. Confirmed on
+        // iPhone 18 Pro: FP8 W8A8 QDQ's runtime activation quantize/
+        // dequantize zeroes 100% of output on the ANE regardless of scale or
+        // magnitude (see measure_conv_fp8.m). Surface it here rather than
+        // silently reporting an inflated TOPS the UI can't distinguish from
+        // a real one.
+        let outputElementCount = outputBufferLen / elementSize
+        let zeroCount = countZeroElements(buffer: oBuf.contents(), elementCount: outputElementCount, dataType: mpsType)
+        if zeroCount == outputElementCount {
+            logHandler("[\(target.shortName) \(precision.rawValue)] WARNING: 100% zero output "
+                + "(\(outputElementCount)/\(outputElementCount) elements) -- this is not a real "
+                + "measurement. The TOPS below is almost certainly hardware zero-skip inflating "
+                + "a degenerate result, not real throughput.")
+        }
+
         // 7. PMU Telemetry Harvesting
         var pmuCounters: [String: UInt64] = [:]
         var computeCycles: UInt64 = 0
