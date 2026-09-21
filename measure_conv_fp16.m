@@ -11,23 +11,37 @@
 + (instancetype)ANEDevice;
 @end
 
+@interface MPSGraphCompilationDescriptor (Private)
+@property (nonatomic, assign) unsigned long long preferredDevice;
+@end
+
 // Fill buffer with small non-zero values to prevent hardware zero-skipping on H17/H18.
-static void fillNonZeroData(void *buffer, size_t byteCount, MPSDataType dataType) {
+// Uses deterministic xorshift64 random non-canceling signs to avoid reduction cancellation.
+static void fillNonZeroDataWithSeed(void *buffer, size_t byteCount, MPSDataType dataType, uint64_t seed) {
   if (!buffer || byteCount == 0) return;
+  uint64_t state = seed;
   if (dataType == MPSDataTypeFloat16) {
     uint16_t *p = (uint16_t *)buffer;
     size_t count = byteCount / sizeof(uint16_t);
-    static const uint16_t fp16_pattern[4] = {0x2C00, 0xAC00, 0x2800, 0xA800};
     for (size_t i = 0; i < count; i++) {
-      p[i] = fp16_pattern[i % 4];
+      state ^= state << 13;
+      state ^= state >> 7;
+      state ^= state << 17;
+      p[i] = (state & 1) ? 0xA800 : 0x2800; // -0.03125, +0.03125
     }
   } else {
     int8_t *p = (int8_t *)buffer;
-    static const int8_t int8_pattern[4] = {1, -1, 2, -2};
     for (size_t i = 0; i < byteCount; i++) {
-      p[i] = int8_pattern[i % 4];
+      state ^= state << 13;
+      state ^= state >> 7;
+      state ^= state << 17;
+      p[i] = (state & 1) ? -1 : 1;
     }
   }
+}
+
+static void fillNonZeroData(void *buffer, size_t byteCount, MPSDataType dataType) {
+  fillNonZeroDataWithSeed(buffer, byteCount, dataType, 0x5EED5EED5EED5EEDULL);
 }
 
 /**
@@ -71,7 +85,7 @@ void run_bench(id<MTLDevice> device, bool useANE) {
 
     // Create constant weights tensor filled with non-zero values (required on H17+ to prevent hardware zero-skipping)
     NSMutableData *wData = [NSMutableData dataWithLength:Co * Ci * K * K * elementSize];
-    fillNonZeroData(wData.mutableBytes, wData.length, MPSDataTypeFloat16);
+    fillNonZeroDataWithSeed(wData.mutableBytes, wData.length, MPSDataTypeFloat16, 0x5EED5EED5EED5EEDULL);
     MPSGraphTensor *w = [graph constantWithData:wData shape:wShape dataType:MPSDataTypeFloat16];
 
     // --- Graph Construction ---
@@ -93,9 +107,7 @@ void run_bench(id<MTLDevice> device, bool useANE) {
     }
 
     // --- Compilation ---
-    // Select the target device: ANE or GPU
-    MPSGraphDevice *mDev =
-        useANE ? [MPSGraphDevice ANEDevice] : [MPSGraphDevice deviceWithMTLDevice:device];
+    MPSGraphDevice *mDev = [MPSGraphDevice deviceWithMTLDevice:device];
     
     // Define feeding dictionary for compilation (shape and type info)
     NSDictionary *feeds =
@@ -104,6 +116,14 @@ void run_bench(id<MTLDevice> device, bool useANE) {
     MPSGraphCompilationDescriptor *cd = [MPSGraphCompilationDescriptor new];
     // Optimization Level: ANE usually benefits from Level 1
     cd.optimizationLevel = useANE ? MPSGraphOptimizationLevel1 : MPSGraphOptimizationLevel0;
+
+    if (useANE) {
+      if ([cd respondsToSelector:@selector(setPreferredDevice:)]) {
+        cd.preferredDevice = 2; // MPSGraphDeviceTypeANE
+      } else if ([MPSGraphDevice respondsToSelector:@selector(ANEDevice)]) {
+        mDev = [MPSGraphDevice ANEDevice];
+      }
+    }
 
     // Compile the graph into an executable
     MPSGraphExecutable *exe = [graph compileWithDevice:mDev
@@ -116,9 +136,14 @@ void run_bench(id<MTLDevice> device, bool useANE) {
     // --- Execution Setup ---
     // Allocate input buffer on the GPU/Shared memory
     id<MTLBuffer> iBuf = [device newBufferWithLength:B * H * W * Ci * elementSize options:0];
-    fillNonZeroData(iBuf.contents, iBuf.length, MPSDataTypeFloat16);
+    fillNonZeroDataWithSeed(iBuf.contents, iBuf.length, MPSDataTypeFloat16, 0x9E3779B97F4A7C15ULL);
     // Wrap buffer in MPSGraphTensorData
     MPSGraphTensorData *iData = [[MPSGraphTensorData alloc] initWithMTLBuffer:iBuf
+                                                                        shape:inShape
+                                                                     dataType:MPSDataTypeFloat16];
+
+    id<MTLBuffer> oBuf = [device newBufferWithLength:B * H * W * Co * elementSize options:0];
+    MPSGraphTensorData *oData = [[MPSGraphTensorData alloc] initWithMTLBuffer:oBuf
                                                                         shape:inShape
                                                                      dataType:MPSDataTypeFloat16];
 
@@ -129,7 +154,7 @@ void run_bench(id<MTLDevice> device, bool useANE) {
 
     // --- Warmup ---
     // Run once to prime the caches and stabilize the device state
-    [exe runWithMTLCommandQueue:q inputsArray:@[ iData ] resultsArray:nil executionDescriptor:ed];
+    [exe runWithMTLCommandQueue:q inputsArray:@[ iData ] resultsArray:@[ oData ] executionDescriptor:ed];
 
     // --- Benchmarking ---
     NSUInteger iterations = 20;
@@ -139,7 +164,7 @@ void run_bench(id<MTLDevice> device, bool useANE) {
     clock_gettime(CLOCK_MONOTONIC, &start);
     for (int i = 0; i < iterations; i++) {
       // Execute the graph
-      [exe runWithMTLCommandQueue:q inputsArray:@[ iData ] resultsArray:nil executionDescriptor:ed];
+      [exe runWithMTLCommandQueue:q inputsArray:@[ iData ] resultsArray:@[ oData ] executionDescriptor:ed];
     }
     // Stop timer
     clock_gettime(CLOCK_MONOTONIC, &end);
@@ -154,11 +179,16 @@ void run_bench(id<MTLDevice> device, bool useANE) {
     // TOPS = Total Operations / (Time in seconds * 10^12)
     double tops = (2.0 * B * H * W * Ci * Co * K * K * L) / (avg * 1e12);
     
-    if (!useANE) {
-      NSLog(@"[%@] Avg: %.2f ms, Speed: %.4f TOPS", @"GPU FP16", avg * 1000.0, tops);
-    } else {
-      NSLog(@"[%@] Avg: %.2f ms, Speed: %.4f TOPS", @"ANE FP16", avg * 1000.0, tops);
+    NSString *tag = useANE ? @"ANE FP16" : @"GPU FP16";
+    size_t totalElem = B * H * W * Co;
+    size_t zeroCount = 0;
+    uint16_t *outPtr = (uint16_t *)oBuf.contents;
+    for (size_t k = 0; k < totalElem; k++) {
+      if (outPtr[k] == 0x0000 || outPtr[k] == 0x8000) zeroCount++;
     }
+    NSLog(@"[%@] Avg: %.2f ms, Speed: %.4f TOPS | Check: [0x%04x, 0x%04x, 0x%04x, 0x%04x] (zeros: %lu/%lu)",
+          tag, avg * 1000.0, tops, outPtr[0], outPtr[1], outPtr[2], outPtr[3],
+          (unsigned long)zeroCount, (unsigned long)totalElem);
   }
 }
 

@@ -7,22 +7,33 @@
 + (instancetype)ANEDevice;
 @end
 
-static void fillNonZeroData(void *buffer, size_t byteCount, MPSDataType dataType) {
+// Fill buffer with small non-zero values to prevent hardware zero-skipping on H17/H18.
+// Uses deterministic xorshift64 random non-canceling signs to avoid reduction cancellation.
+static void fillNonZeroDataWithSeed(void *buffer, size_t byteCount, MPSDataType dataType, uint64_t seed) {
   if (!buffer || byteCount == 0) return;
+  uint64_t state = seed;
   if (dataType == MPSDataTypeFloat16) {
     uint16_t *ptr = (uint16_t *)buffer;
     size_t count = byteCount / sizeof(uint16_t);
-    const uint16_t patterns[4] = {0x2C00, 0xAC00, 0x2800, 0xA800};
     for (size_t i = 0; i < count; i++) {
-      ptr[i] = patterns[i & 3];
+      state ^= state << 13;
+      state ^= state >> 7;
+      state ^= state << 17;
+      ptr[i] = (state & 1) ? 0xA800 : 0x2800; // -0.03125, +0.03125
     }
   } else {
     int8_t *ptr = (int8_t *)buffer;
-    const int8_t patterns[4] = {1, -1, 2, -2};
     for (size_t i = 0; i < byteCount; i++) {
-      ptr[i] = patterns[i & 3];
+      state ^= state << 13;
+      state ^= state >> 7;
+      state ^= state << 17;
+      ptr[i] = (state & 1) ? -1 : 1;
     }
   }
+}
+
+static void fillNonZeroData(void *buffer, size_t byteCount, MPSDataType dataType) {
+  fillNonZeroDataWithSeed(buffer, byteCount, dataType, 0x5EED5EED5EED5EEDULL);
 }
 
 // --- Benchmarking Logic (Refactored for GUI) ---
@@ -106,7 +117,7 @@ static void fillNonZeroData(void *buffer, size_t byteCount, MPSDataType dataType
     NSUInteger elementSize = (wType == MPSDataTypeFloat16) ? 2 : 1;
     NSMutableData *wData =
         [NSMutableData dataWithLength:Co * Ci * K * K * elementSize];
-    fillNonZeroData(wData.mutableBytes, wData.length, wType);
+    fillNonZeroDataWithSeed(wData.mutableBytes, wData.length, wType, 0x5EED5EED5EED5EEDULL);
     MPSGraphTensor *w = [graph constantWithData:wData
                                           shape:wShape
                                        dataType:wType];
@@ -168,7 +179,7 @@ static void fillNonZeroData(void *buffer, size_t byteCount, MPSDataType dataType
     id<MTLBuffer> iBuf =
         [device newBufferWithLength:B * H * W * Ci * inputElementSize
                             options:0];
-    fillNonZeroData(iBuf.contents, iBuf.length, dataType);
+    fillNonZeroDataWithSeed(iBuf.contents, iBuf.length, dataType, 0x9E3779B97F4A7C15ULL);
     MPSGraphTensorData *iData =
         [[MPSGraphTensorData alloc] initWithMTLBuffer:iBuf
                                                 shape:inShape

@@ -8,23 +8,37 @@
 + (instancetype)ANEDevice;
 @end
 
+@interface MPSGraphCompilationDescriptor (Private)
+@property (nonatomic, assign) unsigned long long preferredDevice;
+@end
+
 // Fill buffer with small non-zero values to prevent hardware zero-skipping on H17/H18.
-static void fillNonZeroData(void *buffer, size_t byteCount, MPSDataType dataType) {
+// Uses deterministic xorshift64 random non-canceling signs to avoid reduction cancellation.
+static void fillNonZeroDataWithSeed(void *buffer, size_t byteCount, MPSDataType dataType, uint64_t seed) {
   if (!buffer || byteCount == 0) return;
+  uint64_t state = seed;
   if (dataType == MPSDataTypeFloat16) {
     uint16_t *p = (uint16_t *)buffer;
     size_t count = byteCount / sizeof(uint16_t);
-    static const uint16_t fp16_pattern[4] = {0x2C00, 0xAC00, 0x2800, 0xA800};
     for (size_t i = 0; i < count; i++) {
-      p[i] = fp16_pattern[i % 4];
+      state ^= state << 13;
+      state ^= state >> 7;
+      state ^= state << 17;
+      p[i] = (state & 1) ? 0xA800 : 0x2800; // -0.03125, +0.03125
     }
   } else {
     int8_t *p = (int8_t *)buffer;
-    static const int8_t int8_pattern[4] = {1, -1, 2, -2};
     for (size_t i = 0; i < byteCount; i++) {
-      p[i] = int8_pattern[i % 4];
+      state ^= state << 13;
+      state ^= state >> 7;
+      state ^= state << 17;
+      p[i] = (state & 1) ? -1 : 1;
     }
   }
+}
+
+static void fillNonZeroData(void *buffer, size_t byteCount, MPSDataType dataType) {
+  fillNonZeroDataWithSeed(buffer, byteCount, dataType, 0x5EED5EED5EED5EEDULL);
 }
 
 /**
@@ -33,6 +47,7 @@ static void fillNonZeroData(void *buffer, size_t byteCount, MPSDataType dataType
 void run_bench(id<MTLDevice> device, bool useANE, MPSDataType dataType,
                NSString *name) {
   @autoreleasepool {
+    MPSGraphDevice *mDev = [MPSGraphDevice deviceWithMTLDevice:device];
     MPSGraph *graph = [MPSGraph new];
 
     // Settings for high-throughput
@@ -51,7 +66,7 @@ void run_bench(id<MTLDevice> device, bool useANE, MPSDataType dataType,
     // Weights allocation (non-zero initialized to prevent hardware zero-skipping on H17+)
     NSMutableData *wData =
         [NSMutableData dataWithLength:Co * Ci * K * K * elementSize];
-    fillNonZeroData(wData.mutableBytes, wData.length, dataType);
+    fillNonZeroDataWithSeed(wData.mutableBytes, wData.length, dataType, 0x5EED5EED5EED5EEDULL);
     MPSGraphTensor *w = [graph constantWithData:wData
                                           shape:wShape
                                        dataType:dataType];
@@ -80,8 +95,6 @@ void run_bench(id<MTLDevice> device, bool useANE, MPSDataType dataType,
       }
     }
 
-    MPSGraphDevice *mDev = useANE ? [MPSGraphDevice ANEDevice]
-                                  : [MPSGraphDevice deviceWithMTLDevice:device];
     NSDictionary *feeds = @{
       input : [[MPSGraphShapedType alloc] initWithShape:inShape
                                                dataType:dataType]
@@ -90,6 +103,14 @@ void run_bench(id<MTLDevice> device, bool useANE, MPSDataType dataType,
     MPSGraphCompilationDescriptor *cd = [MPSGraphCompilationDescriptor new];
     cd.optimizationLevel =
         useANE ? MPSGraphOptimizationLevel1 : MPSGraphOptimizationLevel0;
+
+    if (useANE) {
+      if ([cd respondsToSelector:@selector(setPreferredDevice:)]) {
+        cd.preferredDevice = 2; // MPSGraphDeviceTypeANE
+      } else if ([MPSGraphDevice respondsToSelector:@selector(ANEDevice)]) {
+        mDev = [MPSGraphDevice ANEDevice];
+      }
+    }
 
     MPSGraphExecutable *exe = [graph compileWithDevice:mDev
                                                  feeds:feeds
@@ -101,9 +122,16 @@ void run_bench(id<MTLDevice> device, bool useANE, MPSDataType dataType,
 
     id<MTLBuffer> iBuf =
         [device newBufferWithLength:B * H * W * Ci * elementSize options:0];
-    fillNonZeroData(iBuf.contents, iBuf.length, dataType);
+    fillNonZeroDataWithSeed(iBuf.contents, iBuf.length, dataType, 0x9E3779B97F4A7C15ULL);
     MPSGraphTensorData *iData =
         [[MPSGraphTensorData alloc] initWithMTLBuffer:iBuf
+                                                shape:inShape
+                                             dataType:dataType];
+
+    id<MTLBuffer> oBuf =
+        [device newBufferWithLength:B * H * W * Co * elementSize options:0];
+    MPSGraphTensorData *oData =
+        [[MPSGraphTensorData alloc] initWithMTLBuffer:oBuf
                                                 shape:inShape
                                              dataType:dataType];
 
@@ -115,7 +143,7 @@ void run_bench(id<MTLDevice> device, bool useANE, MPSDataType dataType,
     // Warmup
     [exe runWithMTLCommandQueue:q
                     inputsArray:@[ iData ]
-                   resultsArray:nil
+                   resultsArray:@[ oData ]
             executionDescriptor:ed];
 
     NSUInteger iterations = 20;
@@ -124,7 +152,7 @@ void run_bench(id<MTLDevice> device, bool useANE, MPSDataType dataType,
     for (int i = 0; i < iterations; i++) {
       [exe runWithMTLCommandQueue:q
                       inputsArray:@[ iData ]
-                     resultsArray:nil
+                     resultsArray:@[ oData ]
               executionDescriptor:ed];
     }
     clock_gettime(CLOCK_MONOTONIC, &end);
@@ -134,7 +162,26 @@ void run_bench(id<MTLDevice> device, bool useANE, MPSDataType dataType,
     double avg = duration / iterations;
 
     double tops = (2.0 * B * H * W * Ci * Co * K * K * L) / (avg * 1e12);
-    NSLog(@"[%@] Avg: %.2f ms, Speed: %.4f TOPS", name, avg * 1000.0, tops);
+
+    size_t totalElem = B * H * W * Co;
+    size_t zeroCount = 0;
+    if (dataType == MPSDataTypeFloat16) {
+      uint16_t *outPtr = (uint16_t *)oBuf.contents;
+      for (size_t k = 0; k < totalElem; k++) {
+        if (outPtr[k] == 0x0000 || outPtr[k] == 0x8000) zeroCount++;
+      }
+      NSLog(@"[%@] Avg: %.2f ms, Speed: %.4f TOPS | Check: [0x%04x, 0x%04x, 0x%04x, 0x%04x] (zeros: %lu/%lu)",
+            name, avg * 1000.0, tops, outPtr[0], outPtr[1], outPtr[2], outPtr[3],
+            (unsigned long)zeroCount, (unsigned long)totalElem);
+    } else {
+      int8_t *outPtr = (int8_t *)oBuf.contents;
+      for (size_t k = 0; k < totalElem; k++) {
+        if (outPtr[k] == 0) zeroCount++;
+      }
+      NSLog(@"[%@] Avg: %.2f ms, Speed: %.4f TOPS | Check: [%d, %d, %d, %d] (zeros: %lu/%lu)",
+            name, avg * 1000.0, tops, outPtr[0], outPtr[1], outPtr[2], outPtr[3],
+            (unsigned long)zeroCount, (unsigned long)totalElem);
+    }
   }
 }
 

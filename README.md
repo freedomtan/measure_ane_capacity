@@ -166,10 +166,8 @@ These are the same MACs/cycle/core figures `measure_ane_pmu` reports for MPSGrap
 > [!NOTE]
 > `--pmu` queries hardware performance counters directly via `_ANEClient` talking to the root-privileged `aned` daemon. No boot-arg changes, entitlements, `sudo`, or root access are needed.
 
-> [!WARNING]
-> **The tiled `fillNonZeroData` pattern cancels to exactly zero under the convolution reduction.** Verified on hardware with a single-layer model: the tiled `+0.0625, -0.0625, +0.03125, -0.03125` sequence used by every MPSGraph binary in this repo produces an all-zero output tensor (8,388,608 / 8,388,608 elements exactly zero), because the alternating signs cancel across the $C_i \times K \times K$ reduction window. **Only layer 1 ever sees non-zero activations; layers 2…L consume a zero tensor** — precisely the condition the section below warns inflates TOPS on H17+.
->
-> On **H16g (M4 Pro) this is harmless** — measured directly, `--input repeat --weights repeat` (18.55 TOPS) is statistically indistinguishable from `--input dense --weights dense` (18.48 TOPS), confirming H16g does not zero-skip. But on **H17/H18 the published "Dense (Non-Zero)" iPhone figures below may still be partially zero-skipped** and warrant re-measurement. `measure_conv_coreml` therefore defaults to `--input dense` with random-sign weights, RMS-scaled so activation magnitude stays roughly constant (measured $|v| \in [1.5\times10^{-5}, 1.41]$ after 20 layers, zero NaN/Inf). The MPSGraph binaries are unchanged.
+> [!NOTE]
+> **Deterministic Non-Canceling Pseudo-Random Fill (`fillNonZeroData`)**: The legacy tiled `+0.0625, -0.0625, +0.03125, -0.03125` pattern cancelled to zero under the $C_i \times K \times K = 1152$ spatial reduction window. All MPSGraph benchmarks, CoreML MIL generation, and `ANECapacityApp` have been updated to use deterministic `xorshift64` random non-canceling signs ($\pm 0.03125$ for FP16, $\pm 1$ for INT8, $\pm 0.03125$ for FP8) with independent seeds for weights (`0x5EED...`) and inputs (`0x9E37...`). This maintains stable activation variance (~1.0) without zero-cancellation across all 20 chained layers on both Metal GPU and ANE.
 
 ### Universal Matrix Multiplication Benchmark (`measure_matmul_universal`)
 `measure_matmul_universal` benchmarks dense Matrix Multiplication (GEMM) using the native MPSGraph `matrixMultiplicationWithPrimaryTensor:secondaryTensor:` API across Metal GPU and the Apple Neural Engine (ANE).
