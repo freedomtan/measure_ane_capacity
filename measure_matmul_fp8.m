@@ -88,7 +88,7 @@ static void run_bench_matmul_fp8_qdq(id<MTLDevice> device, bool useANE,
 
       MPSGraph *graph = [MPSGraph new];
       MPSDataType actType = (mode == FP8BenchModeFullQDQ) ? fp8Type : MPSDataTypeFloat16;
-      double fp8Scale = 0.0625; // 2^-4: decouples physical 0.5 from logical 0.03125 math
+      double fp8Scale = 1.0; // scale 1.0 matches measure_conv_fp8 --logical-shift -1 on H19
 
       MPSGraphTensor *input = [graph placeholderWithShape:inShape
                                                  dataType:actType

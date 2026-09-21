@@ -207,7 +207,7 @@ final class ANECapacityEngine {
                 guard #available(iOS 27.0, macOS 27.0, *) else {
                     throw BenchmarkError.executionFailed("FP8 requires iOS 27.0 / macOS 27.0 or newer.")
                 }
-                let fp8Scale: Double = 0.0625
+                let fp8Scale: Double = 1.0
                 let wLength = dims.batch * dims.k * dims.n * 1
                 let wData = createNonZeroData(byteCount: wLength, dataType: mpsType)
                 let wFP8 = graph.constant(wData, shape: wShape, dataType: mpsType)
@@ -275,7 +275,7 @@ final class ANECapacityEngine {
                 guard #available(iOS 27.0, macOS 27.0, *) else {
                     throw BenchmarkError.executionFailed("FP8 requires iOS 27.0 / macOS 27.0 or newer.")
                 }
-                let fp8Scale: Double = 0.0625
+                let fp8Scale: Double = 1.0
                 let wLength = dims.outChannels * dims.inChannels * dims.kernelSize * dims.kernelSize * 1
                 let wData = createNonZeroData(byteCount: wLength, dataType: mpsType)
                 let wFP8 = graph.constant(wData, shape: wShape, dataType: mpsType)
