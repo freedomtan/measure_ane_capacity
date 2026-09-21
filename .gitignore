@@ -10,11 +10,13 @@ measure_ane_pmu
 measure_conv_coreml
 measure_conv_fp8
 measure_matmul_fp8
+convert_fp8_to_hwx
 
 # Build artifacts and packages
 *.o
 *.dSYM
 packages/
+hwx_output/
 .DS_Store
 xcuserdata/
 *.xcuserstate

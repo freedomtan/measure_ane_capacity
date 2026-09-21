@@ -28,12 +28,15 @@ PROTOBUF_LIB = $(shell pkg-config --libs protobuf-lite 2>/dev/null || \
 	echo -L/opt/homebrew/lib -L/opt/local/lib -L/usr/local/lib -lprotobuf-lite)
 # protobuf 33's generated code trips absl's own deprecation attributes.
 PROTO_CXXFLAGS = -std=c++17 -O2 -Wno-deprecated-declarations
-TARGETS  = measure_conv_fp16 measure_conv measure_conv_universal measure_matmul_universal measure_conv_qdq measure_conv_swift measure_ane_pmu measure_conv_coreml measure_conv_fp8 measure_matmul_fp8
+TARGETS  = measure_conv_fp16 measure_conv measure_conv_universal measure_matmul_universal measure_conv_qdq measure_conv_swift measure_ane_pmu measure_conv_coreml measure_conv_fp8 measure_matmul_fp8 convert_fp8_to_hwx
 
 all: ${TARGETS}
 
 measure_ane_pmu: measure_ane_pmu.m
 	$(CC) $(CFLAGS) $(FRAMEWORKS) $(ANE_FRAMEWORKS) measure_ane_pmu.m -o measure_ane_pmu
+
+convert_fp8_to_hwx: convert_fp8_to_hwx.m
+	$(CC) $(CFLAGS) $(FRAMEWORKS) $(ANE_FRAMEWORKS) -F/System/Library/PrivateFrameworks -framework ANECompiler convert_fp8_to_hwx.m -o convert_fp8_to_hwx
 
 measure_conv_fp8: measure_conv_fp8.m
 
