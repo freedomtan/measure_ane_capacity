@@ -196,6 +196,12 @@ struct BenchmarkResult: Identifiable, Codable {
     var chipMacsPerCycle: Double = 0.0
     var aluSaturation: Double = 0.0
     var effectiveClockGhz: Double = 0.0
+    var zeroOutputCount: Int = 0
+    var outputElementCount: Int = 0
+    
+    var zeroOutputPct: Double {
+        outputElementCount > 0 ? (Double(zeroOutputCount) / Double(outputElementCount) * 100.0) : 0.0
+    }
     
     static let allPMUCounterKeys: [String] = [
         "kANE_AF_TO_L2_DATA",
@@ -251,7 +257,9 @@ struct BenchmarkResult: Identifiable, Codable {
         macsPerCoreCycle: Double = 0.0,
         chipMacsPerCycle: Double = 0.0,
         aluSaturation: Double = 0.0,
-        effectiveClockGhz: Double = 0.0
+        effectiveClockGhz: Double = 0.0,
+        zeroOutputCount: Int = 0,
+        outputElementCount: Int = 0
     ) {
         self.id = id
         self.timestamp = timestamp
@@ -276,6 +284,8 @@ struct BenchmarkResult: Identifiable, Codable {
         self.chipMacsPerCycle = chipMacsPerCycle
         self.aluSaturation = aluSaturation
         self.effectiveClockGhz = effectiveClockGhz
+        self.zeroOutputCount = zeroOutputCount
+        self.outputElementCount = outputElementCount
     }
     
     var seriesName: String {

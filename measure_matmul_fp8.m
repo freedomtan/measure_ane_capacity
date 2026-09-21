@@ -53,7 +53,7 @@ static void fillFP8Random(void *buffer, size_t byteCount, uint64_t seed) {
     state ^= state << 13;
     state ^= state >> 7;
     state ^= state << 17;
-    p[i] = (state & 1) ? 0x90 : 0x10;  // -0.03125 : +0.03125
+    p[i] = (state & 1) ? 0xB0 : 0x30;  // -0.5 : +0.5 (physical magnitude to avoid H18 zero cliff)
   }
 }
 
@@ -88,6 +88,7 @@ static void run_bench_matmul_fp8_qdq(id<MTLDevice> device, bool useANE,
 
       MPSGraph *graph = [MPSGraph new];
       MPSDataType actType = (mode == FP8BenchModeFullQDQ) ? fp8Type : MPSDataTypeFloat16;
+      double fp8Scale = 0.0625; // 2^-4: decouples physical 0.5 from logical 0.03125 math
 
       MPSGraphTensor *input = [graph placeholderWithShape:inShape
                                                  dataType:actType
@@ -99,9 +100,9 @@ static void run_bench_matmul_fp8_qdq(id<MTLDevice> device, bool useANE,
       fillFP8Random(wData.mutableBytes, wData.length, 0x5EED5EED5EED5EEDULL);
       MPSGraphTensor *wFP8 = [graph constantWithData:wData shape:wShape dataType:fp8Type];
 
-      // Dequantize weights from FP8 to FP16 (scale = 1.0, zeroPoint = 0.0)
+      // Dequantize weights from FP8 to FP16
       MPSGraphTensor *w = [graph dequantizeTensor:wFP8
-                                            scale:1.0
+                                            scale:fp8Scale
                                         zeroPoint:0.0
                                          dataType:MPSDataTypeFloat16
                                              name:@"w_dequant"];
@@ -110,7 +111,7 @@ static void run_bench_matmul_fp8_qdq(id<MTLDevice> device, bool useANE,
         if (mode == FP8BenchModeFullQDQ) {
           // Dequantize activation to FP16
           MPSGraphTensor *inFP16 = [graph dequantizeTensor:cur
-                                                     scale:1.0
+                                                     scale:fp8Scale
                                                  zeroPoint:0.0
                                                   dataType:MPSDataTypeFloat16
                                                       name:nil];
@@ -120,7 +121,7 @@ static void run_bench_matmul_fp8_qdq(id<MTLDevice> device, bool useANE,
                                                                             name:nil];
           // Quantize back to FP8
           cur = [graph quantizeTensor:outFP16
-                                scale:1.0
+                                scale:fp8Scale
                             zeroPoint:0.0
                              dataType:fp8Type
                                  name:nil];

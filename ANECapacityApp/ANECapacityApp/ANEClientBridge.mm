@@ -243,23 +243,40 @@ static IOSurfaceRef createIOSurface(size_t bytes) {
     return IOSurfaceCreate((CFDictionaryRef)props);
 }
 
-static void fillIOSurfaceNonZero(IOSurfaceRef surf, size_t bytes, BOOL isFP16) {
+static void fillIOSurfaceNonZero(IOSurfaceRef surf, size_t bytes, MPSDataType dataType) {
     if (!surf || bytes == 0) return;
     IOSurfaceLock(surf, 0, nil);
     void *ptr = IOSurfaceGetBaseAddress(surf);
     if (ptr) {
-        if (isFP16) {
+        uint64_t state = 0x5EED5EED5EED5EEDULL;
+        if ((uint32_t)dataType == 0x10430008) { // MPSDataTypeFloat8e4m3
+            // Random-sign, physical magnitude 0.5 (E4M3 0x30 = +0.5, 0xB0 = -0.5).
+            // Matches decoupled FP8 fill in ANECapacityEngine.swift to prevent H18 zero-skip cliff.
+            uint8_t *u8 = (uint8_t *)ptr;
+            for (size_t i = 0; i < bytes; i++) {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                u8[i] = (state & 1) ? 0xB0 : 0x30;
+            }
+        } else if (dataType == MPSDataTypeFloat16) {
+            // Random-sign, magnitude 1/32 (FP16 0x2800 = +0.03125, 0xA800 = -0.03125).
             uint16_t *f16 = (uint16_t *)ptr;
             size_t count = bytes / sizeof(uint16_t);
-            static const uint16_t kNonZeroFP16[] = { 0x3400, 0xB400, 0x3000, 0xB000, 0x3800, 0xB800 };
             for (size_t i = 0; i < count; i++) {
-                f16[i] = kNonZeroFP16[i % 6];
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                f16[i] = (state & 1) ? 0xA800 : 0x2800;
             }
         } else {
+            // INT8: Deterministic pseudo-random non-canceling signs {-1, 1}
             int8_t *i8 = (int8_t *)ptr;
-            static const int8_t kNonZeroINT8[] = { 1, -1, 2, -2 };
             for (size_t i = 0; i < bytes; i++) {
-                i8[i] = kNonZeroINT8[i % 4];
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                i8[i] = (state & 1) ? -1 : 1;
             }
         }
     }
@@ -531,6 +548,14 @@ static NSDictionary *gActiveLoadOpts = nil;
     res.totalMacs = workloadMacs;
     res.totalGops = (workloadMacs * 2.0) / 1e9;
     
+    MPSDataType modelDataType = MPSDataTypeFloat16;
+    NSString *fullIdent = [NSString stringWithFormat:@"%@ %@", key ?: @"", [url lastPathComponent] ?: @""].lowercaseString;
+    if ([fullIdent containsString:@"int8"]) {
+        modelDataType = MPSDataTypeInt8;
+    } else if ([fullIdent containsString:@"fp8"]) {
+        modelDataType = (MPSDataType)0x10430008;
+    }
+    
     Class clientClass = NSClassFromString(@"_ANEClient");
     Class modelClass = NSClassFromString(@"_ANEModel");
     Class reqClass = NSClassFromString(@"_ANERequest");
@@ -659,7 +684,7 @@ static NSDictionary *gActiveLoadOpts = nil;
         uint64_t batches = [t[@"Batches"] unsignedLongLongValue] ?: 1;
         size_t bytes = (size_t)(bStride * batches);
         IOSurfaceRef surf = createIOSurface(bytes);
-        fillIOSurfaceNonZero(surf, bytes, YES);
+        fillIOSurfaceNonZero(surf, bytes, modelDataType);
         [inSurfs addObject:(__bridge id)surf];
         id obj = [ioSurfaceObjClass performSelector:@selector(objectWithIOSurface:) withObject:(__bridge id)surf];
         [inObjects addObject:obj];
@@ -670,7 +695,7 @@ static NSDictionary *gActiveLoadOpts = nil;
     // Fallback if model has no declared live inputs
     if (inObjects.count == 0) {
         IOSurfaceRef surf = createIOSurface(0x4000);
-        fillIOSurfaceNonZero(surf, 0x4000, YES);
+        fillIOSurfaceNonZero(surf, 0x4000, modelDataType);
         [inSurfs addObject:(__bridge id)surf];
         id obj = [ioSurfaceObjClass performSelector:@selector(objectWithIOSurface:) withObject:(__bridge id)surf];
         [inObjects addObject:obj];
@@ -1200,7 +1225,7 @@ static NSArray<NSString *> *getANETempBaseDirectories(void) {
     if (outBytes == 0) outBytes = 0x4000;
     
     IOSurfaceRef inSurf = createIOSurface(inBytes);
-    fillIOSurfaceNonZero(inSurf, inBytes, dataType == MPSDataTypeFloat16);
+    fillIOSurfaceNonZero(inSurf, inBytes, dataType);
     IOSurfaceRef outSurf = createIOSurface(outBytes);
     IOSurfaceRef pmuSurf = createIOSurface(0x1000);
     

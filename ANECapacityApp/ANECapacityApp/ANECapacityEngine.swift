@@ -37,20 +37,17 @@ private func fillNonZeroData(buffer: UnsafeMutableRawPointer, byteCount: Int, da
     guard byteCount > 0 else { return }
     var state = seed
     if dataType.rawValue == 0x10430008 { // Float8e4m3
-        // Random-sign, magnitude 1/32 (E4M3 0x10 = +0.03125, 0x90 = -0.03125).
-        // A same-sign, magnitude-~1 fill (0x38/0x34/0x3C/0x30, all positive)
-        // grows geometrically across the chained conv/matmul layers -- by
-        // Ci*K*K (~1152) or K (1024) per layer -- and saturates to NaN/448
-        // by layer 2, silently benchmarking overflow for the rest of the
-        // chain. Random sign at 1/32 keeps the expected per-layer RMS gain
-        // near 1 (sqrt(reduction)/32), matching measure_conv_fp8.m /
-        // measure_matmul_fp8.m and MILSpecBuilder's MILWeightModeDense.
+        // Random-sign, physical magnitude 0.5 (E4M3 0x30 = +0.5, 0xB0 = -0.5).
+        // Paired with dequantize/quantize scale 0.0625 (2^-4), logical arithmetic
+        // runs at 0.5 * 0.0625 = 0.03125 (2^-5), keeping expected per-layer RMS gain
+        // near 1.0 (sqrt(reduction)/32) while avoiding the H18 ANE underflow-to-zero cliff
+        // on dynamic activation dequantization (see measure_conv_fp8.m).
         let ptr = buffer.bindMemory(to: UInt8.self, capacity: byteCount)
         for i in 0..<byteCount {
             state ^= state << 13
             state ^= state >> 7
             state ^= state << 17
-            ptr[i] = (state & 1) != 0 ? 0x90 : 0x10
+            ptr[i] = (state & 1) != 0 ? 0xB0 : 0x30
         }
     } else if dataType == .float16 {
         // Random-sign, magnitude 1/32 (FP16 0x2800 = +0.03125, 0xA800 = -0.03125).
@@ -210,15 +207,16 @@ final class ANECapacityEngine {
                 guard #available(iOS 27.0, macOS 27.0, *) else {
                     throw BenchmarkError.executionFailed("FP8 requires iOS 27.0 / macOS 27.0 or newer.")
                 }
+                let fp8Scale: Double = 0.0625
                 let wLength = dims.batch * dims.k * dims.n * 1
                 let wData = createNonZeroData(byteCount: wLength, dataType: mpsType)
                 let wFP8 = graph.constant(wData, shape: wShape, dataType: mpsType)
-                let w = graph.dequantize(wFP8, scale: 1.0, zeroPoint: 0.0, dataType: .float16, name: "w_dequant")
+                let w = graph.dequantize(wFP8, scale: fp8Scale, zeroPoint: 0.0, dataType: .float16, name: "w_dequant")
                 
                 for _ in 0..<dims.layers {
-                    let lhs = graph.dequantize(cur, scale: 1.0, zeroPoint: 0.0, dataType: .float16, name: "act_dequant")
+                    let lhs = graph.dequantize(cur, scale: fp8Scale, zeroPoint: 0.0, dataType: .float16, name: "act_dequant")
                     let outFP16 = graph.matrixMultiplication(primary: lhs, secondary: w, name: nil)
-                    cur = graph.quantize(outFP16, scale: 1.0, zeroPoint: 0.0, dataType: mpsType, name: "act_quant")
+                    cur = graph.quantize(outFP16, scale: fp8Scale, zeroPoint: 0.0, dataType: mpsType, name: "act_quant")
                 }
             } else {
                 let wLength = dims.batch * dims.k * dims.n * 2
@@ -277,15 +275,16 @@ final class ANECapacityEngine {
                 guard #available(iOS 27.0, macOS 27.0, *) else {
                     throw BenchmarkError.executionFailed("FP8 requires iOS 27.0 / macOS 27.0 or newer.")
                 }
+                let fp8Scale: Double = 0.0625
                 let wLength = dims.outChannels * dims.inChannels * dims.kernelSize * dims.kernelSize * 1
                 let wData = createNonZeroData(byteCount: wLength, dataType: mpsType)
                 let wFP8 = graph.constant(wData, shape: wShape, dataType: mpsType)
-                let w = graph.dequantize(wFP8, scale: 1.0, zeroPoint: 0.0, dataType: .float16, name: "w_dequant")
+                let w = graph.dequantize(wFP8, scale: fp8Scale, zeroPoint: 0.0, dataType: .float16, name: "w_dequant")
                 
                 for _ in 0..<dims.layers {
-                    let actFP16 = graph.dequantize(cur, scale: 1.0, zeroPoint: 0.0, dataType: .float16, name: "act_dequant")
+                    let actFP16 = graph.dequantize(cur, scale: fp8Scale, zeroPoint: 0.0, dataType: .float16, name: "act_dequant")
                     let outFP16 = graph.convolution2D(actFP16, weights: w, descriptor: d, name: nil)
-                    cur = graph.quantize(outFP16, scale: 1.0, zeroPoint: 0.0, dataType: mpsType, name: "act_quant")
+                    cur = graph.quantize(outFP16, scale: fp8Scale, zeroPoint: 0.0, dataType: mpsType, name: "act_quant")
                 }
             } else if mpsType == .int8 && target != .ane {
                 // MPS's GPU convolution kernel only supports FP32/FP16
@@ -542,7 +541,9 @@ final class ANECapacityEngine {
             macsPerCoreCycle: macsPerCoreCycle,
             chipMacsPerCycle: chipMacsPerCycle,
             aluSaturation: aluSaturation,
-            effectiveClockGhz: effectiveClockGhz
+            effectiveClockGhz: effectiveClockGhz,
+            zeroOutputCount: zeroCount,
+            outputElementCount: outputElementCount
         )
     }
     
