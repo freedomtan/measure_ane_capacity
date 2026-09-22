@@ -1,26 +1,47 @@
-import Foundation
+import SwiftUI
 import MetalPerformanceShadersGraph
 
 // MARK: - Precision Mode
 enum PrecisionMode: String, CaseIterable, Identifiable, Codable {
     case fp16 = "FP16"
     case int8 = "INT8"
+    case fp8 = "FP8 (E4M3)"
     case both = "Both (FP16 & INT8)"
+    case all = "All Precisions"
     
     var id: String { rawValue }
     
     var elementSize: Int {
         switch self {
         case .fp16: return 2
-        case .int8: return 1
-        case .both: return 2
+        case .int8, .fp8: return 1
+        case .both, .all: return 2
         }
+    }
+    
+    var isFP8: Bool {
+        return self == .fp8
     }
     
     var mpsDataType: MPSDataType {
         switch self {
-        case .fp16, .both: return .float16
+        case .fp16, .both, .all: return .float16
         case .int8: return .int8
+        case .fp8:
+            if #available(iOS 27.0, macOS 27.0, *) {
+                return .float8e4m3
+            } else {
+                return MPSDataType(rawValue: 0x10430008) ?? .float16
+            }
+        }
+    }
+    
+    var themeColor: Color {
+        switch self {
+        case .fp16: return .blue
+        case .int8: return .orange
+        case .fp8: return .mint
+        case .both, .all: return .purple
         }
     }
 }
@@ -117,14 +138,16 @@ struct ConvDimensions: Codable, Equatable {
     
     func weightsBytes(precision: PrecisionMode) -> Int {
         if opType == .matmul {
-            // MatMul uses FP16 weights
+            if precision.isFP8 {
+                return batch * k * n * 1
+            }
             return batch * k * n * 2
         }
-        return outChannels * inChannels * kernelSize * kernelSize * (precision == .fp16 ? 2 : 1)
+        return outChannels * inChannels * kernelSize * kernelSize * precision.elementSize
     }
     
     func inputBytes(precision: PrecisionMode) -> Int {
-        let elem = (precision == .fp16 ? 2 : 1)
+        let elem = precision.elementSize
         if opType == .matmul {
             return batch * m * k * elem
         }
@@ -173,6 +196,12 @@ struct BenchmarkResult: Identifiable, Codable {
     var chipMacsPerCycle: Double = 0.0
     var aluSaturation: Double = 0.0
     var effectiveClockGhz: Double = 0.0
+    var zeroOutputCount: Int = 0
+    var outputElementCount: Int = 0
+    
+    var zeroOutputPct: Double {
+        outputElementCount > 0 ? (Double(zeroOutputCount) / Double(outputElementCount) * 100.0) : 0.0
+    }
     
     static let allPMUCounterKeys: [String] = [
         "kANE_AF_TO_L2_DATA",
@@ -228,7 +257,9 @@ struct BenchmarkResult: Identifiable, Codable {
         macsPerCoreCycle: Double = 0.0,
         chipMacsPerCycle: Double = 0.0,
         aluSaturation: Double = 0.0,
-        effectiveClockGhz: Double = 0.0
+        effectiveClockGhz: Double = 0.0,
+        zeroOutputCount: Int = 0,
+        outputElementCount: Int = 0
     ) {
         self.id = id
         self.timestamp = timestamp
@@ -253,6 +284,8 @@ struct BenchmarkResult: Identifiable, Codable {
         self.chipMacsPerCycle = chipMacsPerCycle
         self.aluSaturation = aluSaturation
         self.effectiveClockGhz = effectiveClockGhz
+        self.zeroOutputCount = zeroOutputCount
+        self.outputElementCount = outputElementCount
     }
     
     var seriesName: String {

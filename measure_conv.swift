@@ -13,20 +13,25 @@ extension MPSGraphDevice {
     }
 }
 
-func fillNonZeroData(buffer: UnsafeMutableRawPointer, byteCount: Int, dataType: MPSDataType) {
+func fillNonZeroData(buffer: UnsafeMutableRawPointer, byteCount: Int, dataType: MPSDataType, seed: UInt64 = 0x5EED5EED5EED5EED) {
     guard byteCount > 0 else { return }
+    var state = seed
     if dataType == .float16 {
         let ptr = buffer.bindMemory(to: UInt16.self, capacity: byteCount / 2)
         let count = byteCount / 2
-        let patterns: [UInt16] = [0x2C00, 0xAC00, 0x2800, 0xA800]
         for i in 0..<count {
-            ptr[i] = patterns[i & 3]
+            state ^= state << 13
+            state ^= state >> 7
+            state ^= state << 17
+            ptr[i] = (state & 1) != 0 ? 0xA800 : 0x2800 // -0.03125, +0.03125
         }
     } else {
         let ptr = buffer.bindMemory(to: Int8.self, capacity: byteCount)
-        let patterns: [Int8] = [1, -1, 2, -2]
         for i in 0..<byteCount {
-            ptr[i] = patterns[i & 3]
+            state ^= state << 13
+            state ^= state >> 7
+            state ^= state << 17
+            ptr[i] = (state & 1) != 0 ? -1 : 1
         }
     }
 }
@@ -54,11 +59,11 @@ func runBench(device: MTLDevice, useANE: Bool, dataType: MPSDataType, name: Stri
     // Weights allocation
     let wLength = Co.intValue * Ci.intValue * K.intValue * K.intValue * elementSize
     let wData = NSMutableData(length: wLength)!
-    fillNonZeroData(buffer: wData.mutableBytes, byteCount: wLength, dataType: dataType)
+    fillNonZeroData(buffer: wData.mutableBytes, byteCount: wLength, dataType: dataType, seed: 0x5EED5EED5EED5EED)
     let w = graph.constant(wData as Data, shape: wShape, dataType: dataType)
 
     for _ in 0..<L {
-         let d = MPSGraphConvolution2DOpDescriptor(
+        let d = MPSGraphConvolution2DOpDescriptor(
             strideInX: 1,
             strideInY: 1,
             dilationRateInX: 1,
@@ -66,7 +71,8 @@ func runBench(device: MTLDevice, useANE: Bool, dataType: MPSDataType, name: Stri
             groups: 1,
             paddingStyle: .TF_SAME,
             dataLayout: .NCHW,
-            weightsLayout: .OIHW)!
+            weightsLayout: .OIHW
+        )!
             
         cur = graph.convolution2D(cur, weights: w, descriptor: d, name: nil)
         
@@ -78,44 +84,42 @@ func runBench(device: MTLDevice, useANE: Bool, dataType: MPSDataType, name: Stri
         }
     }
     
-    var mDev: MPSGraphDevice?
-    if useANE {
-        guard let ane = MPSGraphDevice.aneDevice else {
-             print("[\(name)] Skipped: ANE not supported.")
-             return
-        }
-        mDev = ane
-    } else {
-        mDev = MPSGraphDevice(mtlDevice: device)
-    }
-
+    let mDev = MPSGraphDevice(mtlDevice: device)
     let feeds = [input: MPSGraphShapedType(shape: inShape, dataType: dataType)]
     
     let cd = MPSGraphCompilationDescriptor()
-    cd.optimizationLevel = useANE ? .level1 : .level0
+    if useANE {
+        cd.optimizationLevel = .level1
+        if cd.responds(to: Selector(("setPreferredDevice:"))) {
+            cd.setValue(2, forKey: "preferredDevice")
+        }
+    } else {
+        cd.optimizationLevel = .level0
+    }
     
-    // Fix non-optional return from compile
     let exe = graph.compile(with: mDev, feeds: feeds, targetTensors: [cur], targetOperations: nil, compilationDescriptor: cd)
     
     let bufferLength = B.intValue * H.intValue * W.intValue * Ci.intValue * elementSize
     let iBuf = device.makeBuffer(length: bufferLength, options: [])!
-    fillNonZeroData(buffer: iBuf.contents(), byteCount: bufferLength, dataType: dataType)
+    fillNonZeroData(buffer: iBuf.contents(), byteCount: bufferLength, dataType: dataType, seed: 0x9E3779B97F4A7C15)
     
-    // Fix argument label (likely just '(_:shape:dataType:)')
     let iData = MPSGraphTensorData(iBuf, shape: inShape, dataType: dataType)
+
+    let oBuf = device.makeBuffer(length: bufferLength, options: [])!
+    let oData = MPSGraphTensorData(oBuf, shape: inShape, dataType: dataType)
     
     let q = device.makeCommandQueue()!
     let ed = MPSGraphExecutableExecutionDescriptor()
     ed.waitUntilCompleted = true
     
     // Warmup
-    exe.run(with: q, inputs: [iData], results: nil, executionDescriptor: ed)
+    exe.run(with: q, inputs: [iData], results: [oData], executionDescriptor: ed)
     
     let iterations = 20
     let start = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW)
     
     for _ in 0..<iterations {
-        exe.run(with: q, inputs: [iData], results: nil, executionDescriptor: ed)
+        exe.run(with: q, inputs: [iData], results: [oData], executionDescriptor: ed)
     }
     
     let end = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW)
@@ -124,7 +128,23 @@ func runBench(device: MTLDevice, useANE: Bool, dataType: MPSDataType, name: Stri
     
     let tops = (2.0 * Double(B.intValue * H.intValue * W.intValue * Ci.intValue * Co.intValue * K.intValue * K.intValue * L)) / (avg * 1e12)
     
-    print(String(format: "[%@] Avg: %.2f ms, Speed: %.4f TOPS", name, avg * 1000.0, tops))
+    let totalElem = B.intValue * H.intValue * W.intValue * Co.intValue
+    var zeroCount = 0
+    if dataType == .float16 {
+        let ptr = oBuf.contents().bindMemory(to: UInt16.self, capacity: totalElem)
+        for k in 0..<totalElem {
+            if ptr[k] == 0x0000 || ptr[k] == 0x8000 { zeroCount += 1 }
+        }
+        print(String(format: "[%@] Avg: %.2f ms, Speed: %.4f TOPS | Check: [0x%04x, 0x%04x, 0x%04x, 0x%04x] (zeros: %d/%d)",
+                     name, avg * 1000.0, tops, ptr[0], ptr[1], ptr[2], ptr[3], zeroCount, totalElem))
+    } else {
+        let ptr = oBuf.contents().bindMemory(to: Int8.self, capacity: totalElem)
+        for k in 0..<totalElem {
+            if ptr[k] == 0 { zeroCount += 1 }
+        }
+        print(String(format: "[%@] Avg: %.2f ms, Speed: %.4f TOPS | Check: [%d, %d, %d, %d] (zeros: %d/%d)",
+                     name, avg * 1000.0, tops, ptr[0], ptr[1], ptr[2], ptr[3], zeroCount, totalElem))
+    }
 }
 
 // Top level code (remove @main struct)

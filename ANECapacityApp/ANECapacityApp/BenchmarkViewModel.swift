@@ -176,6 +176,10 @@ final class BenchmarkViewModel: ObservableObject {
         results.filter { $0.precision == .int8 && $0.target == .ane }.map(\.tops).max() ?? 0.0
     }
     
+    var peakFP8TOPS: Double {
+        results.filter { $0.precision == .fp8 }.map(\.tops).max() ?? 0.0
+    }
+    
     var speedupRatio: Double? {
         guard peakFP16TOPS > 0, peakINT8TOPS > 0 else { return nil }
         return peakINT8TOPS / peakFP16TOPS
@@ -229,15 +233,26 @@ final class BenchmarkViewModel: ObservableObject {
         log("⚠️ Execution cancelled by user.")
     }
     
+    private var precisionsToRun: [PrecisionMode] {
+        switch selectedPrecision {
+        case .both:
+            return [.fp16, .int8]
+        case .all:
+            return [.fp16, .int8, .fp8]
+        case .fp16, .int8, .fp8:
+            return [selectedPrecision]
+        }
+    }
+    
     // MARK: - Single Run Flow
     private func runSingleBenchmarkFlow() async {
-        let precisionsToRun: [PrecisionMode] = (selectedPrecision == .both) ? [.fp16, .int8] : [selectedPrecision]
-        let totalSteps = Double(precisionsToRun.count)
-        var currentStep = 0.0
+        let precisions = precisionsToRun
+        let totalSteps = Double(precisions.count)
+        var currentStep = 0
         
         log("=== Starting Single Benchmark: \(dimensions.detailedDescription) ===")
         
-        for prec in precisionsToRun {
+        for prec in precisions {
             if Task.isCancelled { break }
             statusMessage = "Running \(selectedTarget.shortName) \(prec.rawValue)..."
             
@@ -259,14 +274,14 @@ final class BenchmarkViewModel: ObservableObject {
                 log("❌ Error: \(error.localizedDescription)")
             }
             
-            currentStep += 1.0
-            progress = currentStep / totalSteps
+            currentStep += 1
+            progress = Double(currentStep) / totalSteps
         }
     }
     
     // MARK: - Sweep Benchmark Flow
     private func runSweepBenchmarkFlow() async {
-        let precisionsToRun: [PrecisionMode] = (selectedPrecision == .both) ? [.fp16, .int8] : [selectedPrecision]
+        let precisions = precisionsToRun
         
         // Define sweep points
         struct SweepPoint {
@@ -331,7 +346,7 @@ final class BenchmarkViewModel: ObservableObject {
         }
         
         let totalSteps = Double(points.count * precisionsToRun.count)
-        var currentStep = 0.0
+        var currentStep = 0
         
         log("=== Starting Sweep: \(selectedSweep.rawValue) (\(points.count) steps x \(precisionsToRun.count) types) ===")
         
@@ -359,8 +374,8 @@ final class BenchmarkViewModel: ObservableObject {
                     log("❌ Error at \(pt.label): \(error.localizedDescription)")
                 }
                 
-                currentStep += 1.0
-                progress = currentStep / totalSteps
+                currentStep += 1
+                progress = Double(currentStep) / totalSteps
                 
                 // Small pause between configurations to let hardware thermals / driver settle
                 try? await Task.sleep(nanoseconds: 100_000_000) // 100ms
@@ -373,7 +388,8 @@ final class BenchmarkViewModel: ObservableObject {
         var headers = [
             "Timestamp", "Device", "Precision", "Operation", "Batch", "Height", "Width",
             "InChannels", "OutChannels", "KernelSize", "M", "K", "N", "Layers", "TotalGFLOPs",
-            "AvgDurationMs", "TOPS", "HWExecutionTimeNs", "MACsPerCoreCycle",
+            "AvgDurationMs", "TOPS", "ZeroOutputCount", "OutputElementCount", "ZeroOutputPct",
+            "HWExecutionTimeNs", "MACsPerCoreCycle",
             "TotalChipMACs", "ALUSaturationPct", "EffectiveClockGHz",
             "SweepType", "SweepValue", "SweepLabel", "Iterations",
             "NominalCycles", "ComputeCycles", "OutputStallCycles",
@@ -405,6 +421,9 @@ final class BenchmarkViewModel: ObservableObject {
                 String(format: "%.2f", r.dimensions.gflops),
                 String(format: "%.3f", r.avgDurationMs),
                 String(format: "%.4f", r.tops),
+                "\(r.zeroOutputCount)",
+                "\(r.outputElementCount)",
+                String(format: "%.2f", r.zeroOutputPct),
                 "\(r.hwExecutionTimeNs)",
                 String(format: "%.2f", r.macsPerCoreCycle),
                 String(format: "%.2f", r.chipMacsPerCycle),

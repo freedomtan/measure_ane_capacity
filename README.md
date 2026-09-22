@@ -15,9 +15,8 @@ To build just the Swift version:
 make measure_conv_swift
 ```
 
-The CoreML benchmark additionally needs its MIL-authored models generated first, which requires [coremltools](https://github.com/apple/coremltools):
+The CoreML benchmark builds its MIL-authored model at runtime, in process (no coremltools, no Python) — it just needs `protoc` (`brew install protobuf`) to regenerate the vendored coremltools schema classes it links against:
 ```bash
-make models                 # python3 tools/gen_conv_mil.py -> models/*.mlpackage
 make measure_conv_coreml
 ```
 
@@ -67,77 +66,108 @@ codesign -s "Apple Development" measure_conv_ios
 ```
 
 ### CoreML MIL Convolution Benchmark (`measure_conv_coreml`)
-`measure_conv_coreml` measures the same convolution workload through **CoreML** instead of MPSGraph, so the two frameworks can be compared on identical arithmetic. Models are authored directly in **MIL** (Model Intermediate Language) by [`tools/gen_conv_mil.py`](tools/gen_conv_mil.py) using `coremltools.converters.mil.Builder` — no PyTorch/TensorFlow conversion in the path.
+`measure_conv_coreml` measures the same convolution workload through **CoreML** instead of MPSGraph, so the two frameworks can be compared on identical arithmetic. The MIL (Model Intermediate Language) program is authored **at runtime, in process**, by [`MILSpecBuilder.mm`](MILSpecBuilder.mm), using the C++ classes protoc generates from coremltools' own `.proto` schema (vendored under [`third_party/coremltools/format`](third_party/coremltools/format)). There is no Python, no PyTorch/TensorFlow conversion, and no coremltools runtime dependency — coremltools ships no C++/Objective-C builder, so this reuses its schema directly instead. Because the whole path is Objective-C++ against public CoreML APIs, it also ports to iOS, where coremltools cannot run at all.
 
 Two things this gives us that MPSGraph cannot:
 - **Verified op placement.** `--plan` uses `MLComputePlan` (macOS 14.4+) to report the preferred compute device for every operation in the program. MPSGraph requires the private `preferredDevice = 2` property and offers no confirmation the work reached the ANE — we infer it from latency.
 - **No private API.** The entire ANE path is public CoreML. The binary links only `CoreML` (`otool -L` shows no MetalPerformanceShadersGraph), so the comparison isn't muddied by a shared framework.
 
 ```bash
-# Generate the .mlpackage models (requires coremltools), then build and run
-make models
 make measure_conv_coreml
 ./measure_conv_coreml --plan --check
 
-# Non-default configuration: generate a model, then just point at it
-python3 tools/gen_conv_mil.py --size 64 --layers 10 --no-default-copy
-./measure_conv_coreml --model models/conv_fp16_B1_C128_H64_K3_L10.mlpackage
+# Any dimension is just a flag -- no model-generation step
+./measure_conv_coreml --size 64 --layers 10
 
-# Sweep an axis: one model per point, then run each
-python3 tools/gen_conv_mil.py --sweep kernel --size 128 --layers 10
-for m in models/conv_fp16_B1_C128_H128_K*_L10.mlpackage; do ./measure_conv_coreml --model "$m"; done
+# Sweep an axis in one run
+./measure_conv_coreml --sweep kernel --size 128 --layers 10 --sweep-values 1,3,5,7
+
+# INT8 W8A8 QDQ instead of FP16
+./measure_conv_coreml --precision int8
+
+# Cross-check against a coremltools-generated model instead of the built-in builder
+./measure_conv_coreml --model path/to/external.mlpackage
 ```
 
 #### Changing parameters
-A CoreML model has a **static input shape**, and the layer count is baked into the graph, so unlike the MPSGraph binaries (which build their graph at runtime) each configuration needs its own generated `.mlpackage`. All dimensions are parameterized on the generator: `--batch`, `--size`, `--channels`, `--kernel`, `--layers`. `--sweep {channels,spatial,depth,kernel}` generates a model per point along one axis (override the points with `--sweep-values 32,64,128`); the axes mirror `SweepType` in the app's [`BenchmarkModels.swift`](ANECapacityApp/ANECapacityApp/BenchmarkModels.swift).
+Unlike a pre-generated `.mlpackage`, there is nothing to regenerate: every dimension (`--batch`, `--size`, `--channels`, `--kernel`, `--layers`) is a plain command-line flag, and `MILSpecBuilder` builds the matching MIL program on every invocation. `--sweep {channels,spatial,depth,kernel}` measures every point along one axis in a single run (override the points with `--sweep-values 32,64,128`); the axes mirror `SweepType` in the app's [`BenchmarkModels.swift`](ANECapacityApp/ANECapacityApp/BenchmarkModels.swift).
 
-You do **not** repeat the dimensions when running. The generator stamps the workload into the model's user-defined metadata, and `measure_conv_coreml` reads it back, so `--model <path>` is sufficient and the TOPS numerator always matches the graph actually being executed. This matters because $K$ and $L$ are not recoverable from the input shape — a stale `--layers` would otherwise silently scale the reported throughput. Passing a dimension flag that disagrees with the model is a hard error:
+`--model <path>` switches to benchmarking an *external* `.mlpackage`/`.mlmodelc`/`.mlmodel` (e.g. one actually produced by coremltools) instead of the built-in builder, reading dimensions back from its metadata; passing a dimension flag that disagrees with that model's metadata is a hard error. The CLI likewise refuses to run if a model's I/O is not Float16 (FP16 mode) or Int8 (INT8 mode), since a boundary cast would add per-prediction CPU work and invalidate the measurement.
 
-```
-$ ./measure_conv_coreml --layers 50
-error: --layers=50 disagrees with the model's own workload.layers=20.
-       Omit the flag to use the model's value, or generate a matching model.
-```
+Internally, the generated spec is always written to a temporary `.mlmodel` file and compiled with `compileModelAtURL:` before benchmarking — see below for why — then the temp file is deleted; nothing on disk survives the run unless `--save <path>` is given.
 
-The CLI likewise refuses to run if the model's I/O is not Float16, since an FP32 boundary would add a per-prediction CPU cast and invalidate the measurement.
-
-*Example — kernel-size sweep at $C=128, H=W=128, L=10$, showing arithmetic intensity saturating the ANE (dimensions read from each model, no flags):*
+*Example — kernel-size sweep at $C=128, H=W=128, L=10$, showing arithmetic intensity saturating the ANE:*
 
 | Kernel | GOPs/pass | Latency | Speed (TOPS) |
 | :--- | ---: | ---: | ---: |
-| $1\times1$ | 5.37 | 0.82 ms | 6.55 |
-| $3\times3$ | 48.32 | 3.23 ms | 14.95 |
-| $5\times5$ | 134.22 | 7.44 ms | 18.04 |
-| $7\times7$ | 263.07 | 14.25 ms | **18.46** |
+| $1\times1$ | 5.37 | 1.18 ms | 4.54 |
+| $3\times3$ | 48.32 | 3.15 ms | 15.34 |
+| $5\times5$ | 134.22 | 7.31 ms | 18.36 |
+| $7\times7$ | 263.07 | 14.02 ms | **18.76** |
 
 #### CLI Options
 | Flag | Description | Default |
 | :--- | :--- | :--- |
-| `--model <path>` | `.mlpackage` or `.mlmodelc` to benchmark | `models/conv_fp16.mlpackage` |
+| `--model <path>` | Benchmark an existing `.mlpackage`/`.mlmodelc`/`.mlmodel` instead of building one; dimensions come from its metadata | build at runtime |
 | `--units <target>` | `ane`, `gpu`, `cpu`, or `all` | `ane` |
-| `--input <mode>` | `dense` (random-sign) or `repeat` (tiled, matches the MPSGraph binaries) | `dense` |
-| `--batch/--size/--channels/--kernel/--layers` | Workload dimensions. Only needed for models lacking metadata; must agree with the model if given | from model metadata |
+| `--precision <mode>` | `fp16` or `int8` (simulated W8A8 QDQ) | `fp16` |
+| `--batch/--size/--channels/--kernel/--layers` | Workload dimensions | `1/256/128/3/20` |
+| `--weights <mode>` / `--input <mode>` | `dense` (random-sign, non-cancelling) or `repeat` (tiled, matches the MPSGraph binaries) | `dense` |
 | `--iterations <N>` / `--warmup <N>` | Timed and warmup prediction counts | `20` / `3` |
+| `--sweep <axis>` / `--sweep-values <a,b,c>` | Measure every point along `channels`/`spatial`/`depth`/`kernel` | disabled / axis defaults |
 | `--plan` | Dump per-operation compute device placement | Disabled |
 | `--check` | Verify output is finite and non-zero across the conv chain | Disabled |
-| `--verbose` | Per-operation detail in the compute plan | Disabled |
+| `--dump-mil` | Print the MIL program before running | Disabled |
+| `--save <path>` | Also write the generated spec as a `.mlmodel` | Disabled |
+| `--pmu` | Bypass `MLModel`; evaluate via `_ANEClient` with 29 hardware PMU registers (ANE only) | Disabled |
+| `--verbose` | Per-operation detail in the compute plan, or PMU register dump with `--pmu` | Disabled |
+
+#### In-memory `MLModelAsset` vs. compiling a temporary file
+The obvious way to run a spec built at runtime is `+[MLModelAsset modelAssetWithSpecificationData:]` (macOS 13 / iOS 16), which needs no file at all. Measured on hardware, it is **~25–28% slower** than writing the same bytes to a temporary `.mlmodel` and compiling it with `compileModelAtURL:` first:
+
+| Path | Latency | Speed (TOPS) |
+| :--- | ---: | ---: |
+| `MLModelAsset modelAssetWithSpecificationData:` (in-memory) | 27.02 ms | 14.30 |
+| temp file → `compileModelAtURL:` → `.mlmodelc` (compiled) | 20.85 ms | 18.54 |
+
+Same bytes, same machine, same session — this isolates the gap to how the model reaches CoreML, not to anything about the spec `MILSpecBuilder` emits (per-layer const naming and inline vs. blob-file weights were both checked and ruled out first). A real `.mlmodelc` gets ahead-of-time ANE program compilation and on-disk artifacts the in-memory path apparently doesn't reproduce. `measure_conv_coreml` therefore always compiles from a temporary file by default; the temp file is deleted immediately after compilation, and this doesn't reopen the "no Python on iOS" constraint — `compileModelAtURL:` from an app-generated spec is a normal on-device CoreML call.
 
 #### CoreML vs. MPSGraph on Apple M4 Pro (H16g)
-*Same workload ($B=1, C=128, H=W=256, K=3, L=20$, 386.55 GOPs/pass), same machine, same session:*
+*Same workload ($B=1, C=128, H=W=256, K=3, L=20$, 386.55 GOPs/pass), same machine, same session, both using the compiled path above:*
 
 | Path | Device | Latency | Speed (TOPS) | Placement |
 | :--- | :--- | ---: | ---: | :--- |
-| **CoreML (MIL)** | ANE | 21.32 ms | **18.13** | `conv ops on ANE: 20/20` (verified via `MLComputePlan`) |
-| MPSGraph | ANE | 20.91 ms | 18.49 | inferred from latency |
-| **CoreML (MIL)** | GPU | 40.47 ms | **9.55** | — |
-| MPSGraph | GPU | 39.20 ms | 9.86 | — |
+| **CoreML (MIL)** | ANE | 20.91 ms | **18.48** | `conv ops on ANE: 20/20` (verified via `MLComputePlan`) |
+| MPSGraph | ANE | 20.76 ms | 18.62 | inferred from latency |
+| **CoreML (MIL)** | GPU | 40.22 ms | **9.61** | — |
+| MPSGraph | GPU | 38.95 ms | 9.92 | — |
+| **CoreML (MIL, INT8 QDQ)** | ANE | 11.10 ms | **34.82** | `conv ops on ANE: 20/20` |
+| MPSGraph (native INT8) | ANE | 10.64 ms | 36.33 | inferred from latency |
 
-CoreML lands within **~2–3%** of MPSGraph on both devices, and `MLComputePlan` confirms all 20 convolutions were dispatched to the Neural Engine. The residual gap is per-prediction dispatch overhead, not arithmetic throughput: on the cache-resident configuration ($H=W=64, L=10$) CoreML is actually *faster* (1.06 ms / 11.39 TOPS vs. MPSGraph's 1.15 ms / 10.50 TOPS), where lower fixed overhead matters more than sustained bandwidth. Conclusion: **the ~18.5 TOPS FP16 ceiling on H16g is a property of the silicon, not of MPSGraph.**
+CoreML lands within **~1–4%** of MPSGraph across FP16 and INT8 on both devices, and `MLComputePlan` confirms all 20 convolutions were dispatched to the Neural Engine. Conclusion: **the ~18.5 TOPS FP16 / ~36 TOPS INT8 ceiling on H16g is a property of the silicon, not of MPSGraph** — CoreML reaches the same ceiling through an entirely different compiler front end.
 
-> [!WARNING]
-> **The tiled `fillNonZeroData` pattern cancels to exactly zero under the convolution reduction.** Verified on hardware with a single-layer model: the tiled `+0.0625, -0.0625, +0.03125, -0.03125` sequence used by every MPSGraph binary in this repo produces an all-zero output tensor (8,388,608 / 8,388,608 elements exactly zero), because the alternating signs cancel across the $C_i \times K \times K$ reduction window. **Only layer 1 ever sees non-zero activations; layers 2…L consume a zero tensor** — precisely the condition the section below warns inflates TOPS on H17+.
->
-> On **H16g (M4 Pro) this is harmless** — measured directly, `--input repeat` (17.59 TOPS) is if anything marginally *slower* than `--input dense` (18.13 TOPS), confirming H16g does not zero-skip. But on **H17/H18 the published "Dense (Non-Zero)" iPhone figures below may still be partially zero-skipped** and warrant re-measurement. `measure_conv_coreml` therefore defaults to `--input dense` with random-sign weights, RMS-scaled so activation magnitude stays roughly constant (measured $|v| \in [1.5\times10^{-5}, 1.41]$ after 20 layers, zero NaN/Inf). The MPSGraph binaries are unchanged.
+#### Physical Silicon PMU Telemetry for CoreML MIL (`--pmu`)
+`MLModel predictionFromFeatures:` submits its own internal `_ANERequest`, and the ANE driver refuses a second exclusive client — so the 29-register hardware PMU counters `measure_ane_pmu` reads for MPSGraph's ANECIR bundles cannot bracket a normal CoreML prediction call. `--pmu` sidesteps this the same way [`ane_pmu_profiler`](https://github.com/freedomtan/ane_pmu_profiler) does: it goes around `MLModel` entirely and evaluates the compiled `model.mil` inside the `.mlmodelc` directly via `_ANEClient` (`kANEFModelMIL`, `kANEFPerformanceStatsMask = 15`), the exact same private driver interface `measure_ane_pmu` already uses for MPSGraph — just pointed at a CoreML-compiled model instead of an `.mpsgraphpackage` bundle. This closes the "PMU counters cannot bracket CoreML" gap this project's plan had deliberately left open.
+
+```bash
+./measure_conv_coreml --pmu --verbose
+./measure_conv_coreml --pmu --precision int8
+```
+
+*Same workload as above, measured via raw hardware registers instead of wall-clock `predictionFromFeatures:`:*
+
+| Precision | Latency | Speed (TOPS) | MACs/cycle/core (via `NOMINAL_CYCLES`) | `COMPUTE_CYCLES`/iter (diagnostic) | DMA/iter |
+| :--- | ---: | ---: | ---: | ---: | ---: |
+| FP16 | 20.66 ms | **18.71** | 249.0 / 256 (**97.3%**) | 68,415 | 35.0 MB |
+| INT8 (W8A8 QDQ) | 10.75 ms | **35.95** | 477.8 / 512 (**93.3%**) | 640,739 | 18.2 MB |
+
+These are the same MACs/cycle/core figures `measure_ane_pmu` reports for MPSGraph (FP16 97.22%, native INT8 100.05%) — confirming, on physical registers rather than inferred latency, that a CoreML-authored MIL program saturates the ANE's convolution engine to essentially the same degree MPSGraph does. The MACs/cycle/core figure is computed against `kANE_NE_NOMINAL_CYCLES` (`[10]`), **not** `kANE_NE_COMPUTE_CYCLES` (`[13]`): the latter is clock-gated off during `OUTPUT_STALL` and is not a valid throughput denominator on memory-bound configurations — `--verbose` prints it as a diagnostic only. See [`ane_pmu_profiler`'s §7 register table](https://github.com/freedomtan/ane_pmu_profiler#7-decoded-silicon-pmu-register-table) and its [§3.4.C throughput-metric pitfall writeup](https://github.com/freedomtan/ane_pmu_profiler/blob/main/ANE_Performance_PMU_Technical_Report.md#34-hardware-counter-gating-l2-sram-thresholds--throughput-metrics) for why. Registers `[24]`–`[28]` are firmware-reserved and read as noise; only `[10]`/`[13]`/`[17]`/`[21]` carry real signal on H16g.
+
+> [!NOTE]
+> `--pmu` queries hardware performance counters directly via `_ANEClient` talking to the root-privileged `aned` daemon. No boot-arg changes, entitlements, `sudo`, or root access are needed.
+
+> [!NOTE]
+> **Deterministic Non-Canceling Pseudo-Random Fill (`fillNonZeroData`)**: The legacy tiled `+0.0625, -0.0625, +0.03125, -0.03125` pattern cancelled to zero under the $C_i \times K \times K = 1152$ spatial reduction window. All MPSGraph benchmarks, CoreML MIL generation, and `ANECapacityApp` have been updated to use deterministic `xorshift64` random non-canceling signs ($\pm 0.03125$ for FP16, $\pm 1$ for INT8, $\pm 0.03125$ for FP8) with independent seeds for weights (`0x5EED...`) and inputs (`0x9E37...`). This maintains stable activation variance (~1.0) without zero-cancellation across all 20 chained layers on both Metal GPU and ANE.
 
 ### Universal Matrix Multiplication Benchmark (`measure_matmul_universal`)
 `measure_matmul_universal` benchmarks dense Matrix Multiplication (GEMM) using the native MPSGraph `matrixMultiplicationWithPrimaryTensor:secondaryTensor:` API across Metal GPU and the Apple Neural Engine (ANE).
@@ -178,7 +208,7 @@ It systematically evaluates 5 distinct quantization patterns on Apple Silicon ($
 > **Key Architectural Insight**: In MPSGraph, **True W8A8 QDQ (Pattern 2)** allows the Apple ANE compiler to fuse the operations directly into native INT8 execution, matching Native INT8 convolution (~36.5 TOPS) and CoreML MIL INT8 (~34.7 TOPS) clock-for-clock. Furthermore, while native INT8 convolution is unsupported on Metal GPU, all QDQ patterns run gracefully on GPU at full FP16 compute capacity (~9.8 TOPS).
 
 ### Advanced Silicon PMU Profiler & MPSGraphPackage Exporter (`measure_ane_pmu`)
-`measure_ane_pmu` provides deep physical hardware profiling for Apple Neural Engine via `_ANEClient` and Apple PMU registers (`com.apple.ane.hardware-counters`), comparing FP16, INT8, QDQ, and GPU baselines while exporting self-contained `.mpsgraphpackage` bundles.
+`measure_ane_pmu` provides deep physical hardware profiling for Apple Neural Engine via `_ANEClient` performance statistics, comparing FP16, INT8, QDQ, and GPU baselines while exporting self-contained `.mpsgraphpackage` bundles.
 
 > **Note / Attribution**:
 > `measure_ane_pmu` is based on and adapted from [**ane_pmu_profiler**](https://github.com/freedomtan/ane_pmu_profiler/), reusing its low-level Apple Neural Engine silicon PMU profiling, private `_ANEClient` telemetry interfaces, and hardware register mapping.
@@ -186,7 +216,7 @@ It systematically evaluates 5 distinct quantization patterns on Apple Silicon ($
 > For an in-depth microarchitectural analysis explaining how these counters behave under different tensor dimensions, see the [**Guide to Interpreting measure_ane_pmu Numbers**](docs/How_to_Interpret_measure_ane_pmu_Numbers.md).
 
 ```bash
-# Build and codesign with PMU entitlements
+# Build
 make measure_ane_pmu
 
 # Run full benchmark across FP16, INT8, and QDQ with 20 chained layers

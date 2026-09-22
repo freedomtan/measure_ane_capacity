@@ -69,18 +69,33 @@ static const char *patternName(QDQPatternMode mode) {
   }
 }
 
-static void fillNonZeroData(void *buffer, size_t byteCount, MPSDataType dataType) {
+// Fill buffer with small non-zero values to prevent hardware zero-skipping on H17/H18.
+// Uses deterministic xorshift64 random non-canceling signs to avoid reduction cancellation.
+static void fillNonZeroDataWithSeed(void *buffer, size_t byteCount, MPSDataType dataType, uint64_t seed) {
   if (!buffer || byteCount == 0) return;
+  uint64_t state = seed;
   if (dataType == MPSDataTypeFloat16) {
     uint16_t *p = (uint16_t *)buffer;
     size_t count = byteCount / sizeof(uint16_t);
-    static const uint16_t fp16_pattern[4] = {0x3C00, 0x3800, 0x4000, 0x3C00}; // 1.0, 0.5, 2.0, 1.0
-    for (size_t i = 0; i < count; i++) p[i] = fp16_pattern[i % 4];
+    for (size_t i = 0; i < count; i++) {
+      state ^= state << 13;
+      state ^= state >> 7;
+      state ^= state << 17;
+      p[i] = (state & 1) ? 0xA800 : 0x2800; // -0.03125, +0.03125
+    }
   } else {
     int8_t *p = (int8_t *)buffer;
-    static const int8_t int8_pattern[4] = {1, 2, 1, 3};
-    for (size_t i = 0; i < byteCount; i++) p[i] = int8_pattern[i % 4];
+    for (size_t i = 0; i < byteCount; i++) {
+      state ^= state << 13;
+      state ^= state >> 7;
+      state ^= state << 17;
+      p[i] = (state & 1) ? -1 : 1;
+    }
   }
+}
+
+static void fillNonZeroData(void *buffer, size_t byteCount, MPSDataType dataType) {
+  fillNonZeroDataWithSeed(buffer, byteCount, dataType, 0x5EED5EED5EED5EEDULL);
 }
 
 static void runBench(id<MTLDevice> device, bool useANE, QDQPatternMode mode) {
@@ -105,11 +120,11 @@ static void runBench(id<MTLDevice> device, bool useANE, QDQPatternMode mode) {
       MPSGraphTensor *w = nil;
       if (mode == QDQPatternFP16WeightQDQ) {
         NSMutableData *wData = [NSMutableData dataWithLength:Co * Ci * K * K * sizeof(uint16_t)];
-        fillNonZeroData(wData.mutableBytes, wData.length, MPSDataTypeFloat16);
+        fillNonZeroDataWithSeed(wData.mutableBytes, wData.length, MPSDataTypeFloat16, 0x5EED5EED5EED5EEDULL);
         w = [graph constantWithData:wData shape:wShape dataType:MPSDataTypeFloat16];
       } else {
         NSMutableData *wData = [NSMutableData dataWithLength:Co * Ci * K * K * sizeof(int8_t)];
-        fillNonZeroData(wData.mutableBytes, wData.length, MPSDataTypeInt8);
+        fillNonZeroDataWithSeed(wData.mutableBytes, wData.length, MPSDataTypeInt8, 0x5EED5EED5EED5EEDULL);
         MPSGraphTensor *wInt8 = [graph constantWithData:wData shape:wShape dataType:MPSDataTypeInt8];
 
         if (mode == QDQPatternNativeINT8) {
@@ -272,7 +287,7 @@ static void runBench(id<MTLDevice> device, bool useANE, QDQPatternMode mode) {
       }
 
       id<MTLBuffer> iBuf = [device newBufferWithLength:B * Ci * H * W * sizeof(int8_t) options:0];
-      fillNonZeroData(iBuf.contents, iBuf.length, MPSDataTypeInt8);
+      fillNonZeroDataWithSeed(iBuf.contents, iBuf.length, MPSDataTypeInt8, 0x9E3779B97F4A7C15ULL);
       MPSGraphTensorData *iData = [[MPSGraphTensorData alloc] initWithMTLBuffer:iBuf
                                                                           shape:inShape
                                                                        dataType:MPSDataTypeInt8];

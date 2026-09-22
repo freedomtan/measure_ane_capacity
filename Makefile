@@ -3,9 +3,10 @@ CFLAGS = -fobjc-arc -O3
 FRAMEWORKS = -framework Foundation -framework Metal -framework MetalPerformanceShadersGraph
 LDFLAGS = ${FRAMEWORKS}
 ANE_FRAMEWORKS = -F/System/Library/PrivateFrameworks -framework AppleNeuralEngine -framework IOSurface -framework IOKit -framework Security
+
 # measure_conv_coreml deliberately links only CoreML: pulling in MPSGraph would
 # muddy a benchmark whose point is to compare the two frameworks.
-COREML_FRAMEWORKS = -framework Foundation -framework CoreML
+COREML_FRAMEWORKS = -framework Foundation -framework CoreML -framework IOSurface
 
 # measure_conv_coreml builds its MIL program at runtime from coremltools' own
 # schema. coremltools ships no C++ builder (mb.program is Python only), but it
@@ -27,13 +28,19 @@ PROTOBUF_LIB = $(shell pkg-config --libs protobuf-lite 2>/dev/null || \
 	echo -L/opt/homebrew/lib -L/opt/local/lib -L/usr/local/lib -lprotobuf-lite)
 # protobuf 33's generated code trips absl's own deprecation attributes.
 PROTO_CXXFLAGS = -std=c++17 -O2 -Wno-deprecated-declarations
-TARGETS  = measure_conv_fp16 measure_conv measure_conv_universal measure_matmul_universal measure_conv_qdq measure_conv_swift measure_ane_pmu measure_conv_coreml
+TARGETS  = measure_conv_fp16 measure_conv measure_conv_universal measure_matmul_universal measure_conv_qdq measure_conv_swift measure_ane_pmu measure_conv_coreml measure_conv_fp8 measure_matmul_fp8 convert_fp8_to_hwx
 
 all: ${TARGETS}
 
 measure_ane_pmu: measure_ane_pmu.m
 	$(CC) $(CFLAGS) $(FRAMEWORKS) $(ANE_FRAMEWORKS) measure_ane_pmu.m -o measure_ane_pmu
-	codesign -s - --entitlements entitlements.plist -f measure_ane_pmu
+
+convert_fp8_to_hwx: convert_fp8_to_hwx.m
+	$(CC) $(CFLAGS) $(FRAMEWORKS) $(ANE_FRAMEWORKS) -F/System/Library/PrivateFrameworks -framework ANECompiler convert_fp8_to_hwx.m -o convert_fp8_to_hwx
+
+measure_conv_fp8: measure_conv_fp8.m
+
+measure_matmul_fp8: measure_matmul_fp8.m
 
 measure_conv_fp16: measure_conv_fp16.m
 
@@ -67,7 +74,7 @@ MILSpecBuilder.o: MILSpecBuilder.mm MILSpecBuilder.h $(PROTO_OUT)/.stamp
 		-c MILSpecBuilder.mm -o MILSpecBuilder.o
 
 measure_conv_coreml: measure_conv_coreml.m MILSpecBuilder.o $(PROTO_OBJS)
-	$(CC) $(CFLAGS) $(COREML_FRAMEWORKS) $(PROTOBUF_LIB) -lc++ \
+	$(CC) $(CFLAGS) $(COREML_FRAMEWORKS) $(ANE_FRAMEWORKS) $(PROTOBUF_LIB) -lc++ \
 		measure_conv_coreml.m MILSpecBuilder.o $(PROTO_OBJS) \
 		-o measure_conv_coreml
 

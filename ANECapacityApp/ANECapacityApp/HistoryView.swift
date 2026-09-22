@@ -99,6 +99,9 @@ struct HistoryView: View {
                 filterPill(title: "INT8", isSelected: filterPrecision == .int8) {
                     filterPrecision = .int8
                 }
+                filterPill(title: "FP8", isSelected: filterPrecision == .fp8) {
+                    filterPrecision = .fp8
+                }
             }
             .padding(.horizontal)
             .padding(.vertical, 8)
@@ -134,8 +137,8 @@ struct HistoryView: View {
                     .fontWeight(.bold)
                     .padding(.horizontal, 6)
                     .padding(.vertical, 2)
-                    .background(r.precision == .fp16 ? Color.blue.opacity(0.15) : Color.orange.opacity(0.15))
-                    .foregroundColor(r.precision == .fp16 ? .blue : .orange)
+                    .background(r.precision.themeColor.opacity(0.15))
+                    .foregroundColor(r.precision.themeColor)
                     .cornerRadius(6)
                 
                 Text(r.sweepType == .none ? "Custom" : r.sweepLabel)

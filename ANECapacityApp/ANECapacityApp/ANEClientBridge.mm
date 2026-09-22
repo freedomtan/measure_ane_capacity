@@ -81,6 +81,68 @@ typedef NS_ENUM(NSInteger, ANEModelFormat) {
 @implementation ANEModelDescriptor
 @end
 
+#pragma mark - Private AppleNeuralEngine Declarations
+
+__attribute__((objc_runtime_visible))
+@interface _ANEDeviceInfo : NSObject
++ (NSString *)aneArchitectureType;
++ (BOOL)isInternalBuild;
++ (long long)numANEs;
++ (long long)numANECores;
+@end
+
+__attribute__((objc_runtime_visible))
+@interface _ANEIOSurfaceObject : NSObject
++ (instancetype)objectWithIOSurface:(IOSurfaceRef)surface;
+@end
+
+__attribute__((objc_runtime_visible))
+@interface _ANEPerformanceStatsIOSurface : NSObject
++ (instancetype)objectWithIOSurface:(_ANEIOSurfaceObject *)ioSurface statType:(int)statType;
+- (instancetype)initWithIOSurface:(_ANEIOSurfaceObject *)ioSurface statType:(NSInteger)statType;
+@end
+
+__attribute__((objc_runtime_visible))
+@interface _ANEPerformanceStats : NSObject
+@property (nonatomic, readonly) NSData *perfCounterData;
+@property (nonatomic, readonly) NSData *pStatsRawData;
+@property (nonatomic, readonly) unsigned long long hwExecutionTime;
+@property (nonatomic, readonly) NSDictionary *performanceCounters;
++ (NSString *)stringForPerfCounter:(int)index;
++ (NSString *)stringForEventType:(unsigned short)eventType;
++ (unsigned int)driverMaskForANEFMask:(unsigned int)mask;
++ (NSDictionary *)decodePerformanceStats:(id)stats withOptions:(NSDictionary *)options;
+@end
+
+__attribute__((objc_runtime_visible))
+@interface _ANERequest : NSObject
++ (instancetype)requestWithInputs:(NSArray *)inputs
+                     inputIndices:(NSArray *)inputIndices
+                          outputs:(NSArray *)outputs
+                    outputIndices:(NSArray *)outputIndices
+                        perfStats:(NSArray *)perfStats
+                   procedureIndex:(NSNumber *)procedureIndex;
+@property (nonatomic, readonly) _ANEPerformanceStats *perfStats;
+@end
+
+__attribute__((objc_runtime_visible))
+@interface _ANEModel : NSObject
++ (instancetype)modelAtURL:(NSURL *)url key:(NSString *)key;
++ (instancetype)modelAtURL:(NSURL *)url key:(NSString *)key mpsConstants:(NSString *)constants;
+@property (nonatomic, readonly) NSDictionary *modelAttributes;
+@property (nonatomic, readonly) NSString *cacheURLIdentifier;
+@end
+
+__attribute__((objc_runtime_visible))
+@interface _ANEClient : NSObject
++ (instancetype)sharedConnection;
+- (BOOL)compileModel:(_ANEModel *)model options:(NSDictionary *)options qos:(unsigned int)qos error:(NSError **)error;
+- (BOOL)loadModel:(_ANEModel *)model options:(NSDictionary *)options qos:(unsigned int)qos error:(NSError **)error;
+- (BOOL)unloadModel:(_ANEModel *)model options:(NSDictionary *)options qos:(unsigned int)qos error:(NSError **)error;
+- (BOOL)evaluateWithModel:(_ANEModel *)model options:(NSDictionary *)options request:(_ANERequest *)request qos:(unsigned int)qos error:(NSError **)error;
+- (BOOL)evaluateRealTimeWithModel:(_ANEModel *)model options:(NSDictionary *)options request:(_ANERequest *)request error:(NSError **)error;
+@end
+
 #pragma mark - Private Bridge Core
 
 @implementation ANEClientBridge
@@ -96,26 +158,23 @@ typedef NS_ENUM(NSInteger, ANEModelFormat) {
 
 + (NSDictionary<NSString *, id> *)deviceSiliconInfo {
     [self ensureFrameworksLoaded];
-    Class devInfoClass = NSClassFromString(@"_ANEDeviceInfo");
     
     NSString *arch = @"Unknown";
     BOOL isInternal = NO;
     long long numAnes = 1;
     long long numCores = 16;
     
-    if (devInfoClass) {
-        if ([devInfoClass respondsToSelector:@selector(aneArchitectureType)]) {
-            arch = [devInfoClass performSelector:@selector(aneArchitectureType)];
-        }
-        if ([devInfoClass respondsToSelector:@selector(isInternalBuild)]) {
-            isInternal = ((BOOL (*)(id, SEL))objc_msgSend)(devInfoClass, @selector(isInternalBuild));
-        }
-        if ([devInfoClass respondsToSelector:@selector(numANEs)]) {
-            numAnes = ((long long (*)(id, SEL))objc_msgSend)(devInfoClass, @selector(numANEs));
-        }
-        if ([devInfoClass respondsToSelector:@selector(numANECores)]) {
-            numCores = ((long long (*)(id, SEL))objc_msgSend)(devInfoClass, @selector(numANECores));
-        }
+    if ([_ANEDeviceInfo respondsToSelector:@selector(aneArchitectureType)]) {
+        arch = [_ANEDeviceInfo aneArchitectureType];
+    }
+    if ([_ANEDeviceInfo respondsToSelector:@selector(isInternalBuild)]) {
+        isInternal = [_ANEDeviceInfo isInternalBuild];
+    }
+    if ([_ANEDeviceInfo respondsToSelector:@selector(numANEs)]) {
+        numAnes = [_ANEDeviceInfo numANEs];
+    }
+    if ([_ANEDeviceInfo respondsToSelector:@selector(numANECores)]) {
+        numCores = [_ANEDeviceInfo numANECores];
     }
     
     return @{
@@ -128,11 +187,8 @@ typedef NS_ENUM(NSInteger, ANEModelFormat) {
 
 + (uint32_t)driverMaskForANEFMask:(uint32_t)anefMask {
     [self ensureFrameworksLoaded];
-    Class perfStatsClass = NSClassFromString(@"_ANEPerformanceStats");
-    if (perfStatsClass && [perfStatsClass respondsToSelector:@selector(driverMaskForANEFMask:)]) {
-        return ((unsigned int (*)(id, SEL, unsigned int))objc_msgSend)(
-            perfStatsClass, @selector(driverMaskForANEFMask:), anefMask
-        );
+    if ([_ANEPerformanceStats respondsToSelector:@selector(driverMaskForANEFMask:)]) {
+        return [_ANEPerformanceStats driverMaskForANEFMask:anefMask];
     }
     // Direct silicon bitwise translation fallback
     if (anefMask > 0x0f) return 0;
@@ -144,27 +200,13 @@ typedef NS_ENUM(NSInteger, ANEModelFormat) {
 
 + (NSString *)nameForPerfCounter:(int32_t)index {
     [self ensureFrameworksLoaded];
-    Class perfStatsClass = NSClassFromString(@"_ANEPerformanceStats");
-    if (perfStatsClass) {
-        if ([perfStatsClass respondsToSelector:sel_registerName("stringForPerfCounter:")]) {
-            NSString *name = ((NSString *(*)(id, SEL, int32_t))objc_msgSend)(perfStatsClass, sel_registerName("stringForPerfCounter:"), index);
-            if (name && [name length] > 0) {
-                if ([name hasSuffix:@":"]) {
-                    name = [name substringToIndex:name.length - 1];
-                }
-                return name;
+    if ([_ANEPerformanceStats respondsToSelector:@selector(stringForPerfCounter:)]) {
+        NSString *name = [_ANEPerformanceStats stringForPerfCounter:index];
+        if (name && [name length] > 0) {
+            if ([name hasSuffix:@":"]) {
+                name = [name substringToIndex:name.length - 1];
             }
-        }
-        Method m = class_getInstanceMethod(perfStatsClass, sel_registerName("stringForPerfCounter:"));
-        if (m) {
-            IMP imp = method_getImplementation(m);
-            NSString *name = ((NSString *(*)(id, SEL, int32_t))imp)(nil, sel_registerName("stringForPerfCounter:"), index);
-            if (name && [name length] > 0) {
-                if ([name hasSuffix:@":"]) {
-                    name = [name substringToIndex:name.length - 1];
-                }
-                return name;
-            }
+            return name;
         }
     }
     
@@ -184,11 +226,8 @@ typedef NS_ENUM(NSInteger, ANEModelFormat) {
 
 + (NSString *)nameForEventType:(uint16_t)eventType {
     [self ensureFrameworksLoaded];
-    Class perfStatsClass = NSClassFromString(@"_ANEPerformanceStats");
-    if (perfStatsClass && [perfStatsClass respondsToSelector:@selector(stringForEventType:)]) {
-        NSString *name = ((NSString *(*)(id, SEL, unsigned short))objc_msgSend)(
-            perfStatsClass, @selector(stringForEventType:), eventType
-        );
+    if ([_ANEPerformanceStats respondsToSelector:@selector(stringForEventType:)]) {
+        NSString *name = [_ANEPerformanceStats stringForEventType:eventType];
         if (name) return name;
     }
     
@@ -243,23 +282,40 @@ static IOSurfaceRef createIOSurface(size_t bytes) {
     return IOSurfaceCreate((CFDictionaryRef)props);
 }
 
-static void fillIOSurfaceNonZero(IOSurfaceRef surf, size_t bytes, BOOL isFP16) {
+static void fillIOSurfaceNonZero(IOSurfaceRef surf, size_t bytes, MPSDataType dataType) {
     if (!surf || bytes == 0) return;
     IOSurfaceLock(surf, 0, nil);
     void *ptr = IOSurfaceGetBaseAddress(surf);
     if (ptr) {
-        if (isFP16) {
+        uint64_t state = 0x5EED5EED5EED5EEDULL;
+        if ((uint32_t)dataType == 0x10430008) { // MPSDataTypeFloat8e4m3
+            // Random-sign, physical magnitude 0.5 (E4M3 0x30 = +0.5, 0xB0 = -0.5).
+            // Matches decoupled FP8 fill in ANECapacityEngine.swift to prevent H18 zero-skip cliff.
+            uint8_t *u8 = (uint8_t *)ptr;
+            for (size_t i = 0; i < bytes; i++) {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                u8[i] = (state & 1) ? 0xB0 : 0x30;
+            }
+        } else if (dataType == MPSDataTypeFloat16) {
+            // Random-sign, magnitude 1/32 (FP16 0x2800 = +0.03125, 0xA800 = -0.03125).
             uint16_t *f16 = (uint16_t *)ptr;
             size_t count = bytes / sizeof(uint16_t);
-            static const uint16_t kNonZeroFP16[] = { 0x3400, 0xB400, 0x3000, 0xB000, 0x3800, 0xB800 };
             for (size_t i = 0; i < count; i++) {
-                f16[i] = kNonZeroFP16[i % 6];
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                f16[i] = (state & 1) ? 0xA800 : 0x2800;
             }
         } else {
+            // INT8: Deterministic pseudo-random non-canceling signs {-1, 1}
             int8_t *i8 = (int8_t *)ptr;
-            static const int8_t kNonZeroINT8[] = { 1, -1, 2, -2 };
             for (size_t i = 0; i < bytes; i++) {
-                i8[i] = kNonZeroINT8[i % 4];
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                i8[i] = (state & 1) ? -1 : 1;
             }
         }
     }
@@ -374,15 +430,7 @@ static NSDictionary<NSString *, NSDictionary<NSString *, NSNumber *> *> *categor
     [self ensureFrameworksLoaded];
     ANEModelInfo *info = [[ANEModelInfo alloc] init];
     
-    Class clientClass = NSClassFromString(@"_ANEClient");
-    Class modelClass = NSClassFromString(@"_ANEModel");
-    
-    if (!clientClass || !modelClass) {
-        info.statusMessage = @"AppleNeuralEngine private classes unavailable on this device.";
-        return info;
-    }
-    
-    id client = [clientClass performSelector:@selector(sharedConnection)];
+    _ANEClient *client = [_ANEClient sharedConnection];
     if (!client) {
         info.statusMessage = @"Failed to acquire _ANEClient sharedConnection.";
         return info;
@@ -392,21 +440,15 @@ static NSDictionary<NSString *, NSDictionary<NSString *, NSNumber *> *> *categor
     ANEModelDescriptor *desc = [self detectDescriptorForURL:url key:key arch:effectiveArch];
     info.modelFormat = desc.formatString;
     
-    id model = nil;
+    _ANEModel *model = nil;
     if (desc.format == ANEModelFormatANECIR) {
-        if ([modelClass respondsToSelector:@selector(modelAtURL:key:mpsConstants:)]) {
-            model = ((id (*)(id, SEL, id, id, id))objc_msgSend)(
-                modelClass, @selector(modelAtURL:key:mpsConstants:), desc.bundleURL, desc.regionKey, @"constants"
-            );
+        if ([_ANEModel respondsToSelector:@selector(modelAtURL:key:mpsConstants:)]) {
+            model = [_ANEModel modelAtURL:desc.bundleURL key:desc.regionKey mpsConstants:@"constants"];
         } else {
-            model = ((id (*)(id, SEL, id, id))objc_msgSend)(
-                modelClass, @selector(modelAtURL:key:), desc.bundleURL, desc.regionKey
-            );
+            model = [_ANEModel modelAtURL:desc.bundleURL key:desc.regionKey];
         }
     } else {
-        model = ((id (*)(id, SEL, id, id))objc_msgSend)(
-            modelClass, @selector(modelAtURL:key:), desc.bundleURL, desc.regionKey
-        );
+        model = [_ANEModel modelAtURL:desc.bundleURL key:desc.regionKey];
     }
     
     if (!model) {
@@ -430,9 +472,7 @@ static NSDictionary<NSString *, NSDictionary<NSString *, NSNumber *> *> *categor
     compileOpts[@"DumpStatusDictionaryToFile"] = @YES;
     
     NSError *compileErr = nil;
-    BOOL ok = ((BOOL (*)(id, SEL, id, id, unsigned int, id*))objc_msgSend)(
-        client, @selector(compileModel:options:qos:error:), model, compileOpts, 25, &compileErr
-    );
+    BOOL ok = [client compileModel:model options:compileOpts qos:25 error:&compileErr];
     
     if (!ok) {
         info.statusMessage = [NSString stringWithFormat:@"_ANEClient compileModel failed: %@", compileErr.localizedDescription ?: @"Unknown error"];
@@ -444,10 +484,10 @@ static NSDictionary<NSString *, NSDictionary<NSString *, NSNumber *> *> *categor
     info.statusMessage = [NSString stringWithFormat:@"%@ model compiled and introspected successfully.", desc.formatString];
     
     if ([model respondsToSelector:@selector(cacheURLIdentifier)]) {
-        info.cacheURLIdentifier = [model performSelector:@selector(cacheURLIdentifier)];
+        info.cacheURLIdentifier = model.cacheURLIdentifier;
     }
     
-    NSDictionary *attrs = [model valueForKey:@"modelAttributes"];
+    NSDictionary *attrs = model.modelAttributes;
     if (attrs && [attrs isKindOfClass:[NSDictionary class]]) {
         info.rawAttributes = attrs;
         
@@ -472,7 +512,7 @@ static NSDictionary<NSString *, NSDictionary<NSString *, NSNumber *> *> *categor
     return info;
 }
 
-static id gActiveLoadedModel = nil;
+static _ANEModel *gActiveLoadedModel = nil;
 static NSString *gActiveModelKey = nil;
 static NSURL *gActiveModelURL = nil;
 static NSString *gActiveArch = nil;
@@ -481,14 +521,9 @@ static NSDictionary *gActiveLoadOpts = nil;
 
 + (void)unloadActiveModel {
     if (gActiveLoadedModel) {
-        Class clientClass = NSClassFromString(@"_ANEClient");
-        if (clientClass) {
-            id client = [clientClass performSelector:@selector(sharedConnection)];
-            if (client) {
-                ((BOOL (*)(id, SEL, id, id, unsigned int, id*))objc_msgSend)(
-                    client, @selector(unloadModel:options:qos:error:), gActiveLoadedModel, gActiveLoadOpts ?: @{}, 25, nil
-                );
-            }
+        _ANEClient *client = [_ANEClient sharedConnection];
+        if (client) {
+            [client unloadModel:gActiveLoadedModel options:gActiveLoadOpts ?: @{} qos:25 error:nil];
         }
         gActiveLoadedModel = nil;
         gActiveModelKey = nil;
@@ -531,19 +566,15 @@ static NSDictionary *gActiveLoadOpts = nil;
     res.totalMacs = workloadMacs;
     res.totalGops = (workloadMacs * 2.0) / 1e9;
     
-    Class clientClass = NSClassFromString(@"_ANEClient");
-    Class modelClass = NSClassFromString(@"_ANEModel");
-    Class reqClass = NSClassFromString(@"_ANERequest");
-    Class ioSurfaceObjClass = NSClassFromString(@"_ANEIOSurfaceObject");
-    Class perfStatsClass = NSClassFromString(@"_ANEPerformanceStats");
-    Class perfStatsIoClass = NSClassFromString(@"_ANEPerformanceStatsIOSurface");
-    
-    if (!clientClass || !modelClass || !reqClass || !ioSurfaceObjClass || !perfStatsClass || !perfStatsIoClass) {
-        res.statusMessage = @"Required private AppleNeuralEngine classes not found.";
-        return res;
+    MPSDataType modelDataType = MPSDataTypeFloat16;
+    NSString *fullIdent = [NSString stringWithFormat:@"%@ %@", key ?: @"", [url lastPathComponent] ?: @""].lowercaseString;
+    if ([fullIdent containsString:@"int8"]) {
+        modelDataType = MPSDataTypeInt8;
+    } else if ([fullIdent containsString:@"fp8"]) {
+        modelDataType = (MPSDataType)0x10430008;
     }
     
-    id client = [clientClass performSelector:@selector(sharedConnection)];
+    _ANEClient *client = [_ANEClient sharedConnection];
     if (!client) {
         res.statusMessage = @"Failed to acquire _ANEClient connection.";
         return res;
@@ -553,7 +584,7 @@ static NSDictionary *gActiveLoadOpts = nil;
     ANEModelDescriptor *desc = [self detectDescriptorForURL:url key:key arch:effectiveArch];
     res.modelFormat = desc.formatString;
     
-    id model = nil;
+    _ANEModel *model = nil;
     BOOL needLoad = YES;
     
     // Check if we can reuse the already loaded model on ANE silicon
@@ -586,19 +617,13 @@ static NSDictionary *gActiveLoadOpts = nil;
     
     if (needLoad) {
         if (desc.format == ANEModelFormatANECIR) {
-            if ([modelClass respondsToSelector:@selector(modelAtURL:key:mpsConstants:)]) {
-                model = ((id (*)(id, SEL, id, id, id))objc_msgSend)(
-                    modelClass, @selector(modelAtURL:key:mpsConstants:), desc.bundleURL, desc.regionKey, @"constants"
-                );
+            if ([_ANEModel respondsToSelector:@selector(modelAtURL:key:mpsConstants:)]) {
+                model = [_ANEModel modelAtURL:desc.bundleURL key:desc.regionKey mpsConstants:@"constants"];
             } else {
-                model = ((id (*)(id, SEL, id, id))objc_msgSend)(
-                    modelClass, @selector(modelAtURL:key:), desc.bundleURL, desc.regionKey
-                );
+                model = [_ANEModel modelAtURL:desc.bundleURL key:desc.regionKey];
             }
         } else {
-            model = ((id (*)(id, SEL, id, id))objc_msgSend)(
-                modelClass, @selector(modelAtURL:key:), desc.bundleURL, desc.regionKey
-            );
+            model = [_ANEModel modelAtURL:desc.bundleURL key:desc.regionKey];
         }
         
         if (!model) {
@@ -609,9 +634,7 @@ static NSDictionary *gActiveLoadOpts = nil;
         // Step 1: Compile Model (MIL models only; ANECIR is already precompiled)
         if (desc.format != ANEModelFormatANECIR) {
             NSError *compileErr = nil;
-            BOOL compOk = ((BOOL (*)(id, SEL, id, id, unsigned int, id*))objc_msgSend)(
-                client, @selector(compileModel:options:qos:error:), model, compileOpts, 25, &compileErr
-            );
+            BOOL compOk = [client compileModel:model options:compileOpts qos:25 error:&compileErr];
             if (!compOk) {
                 res.statusMessage = [NSString stringWithFormat:@"Compilation error: %@", compileErr.localizedDescription ?: @"Unknown"];
                 return res;
@@ -620,9 +643,7 @@ static NSDictionary *gActiveLoadOpts = nil;
         
         // Step 2: Load Model with Performance Stats Mask
         NSError *loadErr = nil;
-        BOOL loadOk = ((BOOL (*)(id, SEL, id, id, unsigned int, id*))objc_msgSend)(
-            client, @selector(loadModel:options:qos:error:), model, loadOpts, 25, &loadErr
-        );
+        BOOL loadOk = [client loadModel:model options:loadOpts qos:25 error:&loadErr];
         if (!loadOk) {
             res.statusMessage = [NSString stringWithFormat:@"Load error: %@", loadErr.localizedDescription ?: @"Unknown"];
             return res;
@@ -637,7 +658,7 @@ static NSDictionary *gActiveLoadOpts = nil;
     }
     
     // Step 3: Inspect NetworkStatusList for tensor requirements
-    NSDictionary *attrs = [model valueForKey:@"modelAttributes"];
+    NSDictionary *attrs = model.modelAttributes;
     NSArray *netList = (attrs && [attrs isKindOfClass:[NSDictionary class]]) ? attrs[@"NetworkStatusList"] : nil;
     
     NSArray *inputs = @[];
@@ -649,8 +670,8 @@ static NSDictionary *gActiveLoadOpts = nil;
     }
     
     // Step 4: Allocate Input & Output IOSurfaces
-    NSMutableArray *inObjects = [NSMutableArray array];
-    NSMutableArray *inIndices = [NSMutableArray array];
+    NSMutableArray<_ANEIOSurfaceObject *> *inObjects = [NSMutableArray array];
+    NSMutableArray<NSNumber *> *inIndices = [NSMutableArray array];
     NSMutableArray *inSurfs = [NSMutableArray array];
     
     uint32_t inIdx = 0;
@@ -659,9 +680,9 @@ static NSDictionary *gActiveLoadOpts = nil;
         uint64_t batches = [t[@"Batches"] unsignedLongLongValue] ?: 1;
         size_t bytes = (size_t)(bStride * batches);
         IOSurfaceRef surf = createIOSurface(bytes);
-        fillIOSurfaceNonZero(surf, bytes, YES);
+        fillIOSurfaceNonZero(surf, bytes, modelDataType);
         [inSurfs addObject:(__bridge id)surf];
-        id obj = [ioSurfaceObjClass performSelector:@selector(objectWithIOSurface:) withObject:(__bridge id)surf];
+        _ANEIOSurfaceObject *obj = [_ANEIOSurfaceObject objectWithIOSurface:surf];
         [inObjects addObject:obj];
         [inIndices addObject:@(inIdx++)];
         CFRelease(surf);
@@ -670,16 +691,16 @@ static NSDictionary *gActiveLoadOpts = nil;
     // Fallback if model has no declared live inputs
     if (inObjects.count == 0) {
         IOSurfaceRef surf = createIOSurface(0x4000);
-        fillIOSurfaceNonZero(surf, 0x4000, YES);
+        fillIOSurfaceNonZero(surf, 0x4000, modelDataType);
         [inSurfs addObject:(__bridge id)surf];
-        id obj = [ioSurfaceObjClass performSelector:@selector(objectWithIOSurface:) withObject:(__bridge id)surf];
+        _ANEIOSurfaceObject *obj = [_ANEIOSurfaceObject objectWithIOSurface:surf];
         [inObjects addObject:obj];
         [inIndices addObject:@(0)];
         CFRelease(surf);
     }
     
-    NSMutableArray *outObjects = [NSMutableArray array];
-    NSMutableArray *outIndices = [NSMutableArray array];
+    NSMutableArray<_ANEIOSurfaceObject *> *outObjects = [NSMutableArray array];
+    NSMutableArray<NSNumber *> *outIndices = [NSMutableArray array];
     NSMutableArray *outSurfs = [NSMutableArray array];
     
     uint32_t outIdx = 0;
@@ -689,7 +710,7 @@ static NSDictionary *gActiveLoadOpts = nil;
         size_t bytes = (size_t)(bStride * batches);
         IOSurfaceRef surf = createIOSurface(bytes);
         [outSurfs addObject:(__bridge id)surf];
-        id obj = [ioSurfaceObjClass performSelector:@selector(objectWithIOSurface:) withObject:(__bridge id)surf];
+        _ANEIOSurfaceObject *obj = [_ANEIOSurfaceObject objectWithIOSurface:surf];
         [outObjects addObject:obj];
         [outIndices addObject:@(outIdx++)];
         CFRelease(surf);
@@ -698,7 +719,7 @@ static NSDictionary *gActiveLoadOpts = nil;
     if (outObjects.count == 0) {
         IOSurfaceRef surf = createIOSurface(0x4000);
         [outSurfs addObject:(__bridge id)surf];
-        id obj = [ioSurfaceObjClass performSelector:@selector(objectWithIOSurface:) withObject:(__bridge id)surf];
+        _ANEIOSurfaceObject *obj = [_ANEIOSurfaceObject objectWithIOSurface:surf];
         [outObjects addObject:obj];
         [outIndices addObject:@(0)];
         CFRelease(surf);
@@ -706,17 +727,22 @@ static NSDictionary *gActiveLoadOpts = nil;
     
     // Step 5: Allocate Stats IOSurface (statType = 2 for PMU telemetry)
     IOSurfaceRef statsSurf = createIOSurface(0x4000);
-    id statsIoObj = [ioSurfaceObjClass performSelector:@selector(objectWithIOSurface:) withObject:(__bridge id)statsSurf];
-    id statsSurfObj = ((id (*)(id, SEL, id, NSInteger))objc_msgSend)(
-        [perfStatsIoClass alloc], @selector(initWithIOSurface:statType:), statsIoObj, 2
-    );
+    _ANEIOSurfaceObject *statsIoObj = [_ANEIOSurfaceObject objectWithIOSurface:statsSurf];
+    _ANEPerformanceStatsIOSurface *statsSurfObj = nil;
+    if ([_ANEPerformanceStatsIOSurface respondsToSelector:@selector(objectWithIOSurface:statType:)]) {
+        statsSurfObj = [_ANEPerformanceStatsIOSurface objectWithIOSurface:statsIoObj statType:2];
+    } else {
+        statsSurfObj = [[_ANEPerformanceStatsIOSurface alloc] initWithIOSurface:statsIoObj statType:2];
+    }
     CFRelease(statsSurf);
     
     // Step 6: Create _ANERequest
-    id request = ((id (*)(id, SEL, id, id, id, id, id, id))objc_msgSend)(
-        reqClass, @selector(requestWithInputs:inputIndices:outputs:outputIndices:perfStats:procedureIndex:),
-        inObjects, inIndices, outObjects, outIndices, @[statsSurfObj], @(0)
-    );
+    _ANERequest *request = [_ANERequest requestWithInputs:inObjects
+                                             inputIndices:inIndices
+                                                  outputs:outObjects
+                                            outputIndices:outIndices
+                                                perfStats:@[statsSurfObj]
+                                           procedureIndex:@(0)];
     
     if (!request) {
         res.statusMessage = @"Failed to construct _ANERequest with perfStats.";
@@ -732,9 +758,7 @@ static NSDictionary *gActiveLoadOpts = nil;
     // Step 7: Warm-up Iteration
     NSError *evalErr = nil;
     uint64_t tW0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
-    BOOL warmOk = ((BOOL (*)(id, SEL, id, id, id, unsigned int, id*))objc_msgSend)(
-        client, @selector(evaluateWithModel:options:request:qos:error:), model, evalOpts, request, 25, &evalErr
-    );
+    BOOL warmOk = [client evaluateWithModel:model options:evalOpts request:request qos:25 error:&evalErr];
     uint64_t dtWarm = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - tW0;
     res.warmupMs = (double)dtWarm / 1000000.0;
     
@@ -746,10 +770,10 @@ static NSDictionary *gActiveLoadOpts = nil;
     
     // Capture baseline initial PMU counters immediately after warm-up
     NSMutableDictionary<NSString *, NSNumber *> *initialCounters = [NSMutableDictionary dictionary];
-    id warmPerfStats = [request valueForKey:@"perfStats"];
+    _ANEPerformanceStats *warmPerfStats = request.perfStats;
     if (warmPerfStats) {
         if ([warmPerfStats respondsToSelector:@selector(performanceCounters)]) {
-            NSDictionary *c = [warmPerfStats performanceCounters];
+            NSDictionary *c = warmPerfStats.performanceCounters;
             if (c) {
                 for (id rawK in c) {
                     NSString *k = [rawK description];
@@ -760,7 +784,7 @@ static NSDictionary *gActiveLoadOpts = nil;
                 }
             }
         }
-        NSData *wData = [warmPerfStats valueForKey:@"perfCounterData"];
+        NSData *wData = warmPerfStats.perfCounterData;
         if (wData && wData.length >= sizeof(uint64_t)) {
             const uint64_t *wRegs = (const uint64_t *)wData.bytes;
             size_t wCount = wData.length / sizeof(uint64_t);
@@ -780,9 +804,7 @@ static NSDictionary *gActiveLoadOpts = nil;
     
     for (NSUInteger i = 0; i < numIters; i++) {
         uint64_t t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
-        BOOL ok = ((BOOL (*)(id, SEL, id, id, id, unsigned int, id*))objc_msgSend)(
-            client, @selector(evaluateWithModel:options:request:qos:error:), model, evalOpts, request, 25, &evalErr
-        );
+        BOOL ok = [client evaluateWithModel:model options:evalOpts request:request qos:25 error:&evalErr];
         uint64_t dt = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0;
         totalNs += dt;
         [latencies addObject:@((double)dt / 1000000.0)];
@@ -796,19 +818,19 @@ static NSDictionary *gActiveLoadOpts = nil;
     }
     
     // Step 9: Extract & Decode _ANEPerformanceStats
-    id perfStats = [request valueForKey:@"perfStats"];
+    _ANEPerformanceStats *perfStats = request.perfStats;
     if (perfStats) {
         if ([perfStats respondsToSelector:@selector(hwExecutionTime)]) {
-            res.hwExecutionTimeNs = ((uint64_t (*)(id, SEL))objc_msgSend)(perfStats, @selector(hwExecutionTime));
+            res.hwExecutionTimeNs = perfStats.hwExecutionTime;
             res.hwExecutionTimeMs = (double)res.hwExecutionTimeNs / 1000000.0;
         }
         
-        NSData *perfCounterData = [perfStats valueForKey:@"perfCounterData"];
+        NSData *perfCounterData = perfStats.perfCounterData;
         if (perfCounterData) {
             res.perfCounterBytes = perfCounterData.length;
         }
         
-        NSData *pStatsRawData = [perfStats valueForKey:@"pStatsRawData"];
+        NSData *pStatsRawData = perfStats.pStatsRawData;
         if (pStatsRawData) {
             res.rawStatsBytes = pStatsRawData.length;
         }
@@ -816,7 +838,7 @@ static NSDictionary *gActiveLoadOpts = nil;
         // Extract final raw counters
         NSMutableDictionary<NSString *, NSNumber *> *finalCounters = [NSMutableDictionary dictionary];
         if ([perfStats respondsToSelector:@selector(performanceCounters)]) {
-            NSDictionary *c = [perfStats performanceCounters];
+            NSDictionary *c = perfStats.performanceCounters;
             if (c) {
                 for (id rawK in c) {
                     NSString *k = [rawK description];
@@ -915,10 +937,8 @@ static NSDictionary *gActiveLoadOpts = nil;
         }
         
         // Decode raw descriptor telemetry
-        if ([perfStatsClass respondsToSelector:@selector(decodePerformanceStats:withOptions:)]) {
-            NSDictionary *decoded = ((NSDictionary *(*)(id, SEL, id, id))objc_msgSend)(
-                perfStatsClass, @selector(decodePerformanceStats:withOptions:), perfStats, @{ @"kANEFPerformanceStatsMask": @(perfMask) }
-            );
+        if ([_ANEPerformanceStats respondsToSelector:@selector(decodePerformanceStats:withOptions:)]) {
+            NSDictionary *decoded = [_ANEPerformanceStats decodePerformanceStats:perfStats withOptions:@{ @"kANEFPerformanceStatsMask": @(perfMask) }];
             
             if (decoded && [decoded isKindOfClass:[NSDictionary class]]) {
                 NSDictionary *rawStats = decoded[@"rawStats"];
@@ -1027,12 +1047,24 @@ static NSArray<NSString *> *getANETempBaseDirectories(void) {
 
 + (NSString * _Nullable)findNewANETempDirectorySince:(NSSet<NSString *> * _Nullable)beforeDirs {
     NSFileManager *fm = [NSFileManager defaultManager];
-    
-    // 1. Check for newly created directories under any base
+
+    // Only ever return a directory that did not exist in beforeDirs. There
+    // used to be a second fallback pass here that, when no *new* bundle was
+    // found, returned the most-recently-modified bundle from ANY prior run --
+    // with no check against beforeDirs or "now" at all. That meant a config
+    // whose ANE compile silently fails and falls back to GPU (e.g. every FP8
+    // benchmark: MPSGraph's dequantize/quantize passes reject FP8 MLIR on the
+    // ANE compiler) would silently be attributed the PMU telemetry of
+    // whatever real ANE bundle a previous, unrelated benchmark happened to
+    // leave behind in /tmp -- reporting a plausible-looking but fabricated
+    // TOPS/ALU-saturation number instead of "no ANE bundle for this run."
+    // Returning nil here instead surfaces the honest
+    // "[PMU Note] No temporary ANE bundle emitted..." log path in
+    // ANECapacityEngine.swift.
     for (NSString *base in getANETempBaseDirectories()) {
         BOOL isDir = NO;
         if (![fm fileExistsAtPath:base isDirectory:&isDir] || !isDir) continue;
-        
+
         NSArray *subdirs = [fm contentsOfDirectoryAtPath:base error:nil];
         for (NSString *sub in subdirs) {
             NSString *full = [base stringByAppendingPathComponent:sub];
@@ -1049,35 +1081,8 @@ static NSArray<NSString *> *getANETempBaseDirectories(void) {
             }
         }
     }
-    
-    // 2. Fallback: Find most recent directory containing .bc.mlir, .hwx, or .mil
-    NSString *bestDir = nil;
-    NSDate *bestDate = [NSDate distantPast];
-    for (NSString *base in getANETempBaseDirectories()) {
-        BOOL isDir = NO;
-        if (![fm fileExistsAtPath:base isDirectory:&isDir] || !isDir) continue;
-        
-        NSArray *subdirs = [fm contentsOfDirectoryAtPath:base error:nil];
-        for (NSString *sub in subdirs) {
-            NSString *full = [base stringByAppendingPathComponent:sub];
-            BOOL subIsDir = NO;
-            if ([fm fileExistsAtPath:full isDirectory:&subIsDir] && subIsDir) {
-                NSArray *files = [fm contentsOfDirectoryAtPath:full error:nil];
-                for (NSString *f in files) {
-                    if ([f hasSuffix:@".bc.mlir"] || [f hasSuffix:@".hwx"] || [f hasSuffix:@".mil"]) {
-                        NSDictionary *attrs = [fm attributesOfItemAtPath:full error:nil];
-                        NSDate *mod = attrs[NSFileModificationDate];
-                        if (mod && [mod compare:bestDate] == NSOrderedDescending) {
-                            bestDate = mod;
-                            bestDir = full;
-                        }
-                        break;
-                    }
-                }
-            }
-        }
-    }
-    return bestDir;
+
+    return nil;
 }
 
 + (NSString * _Nullable)findANETempDirectorySince:(NSDate * _Nullable)sinceDate {
@@ -1144,19 +1149,7 @@ static NSArray<NSString *> *getANETempBaseDirectories(void) {
         }
     }
     
-    Class clientClass = NSClassFromString(@"_ANEClient");
-    Class modelClass = NSClassFromString(@"_ANEModel");
-    Class reqClass = NSClassFromString(@"_ANERequest");
-    Class ioSurfaceObjClass = NSClassFromString(@"_ANEIOSurfaceObject");
-    Class perfStatsClass = NSClassFromString(@"_ANEPerformanceStats");
-    Class perfStatsIoClass = NSClassFromString(@"_ANEPerformanceStatsIOSurface");
-    
-    if (!clientClass || !modelClass || !reqClass || !ioSurfaceObjClass || !perfStatsClass || !perfStatsIoClass) {
-        res.statusMessage = @"Required private AppleNeuralEngine classes not found.";
-        return res;
-    }
-    
-    id client = [clientClass performSelector:@selector(sharedConnection)];
+    _ANEClient *client = [_ANEClient sharedConnection];
     if (!client) {
         res.statusMessage = @"Failed to acquire _ANEClient connection.";
         return res;
@@ -1165,23 +1158,18 @@ static NSArray<NSString *> *getANETempBaseDirectories(void) {
     [self unloadActiveModel];
     
     NSString *effectiveArch = nil;
-    Class devInfoClass = NSClassFromString(@"_ANEDeviceInfo");
-    if (devInfoClass && [devInfoClass respondsToSelector:@selector(aneArchitectureType)]) {
-        effectiveArch = [devInfoClass performSelector:@selector(aneArchitectureType)];
+    if ([_ANEDeviceInfo respondsToSelector:@selector(aneArchitectureType)]) {
+        effectiveArch = [_ANEDeviceInfo aneArchitectureType];
     }
     if (!effectiveArch || effectiveArch.length == 0) {
         effectiveArch = @"h16g";
     }
     
-    id model = nil;
-    if ([modelClass respondsToSelector:@selector(modelAtURL:key:mpsConstants:)]) {
-        model = ((id (*)(id, SEL, id, id, id))objc_msgSend)(
-            modelClass, @selector(modelAtURL:key:mpsConstants:), bundleURL, regionKey, @"constants"
-        );
+    _ANEModel *model = nil;
+    if ([_ANEModel respondsToSelector:@selector(modelAtURL:key:mpsConstants:)]) {
+        model = [_ANEModel modelAtURL:bundleURL key:regionKey mpsConstants:@"constants"];
     } else {
-        model = ((id (*)(id, SEL, id, id))objc_msgSend)(
-            modelClass, @selector(modelAtURL:key:), bundleURL, regionKey
-        );
+        model = [_ANEModel modelAtURL:bundleURL key:regionKey];
     }
     
     if (!model) {
@@ -1199,9 +1187,7 @@ static NSArray<NSString *> *getANETempBaseDirectories(void) {
     };
     
     NSError *loadErr = nil;
-    BOOL loadOk = ((BOOL (*)(id, SEL, id, id, unsigned int, id*))objc_msgSend)(
-        client, @selector(loadModel:options:qos:error:), model, loadOpts, 25, &loadErr
-    );
+    BOOL loadOk = [client loadModel:model options:loadOpts qos:25 error:&loadErr];
     if (!loadOk) {
         res.statusMessage = [NSString stringWithFormat:@"_ANEClient loadModel failed: %@", loadErr.localizedDescription ?: @"Unknown error"];
         return res;
@@ -1215,27 +1201,30 @@ static NSArray<NSString *> *getANETempBaseDirectories(void) {
     if (outBytes == 0) outBytes = 0x4000;
     
     IOSurfaceRef inSurf = createIOSurface(inBytes);
-    fillIOSurfaceNonZero(inSurf, inBytes, dataType == MPSDataTypeFloat16);
+    fillIOSurfaceNonZero(inSurf, inBytes, dataType);
     IOSurfaceRef outSurf = createIOSurface(outBytes);
     IOSurfaceRef pmuSurf = createIOSurface(0x1000);
     
-    id inObj = [ioSurfaceObjClass performSelector:@selector(objectWithIOSurface:) withObject:(__bridge id)inSurf];
-    id outObj = [ioSurfaceObjClass performSelector:@selector(objectWithIOSurface:) withObject:(__bridge id)outSurf];
-    id pmuObj = [ioSurfaceObjClass performSelector:@selector(objectWithIOSurface:) withObject:(__bridge id)pmuSurf];
-    id pmuStatsSurf = ((id (*)(id, SEL, id, NSInteger))objc_msgSend)(
-        [perfStatsIoClass alloc], @selector(initWithIOSurface:statType:), pmuObj, 2
-    );
+    _ANEIOSurfaceObject *inObj = [_ANEIOSurfaceObject objectWithIOSurface:inSurf];
+    _ANEIOSurfaceObject *outObj = [_ANEIOSurfaceObject objectWithIOSurface:outSurf];
+    _ANEIOSurfaceObject *pmuObj = [_ANEIOSurfaceObject objectWithIOSurface:pmuSurf];
+    _ANEPerformanceStatsIOSurface *pmuStatsSurf = nil;
+    if ([_ANEPerformanceStatsIOSurface respondsToSelector:@selector(objectWithIOSurface:statType:)]) {
+        pmuStatsSurf = [_ANEPerformanceStatsIOSurface objectWithIOSurface:pmuObj statType:2];
+    } else {
+        pmuStatsSurf = [[_ANEPerformanceStatsIOSurface alloc] initWithIOSurface:pmuObj statType:2];
+    }
     
-    id req = ((id (*)(id, SEL, id, id, id, id, id, id))objc_msgSend)(
-        reqClass, @selector(requestWithInputs:inputIndices:outputs:outputIndices:perfStats:procedureIndex:),
-        @[inObj], @[@0], @[outObj], @[@0], @[pmuStatsSurf], @0
-    );
+    _ANERequest *req = [_ANERequest requestWithInputs:@[inObj]
+                                         inputIndices:@[@0]
+                                              outputs:@[outObj]
+                                        outputIndices:@[@0]
+                                            perfStats:@[pmuStatsSurf]
+                                       procedureIndex:@0];
     
     if (!req) {
         res.statusMessage = @"Failed to construct _ANERequest with perfStats.";
-        ((BOOL (*)(id, SEL, id, id, unsigned int, id*))objc_msgSend)(
-            client, @selector(unloadModel:options:qos:error:), model, loadOpts, 25, nil
-        );
+        [client unloadModel:model options:loadOpts qos:25 error:nil];
         CFRelease(inSurf);
         CFRelease(outSurf);
         CFRelease(pmuSurf);
@@ -1250,16 +1239,12 @@ static NSArray<NSString *> *getANETempBaseDirectories(void) {
     // Warm-up iteration & baseline register latch
     NSError *evalErr = nil;
     uint64_t tW0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
-    BOOL warmOk = ((BOOL (*)(id, SEL, id, id, id, unsigned int, id*))objc_msgSend)(
-        client, @selector(evaluateWithModel:options:request:qos:error:), model, evalOpts, req, 25, &evalErr
-    );
+    BOOL warmOk = [client evaluateWithModel:model options:evalOpts request:req qos:25 error:&evalErr];
     res.warmupMs = (double)(clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - tW0) / 1e6;
     
     if (!warmOk) {
         res.statusMessage = [NSString stringWithFormat:@"_ANEClient evaluate failed on warmup: %@", evalErr.localizedDescription ?: @"Unknown error"];
-        ((BOOL (*)(id, SEL, id, id, unsigned int, id*))objc_msgSend)(
-            client, @selector(unloadModel:options:qos:error:), model, loadOpts, 25, nil
-        );
+        [client unloadModel:model options:loadOpts qos:25 error:nil];
         CFRelease(inSurf);
         CFRelease(outSurf);
         CFRelease(pmuSurf);
@@ -1267,8 +1252,8 @@ static NSArray<NSString *> *getANETempBaseDirectories(void) {
     }
     
     uint64_t initRegs[29] = {0};
-    id warmPerfStats = [req valueForKey:@"perfStats"];
-    NSData *d0 = [warmPerfStats valueForKey:@"perfCounterData"];
+    _ANEPerformanceStats *warmPerfStats = req.perfStats;
+    NSData *d0 = warmPerfStats.perfCounterData;
     if (d0 && d0.length >= sizeof(uint64_t)) {
         size_t copyBytes = MIN(d0.length, sizeof(initRegs));
         memcpy(initRegs, d0.bytes, copyBytes);
@@ -1280,9 +1265,7 @@ static NSArray<NSString *> *getANETempBaseDirectories(void) {
     
     for (NSUInteger i = 0; i < numIters; i++) {
         uint64_t t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
-        BOOL ok = ((BOOL (*)(id, SEL, id, id, id, unsigned int, id*))objc_msgSend)(
-            client, @selector(evaluateWithModel:options:request:qos:error:), model, evalOpts, req, 25, &evalErr
-        );
+        BOOL ok = [client evaluateWithModel:model options:evalOpts request:req qos:25 error:&evalErr];
         uint64_t dt = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0;
         totalNs += dt;
         [latencies addObject:@((double)dt / 1e6)];
@@ -1296,14 +1279,14 @@ static NSArray<NSString *> *getANETempBaseDirectories(void) {
     }
     
     // Final registers & stats
-    id finalPerfStats = [req valueForKey:@"perfStats"];
+    _ANEPerformanceStats *finalPerfStats = req.perfStats;
     if (finalPerfStats && [finalPerfStats respondsToSelector:@selector(hwExecutionTime)]) {
-        res.hwExecutionTimeNs = ((uint64_t (*)(id, SEL))objc_msgSend)(finalPerfStats, @selector(hwExecutionTime));
+        res.hwExecutionTimeNs = finalPerfStats.hwExecutionTime;
         res.hwExecutionTimeMs = (double)res.hwExecutionTimeNs / 1e6;
     }
     
     uint64_t finalRegs[29] = {0};
-    NSData *d1 = [finalPerfStats valueForKey:@"perfCounterData"];
+    NSData *d1 = finalPerfStats.perfCounterData;
     if (d1) {
         res.perfCounterBytes = d1.length;
     }
@@ -1318,7 +1301,7 @@ static NSArray<NSString *> *getANETempBaseDirectories(void) {
     NSMutableDictionary<NSString *, NSNumber *> *deltasPerIter = [NSMutableDictionary dictionary];
     
     if ([finalPerfStats respondsToSelector:@selector(performanceCounters)]) {
-        NSDictionary *c = [finalPerfStats performanceCounters];
+        NSDictionary *c = finalPerfStats.performanceCounters;
         if (c) {
             for (id rawK in c) {
                 NSString *k = [rawK description];
@@ -1330,7 +1313,7 @@ static NSArray<NSString *> *getANETempBaseDirectories(void) {
         }
     }
     if ([warmPerfStats respondsToSelector:@selector(performanceCounters)]) {
-        NSDictionary *c = [warmPerfStats performanceCounters];
+        NSDictionary *c = warmPerfStats.performanceCounters;
         if (c) {
             for (id rawK in c) {
                 NSString *k = [rawK description];
@@ -1391,9 +1374,7 @@ static NSArray<NSString *> *getANETempBaseDirectories(void) {
     res.statusMessage = @"Success";
     
     // Unload model and release resources
-    ((BOOL (*)(id, SEL, id, id, unsigned int, id*))objc_msgSend)(
-        client, @selector(unloadModel:options:qos:error:), model, loadOpts, 25, nil
-    );
+    [client unloadModel:model options:loadOpts qos:25 error:nil];
     CFRelease(inSurf);
     CFRelease(outSurf);
     CFRelease(pmuSurf);

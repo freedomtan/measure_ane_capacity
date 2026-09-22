@@ -33,21 +33,72 @@ enum BenchmarkError: LocalizedError {
 }
 
 // MARK: - Benchmark Engine
-private func fillNonZeroData(buffer: UnsafeMutableRawPointer, byteCount: Int, dataType: MPSDataType) {
+private func fillNonZeroData(buffer: UnsafeMutableRawPointer, byteCount: Int, dataType: MPSDataType, seed: UInt64 = 0x5EED5EED5EED5EED) {
     guard byteCount > 0 else { return }
-    if dataType == .float16 {
+    var state = seed
+    if dataType.rawValue == 0x10430008 { // Float8e4m3
+        // Random-sign, physical magnitude 0.5 (E4M3 0x30 = +0.5, 0xB0 = -0.5).
+        // Paired with dequantize/quantize scale 0.0625 (2^-4), logical arithmetic
+        // runs at 0.5 * 0.0625 = 0.03125 (2^-5), keeping expected per-layer RMS gain
+        // near 1.0 (sqrt(reduction)/32) while avoiding the H18 ANE underflow-to-zero cliff
+        // on dynamic activation dequantization (see measure_conv_fp8.m).
+        let ptr = buffer.bindMemory(to: UInt8.self, capacity: byteCount)
+        for i in 0..<byteCount {
+            state ^= state << 13
+            state ^= state >> 7
+            state ^= state << 17
+            ptr[i] = (state & 1) != 0 ? 0xB0 : 0x30
+        }
+    } else if dataType == .float16 {
+        // Random-sign, magnitude 1/32 (FP16 0x2800 = +0.03125, 0xA800 = -0.03125).
+        // Deterministic xorshift64 avoids symmetric 4-element zero-canceling reductions
+        // and maintains stable activation magnitude (~1.0) across 20 chained conv/matmul layers.
         let ptr = buffer.bindMemory(to: UInt16.self, capacity: byteCount / 2)
         let count = byteCount / 2
-        let patterns: [UInt16] = [0x2C00, 0xAC00, 0x2800, 0xA800]
         for i in 0..<count {
-            ptr[i] = patterns[i & 3]
+            state ^= state << 13
+            state ^= state >> 7
+            state ^= state << 17
+            ptr[i] = (state & 1) != 0 ? 0xA800 : 0x2800
         }
     } else {
+        // INT8: Deterministic pseudo-random non-canceling signs {-1, 1}
         let ptr = buffer.bindMemory(to: Int8.self, capacity: byteCount)
-        let patterns: [Int8] = [1, -1, 2, -2]
         for i in 0..<byteCount {
-            ptr[i] = patterns[i & 3]
+            state ^= state << 13
+            state ^= state >> 7
+            state ^= state << 17
+            ptr[i] = (state & 1) != 0 ? -1 : 1
         }
+    }
+}
+
+private func countZeroElements(buffer: UnsafeMutableRawPointer, elementCount: Int, dataType: MPSDataType) -> Int {
+    guard elementCount > 0 else { return 0 }
+    if dataType == .float16 {
+        let ptr = buffer.bindMemory(to: UInt16.self, capacity: elementCount)
+        var zeros = 0
+        for i in 0..<elementCount {
+            // FP16 zero is 0x0000 (+0) or 0x8000 (-0).
+            if ptr[i] == 0x0000 || ptr[i] == 0x8000 { zeros += 1 }
+        }
+        return zeros
+    } else if dataType.rawValue == 0x10430008 { // Float8e4m3
+        // E4M3 zero is 0x00 (+0) or 0x80 (-0).
+        let ptr = buffer.bindMemory(to: UInt8.self, capacity: elementCount)
+        var zeros = 0
+        for i in 0..<elementCount {
+            if ptr[i] == 0x00 || ptr[i] == 0x80 { zeros += 1 }
+        }
+        return zeros
+    } else {
+        // Int8 zero is 0x00.
+        let ptr = buffer.bindMemory(to: UInt8.self, capacity: elementCount)
+        var zeros = 0
+        for i in 0..<elementCount {
+            if ptr[i] == 0 { zeros += 1 }
+        }
+        return zeros
     }
 }
 
@@ -55,7 +106,7 @@ private func createNonZeroData(byteCount: Int, dataType: MPSDataType) -> Data {
     var data = Data(count: byteCount)
     data.withUnsafeMutableBytes { rawBuf in
         if let baseAddress = rawBuf.baseAddress {
-            fillNonZeroData(buffer: baseAddress, byteCount: byteCount, dataType: dataType)
+            fillNonZeroData(buffer: baseAddress, byteCount: byteCount, dataType: dataType, seed: 0x5EED5EED5EED5EED)
         }
     }
     return data
@@ -109,7 +160,7 @@ final class ANECapacityEngine {
         
         let mpsType = precision.mpsDataType
         let elementSize = precision.elementSize
-        
+
         logHandler("[\(target.shortName) \(precision.rawValue)] Building graph: \(dims.shortDescription)...")
         
         // 1. Device and Compilation Descriptor Setup
@@ -134,6 +185,8 @@ final class ANECapacityEngine {
         let input: MPSGraphTensor
         var cur: MPSGraphTensor
         let inputBufferLen: Int
+        let outputBufferLen: Int
+        let outShape: [NSNumber]
         
         if dims.opType == .matmul {
             inShape = [
@@ -150,21 +203,44 @@ final class ANECapacityEngine {
             input = graph.placeholder(shape: inShape, dataType: mpsType, name: "in")
             cur = input
             
-            let wLength = dims.batch * dims.k * dims.n * 2
-            let wData = createNonZeroData(byteCount: wLength, dataType: .float16)
-            let w = graph.constant(wData, shape: wShape, dataType: .float16)
-            
-            for _ in 0..<dims.layers {
-                var lhs = cur
-                if mpsType == .int8 {
-                    lhs = graph.cast(cur, to: .float16, name: "dequant")
+            if precision.isFP8 {
+                guard #available(iOS 27.0, macOS 27.0, *) else {
+                    throw BenchmarkError.executionFailed("FP8 requires iOS 27.0 / macOS 27.0 or newer.")
                 }
-                cur = graph.matrixMultiplication(primary: lhs, secondary: w, name: nil)
-                if mpsType == .int8 {
-                    cur = graph.cast(cur, to: .int8, name: "requant")
+                let fp8Scale: Double = 1.0
+                let wLength = dims.batch * dims.k * dims.n * 1
+                let wData = createNonZeroData(byteCount: wLength, dataType: mpsType)
+                let wFP8 = graph.constant(wData, shape: wShape, dataType: mpsType)
+                let w = graph.dequantize(wFP8, scale: fp8Scale, zeroPoint: 0.0, dataType: .float16, name: "w_dequant")
+                
+                for _ in 0..<dims.layers {
+                    let lhs = graph.dequantize(cur, scale: fp8Scale, zeroPoint: 0.0, dataType: .float16, name: "act_dequant")
+                    let outFP16 = graph.matrixMultiplication(primary: lhs, secondary: w, name: nil)
+                    cur = graph.quantize(outFP16, scale: fp8Scale, zeroPoint: 0.0, dataType: mpsType, name: "act_quant")
+                }
+            } else {
+                let wLength = dims.batch * dims.k * dims.n * 2
+                let wData = createNonZeroData(byteCount: wLength, dataType: .float16)
+                let w = graph.constant(wData, shape: wShape, dataType: .float16)
+                
+                for _ in 0..<dims.layers {
+                    var lhs = cur
+                    if mpsType == .int8 {
+                        lhs = graph.cast(cur, to: .float16, name: "dequant")
+                    }
+                    cur = graph.matrixMultiplication(primary: lhs, secondary: w, name: nil)
+                    if mpsType == .int8 {
+                        cur = graph.cast(cur, to: .int8, name: "requant")
+                    }
                 }
             }
             inputBufferLen = dims.batch * dims.m * dims.k * elementSize
+            outputBufferLen = dims.batch * dims.m * dims.n * elementSize
+            outShape = [
+                NSNumber(value: dims.batch),
+                NSNumber(value: dims.m),
+                NSNumber(value: dims.n)
+            ]
         } else {
             inShape = [
                 NSNumber(value: dims.batch),
@@ -182,35 +258,78 @@ final class ANECapacityEngine {
             input = graph.placeholder(shape: inShape, dataType: mpsType, name: "in")
             cur = input
             
-            // Constant weights
-            let wLength = dims.outChannels * dims.inChannels * dims.kernelSize * dims.kernelSize * elementSize
-            let wData = createNonZeroData(byteCount: wLength, dataType: mpsType)
-            let w = graph.constant(wData, shape: wShape, dataType: mpsType)
+            guard let d = MPSGraphConvolution2DOpDescriptor(
+                strideInX: 1,
+                strideInY: 1,
+                dilationRateInX: 1,
+                dilationRateInY: 1,
+                groups: 1,
+                paddingStyle: .TF_SAME,
+                dataLayout: .NCHW,
+                weightsLayout: .OIHW
+            ) else {
+                throw BenchmarkError.graphCompilationFailed("Invalid convolution descriptor")
+            }
             
-            // Chain L layers
-            for _ in 0..<dims.layers {
-                guard let d = MPSGraphConvolution2DOpDescriptor(
-                    strideInX: 1,
-                    strideInY: 1,
-                    dilationRateInX: 1,
-                    dilationRateInY: 1,
-                    groups: 1,
-                    paddingStyle: .TF_SAME,
-                    dataLayout: .NCHW,
-                    weightsLayout: .OIHW
-                ) else {
-                    throw BenchmarkError.graphCompilationFailed("Invalid convolution descriptor")
+            if precision.isFP8 {
+                guard #available(iOS 27.0, macOS 27.0, *) else {
+                    throw BenchmarkError.executionFailed("FP8 requires iOS 27.0 / macOS 27.0 or newer.")
                 }
+                let fp8Scale: Double = 1.0
+                let wLength = dims.outChannels * dims.inChannels * dims.kernelSize * dims.kernelSize * 1
+                let wData = createNonZeroData(byteCount: wLength, dataType: mpsType)
+                let wFP8 = graph.constant(wData, shape: wShape, dataType: mpsType)
+                let w = graph.dequantize(wFP8, scale: fp8Scale, zeroPoint: 0.0, dataType: .float16, name: "w_dequant")
                 
-                cur = graph.convolution2D(cur, weights: w, descriptor: d, name: nil)
-                
-                // Int8 simulated quantized flow: Int8 -> Conv -> FP16 dequant -> Int8 requant
-                if mpsType == .int8 {
-                    let fp = graph.cast(cur, to: .float16, name: "dequant")
-                    cur = graph.cast(fp, to: .int8, name: "requant")
+                for _ in 0..<dims.layers {
+                    let actFP16 = graph.dequantize(cur, scale: fp8Scale, zeroPoint: 0.0, dataType: .float16, name: "act_dequant")
+                    let outFP16 = graph.convolution2D(actFP16, weights: w, descriptor: d, name: nil)
+                    cur = graph.quantize(outFP16, scale: fp8Scale, zeroPoint: 0.0, dataType: mpsType, name: "act_quant")
+                }
+            } else if mpsType == .int8 && target != .ane {
+                // MPS's GPU convolution kernel only supports FP32/FP16
+                // operands -- unlike ANE, which has a native INT8 conv path.
+                // Passing raw INT8 tensors to convolution2D here does not
+                // throw a catchable NSException; it hits a hard assertion
+                // inside MPSNDArrayConvolutionPreG13.mm ("Only FP32 or FP16
+                // convolution supported") and calls abort(), taking the whole
+                // app down. Route through the same QDQ pattern matmul's INT8
+                // path already uses below: dequantize activations to FP16,
+                // convolve in FP16 with FP16 weights, requantize the output.
+                let wLength = dims.outChannels * dims.inChannels * dims.kernelSize * dims.kernelSize * 2
+                let wData = createNonZeroData(byteCount: wLength, dataType: .float16)
+                let w = graph.constant(wData, shape: wShape, dataType: .float16)
+
+                for _ in 0..<dims.layers {
+                    let lhs = graph.cast(cur, to: .float16, name: "dequant")
+                    let outFP16 = graph.convolution2D(lhs, weights: w, descriptor: d, name: nil)
+                    cur = graph.cast(outFP16, to: .int8, name: "requant")
+                }
+            } else {
+                // Constant weights
+                let wLength = dims.outChannels * dims.inChannels * dims.kernelSize * dims.kernelSize * elementSize
+                let wData = createNonZeroData(byteCount: wLength, dataType: mpsType)
+                let w = graph.constant(wData, shape: wShape, dataType: mpsType)
+
+                // Chain L layers
+                for _ in 0..<dims.layers {
+                    cur = graph.convolution2D(cur, weights: w, descriptor: d, name: nil)
+
+                    // Int8 simulated quantized flow: Int8 -> Conv -> FP16 dequant -> Int8 requant
+                    if mpsType == .int8 {
+                        let fp = graph.cast(cur, to: .float16, name: "dequant")
+                        cur = graph.cast(fp, to: .int8, name: "requant")
+                    }
                 }
             }
             inputBufferLen = dims.batch * dims.height * dims.width * dims.inChannels * elementSize
+            outputBufferLen = dims.batch * dims.height * dims.width * dims.outChannels * elementSize
+            outShape = [
+                NSNumber(value: dims.batch),
+                NSNumber(value: dims.outChannels),
+                NSNumber(value: dims.height),
+                NSNumber(value: dims.width)
+            ]
         }
         
         if Task.isCancelled { throw BenchmarkError.executionCancelled }
@@ -247,43 +366,54 @@ final class ANECapacityEngine {
         guard let iBuf = device.makeBuffer(length: inputBufferLen, options: []) else {
             throw BenchmarkError.bufferAllocationFailed
         }
-        fillNonZeroData(buffer: iBuf.contents(), byteCount: inputBufferLen, dataType: mpsType)
+        fillNonZeroData(buffer: iBuf.contents(), byteCount: inputBufferLen, dataType: mpsType, seed: 0x9E3779B97F4A7C15)
         let iData = MPSGraphTensorData(iBuf, shape: inShape, dataType: mpsType)
-        
+
+        // Captured (not results: nil) so the result can be checked for
+        // degenerate all-zero output below -- a plausible-looking TOPS
+        // number computed from wall-clock latency alone cannot distinguish
+        // real work from H17+ zero-skip inflating a degenerate result, which
+        // is exactly what FP8 W8A8 QDQ hits on some ANE generations (see
+        // measure_conv_fp8.m's file-header note on H18).
+        guard let oBuf = device.makeBuffer(length: outputBufferLen, options: []) else {
+            throw BenchmarkError.bufferAllocationFailed
+        }
+        let oData = MPSGraphTensorData(oBuf, shape: outShape, dataType: mpsType)
+
         guard let queue = device.makeCommandQueue() else {
             throw BenchmarkError.commandQueueCreationFailed
         }
-        
+
         let ed = MPSGraphExecutableExecutionDescriptor()
         ed.waitUntilCompleted = true
-        
+
         // 5. Warmup with Exception Protection
         logHandler("[\(target.shortName) \(precision.rawValue)] Warming up pipeline...")
         do {
             try ANEClientBridge.catchException {
-                exe.run(with: queue, inputs: [iData], results: nil, executionDescriptor: ed)
+                exe.run(with: queue, inputs: [iData], results: [oData], executionDescriptor: ed)
             }
         } catch {
             throw BenchmarkError.executionFailed("Warmup failed: \(error.localizedDescription)")
         }
-        
+
         if Task.isCancelled { throw BenchmarkError.executionCancelled }
-        
+
         // 6. Timed Benchmarking loop
         logHandler("[\(target.shortName) \(precision.rawValue)] Benchmarking \(iterations) iterations...")
         let startNanos = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW)
-        
+
         for i in 0..<iterations {
             if Task.isCancelled { throw BenchmarkError.executionCancelled }
-            
+
             do {
                 try ANEClientBridge.catchException {
-                    exe.run(with: queue, inputs: [iData], results: nil, executionDescriptor: ed)
+                    exe.run(with: queue, inputs: [iData], results: [oData], executionDescriptor: ed)
                 }
             } catch {
                 throw BenchmarkError.executionFailed("Iteration \(i) failed: \(error.localizedDescription)")
             }
-            
+
             // Yield every 5 iterations to allow UI updates
             if (i + 1) % 5 == 0 {
                 await Task.yield()
@@ -298,7 +428,24 @@ final class ANECapacityEngine {
         
         // Calculate TOPS: totalOps / (avgSec * 1e12)
         var tops = dims.totalOperations / (avgSec * 1e12)
-        
+
+        // A degenerate all-zero result reads as a plausible, even fast,
+        // number here -- wall-clock latency alone can't tell real work from
+        // H17+ zero-skip inflating throughput on garbage output. Confirmed on
+        // iPhone 18 Pro: FP8 W8A8 QDQ's runtime activation quantize/
+        // dequantize zeroes 100% of output on the ANE regardless of scale or
+        // magnitude (see measure_conv_fp8.m). Surface it here rather than
+        // silently reporting an inflated TOPS the UI can't distinguish from
+        // a real one.
+        let outputElementCount = outputBufferLen / elementSize
+        let zeroCount = countZeroElements(buffer: oBuf.contents(), elementCount: outputElementCount, dataType: mpsType)
+        if zeroCount == outputElementCount {
+            logHandler("[\(target.shortName) \(precision.rawValue)] WARNING: 100% zero output "
+                + "(\(outputElementCount)/\(outputElementCount) elements) -- this is not a real "
+                + "measurement. The TOPS below is almost certainly hardware zero-skip inflating "
+                + "a degenerate result, not real throughput.")
+        }
+
         // 7. PMU Telemetry Harvesting
         var pmuCounters: [String: UInt64] = [:]
         var computeCycles: UInt64 = 0
@@ -394,7 +541,9 @@ final class ANECapacityEngine {
             macsPerCoreCycle: macsPerCoreCycle,
             chipMacsPerCycle: chipMacsPerCycle,
             aluSaturation: aluSaturation,
-            effectiveClockGhz: effectiveClockGhz
+            effectiveClockGhz: effectiveClockGhz,
+            zeroOutputCount: zeroCount,
+            outputElementCount: outputElementCount
         )
     }
     
