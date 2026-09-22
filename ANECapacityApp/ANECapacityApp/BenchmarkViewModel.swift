@@ -248,7 +248,7 @@ final class BenchmarkViewModel: ObservableObject {
     private func runSingleBenchmarkFlow() async {
         let precisions = precisionsToRun
         let totalSteps = Double(precisions.count)
-        var currentStep = 0.0
+        var currentStep = 0
         
         log("=== Starting Single Benchmark: \(dimensions.detailedDescription) ===")
         
@@ -274,8 +274,8 @@ final class BenchmarkViewModel: ObservableObject {
                 log("❌ Error: \(error.localizedDescription)")
             }
             
-            currentStep += 1.0
-            progress = currentStep / totalSteps
+            currentStep += 1
+            progress = Double(currentStep) / totalSteps
         }
     }
     
@@ -346,7 +346,7 @@ final class BenchmarkViewModel: ObservableObject {
         }
         
         let totalSteps = Double(points.count * precisionsToRun.count)
-        var currentStep = 0.0
+        var currentStep = 0
         
         log("=== Starting Sweep: \(selectedSweep.rawValue) (\(points.count) steps x \(precisionsToRun.count) types) ===")
         
@@ -374,8 +374,8 @@ final class BenchmarkViewModel: ObservableObject {
                     log("❌ Error at \(pt.label): \(error.localizedDescription)")
                 }
                 
-                currentStep += 1.0
-                progress = currentStep / totalSteps
+                currentStep += 1
+                progress = Double(currentStep) / totalSteps
                 
                 // Small pause between configurations to let hardware thermals / driver settle
                 try? await Task.sleep(nanoseconds: 100_000_000) // 100ms
