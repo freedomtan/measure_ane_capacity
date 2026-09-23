@@ -1193,20 +1193,80 @@ static NSArray<NSString *> *getANETempBaseDirectories(void) {
         return res;
     }
     
-    size_t inElementSize = (dataType == MPSDataTypeFloat16) ? 2 : 1;
-    size_t outElementSize = (dataType == MPSDataTypeFloat16) ? 2 : 1;
-    size_t inBytes = B * H * W * Ci * inElementSize;
-    size_t outBytes = B * H * W * Co * outElementSize;
-    if (inBytes == 0) inBytes = 0x4000;
-    if (outBytes == 0) outBytes = 0x4000;
+    // Inspect NetworkStatusList for exact tensor buffer requirements
+    NSDictionary *attrs = model.modelAttributes;
+    NSArray *netList = (attrs && [attrs isKindOfClass:[NSDictionary class]]) ? attrs[@"NetworkStatusList"] : nil;
     
-    IOSurfaceRef inSurf = createIOSurface(inBytes);
-    fillIOSurfaceNonZero(inSurf, inBytes, dataType);
-    IOSurfaceRef outSurf = createIOSurface(outBytes);
-    IOSurfaceRef pmuSurf = createIOSurface(0x1000);
+    NSArray *inputs = @[];
+    NSArray *outputs = @[];
+    if (netList && netList.count > 0) {
+        NSDictionary *mainNet = netList[0];
+        inputs = mainNet[@"LiveInputList"] ?: @[];
+        outputs = mainNet[@"LiveOutputList"] ?: @[];
+    }
     
-    _ANEIOSurfaceObject *inObj = [_ANEIOSurfaceObject objectWithIOSurface:inSurf];
-    _ANEIOSurfaceObject *outObj = [_ANEIOSurfaceObject objectWithIOSurface:outSurf];
+    NSMutableArray<_ANEIOSurfaceObject *> *inObjects = [NSMutableArray array];
+    NSMutableArray<NSNumber *> *inIndices = [NSMutableArray array];
+    NSMutableArray *inSurfs = [NSMutableArray array];
+    
+    uint32_t inIdx = 0;
+    for (NSDictionary *t in inputs) {
+        uint64_t bStride = [t[@"BatchStride"] unsignedLongLongValue] ?: 4096;
+        uint64_t batches = [t[@"Batches"] unsignedLongLongValue] ?: 1;
+        size_t bytes = (size_t)(bStride * batches);
+        IOSurfaceRef surf = createIOSurface(bytes);
+        fillIOSurfaceNonZero(surf, bytes, dataType);
+        [inSurfs addObject:(__bridge id)surf];
+        _ANEIOSurfaceObject *obj = [_ANEIOSurfaceObject objectWithIOSurface:surf];
+        [inObjects addObject:obj];
+        [inIndices addObject:@(inIdx++)];
+        CFRelease(surf);
+    }
+    
+    // Fallback if model has no declared live inputs
+    if (inObjects.count == 0) {
+        size_t inElementSize = (dataType == MPSDataTypeFloat16) ? 2 : 1;
+        size_t inBytes = B * H * W * Ci * inElementSize;
+        if (inBytes < 0x4000) inBytes = 0x4000;
+        IOSurfaceRef surf = createIOSurface(inBytes);
+        fillIOSurfaceNonZero(surf, inBytes, dataType);
+        [inSurfs addObject:(__bridge id)surf];
+        _ANEIOSurfaceObject *obj = [_ANEIOSurfaceObject objectWithIOSurface:surf];
+        [inObjects addObject:obj];
+        [inIndices addObject:@(0)];
+        CFRelease(surf);
+    }
+    
+    NSMutableArray<_ANEIOSurfaceObject *> *outObjects = [NSMutableArray array];
+    NSMutableArray<NSNumber *> *outIndices = [NSMutableArray array];
+    NSMutableArray *outSurfs = [NSMutableArray array];
+    
+    uint32_t outIdx = 0;
+    for (NSDictionary *t in outputs) {
+        uint64_t bStride = [t[@"BatchStride"] unsignedLongLongValue] ?: 4096;
+        uint64_t batches = [t[@"Batches"] unsignedLongLongValue] ?: 1;
+        size_t bytes = (size_t)(bStride * batches);
+        IOSurfaceRef surf = createIOSurface(bytes);
+        [outSurfs addObject:(__bridge id)surf];
+        _ANEIOSurfaceObject *obj = [_ANEIOSurfaceObject objectWithIOSurface:surf];
+        [outObjects addObject:obj];
+        [outIndices addObject:@(outIdx++)];
+        CFRelease(surf);
+    }
+    
+    if (outObjects.count == 0) {
+        size_t outElementSize = (dataType == MPSDataTypeFloat16) ? 2 : 1;
+        size_t outBytes = B * H * W * Co * outElementSize;
+        if (outBytes < 0x4000) outBytes = 0x4000;
+        IOSurfaceRef surf = createIOSurface(outBytes);
+        [outSurfs addObject:(__bridge id)surf];
+        _ANEIOSurfaceObject *obj = [_ANEIOSurfaceObject objectWithIOSurface:surf];
+        [outObjects addObject:obj];
+        [outIndices addObject:@(0)];
+        CFRelease(surf);
+    }
+    
+    IOSurfaceRef pmuSurf = createIOSurface(0x4000);
     _ANEIOSurfaceObject *pmuObj = [_ANEIOSurfaceObject objectWithIOSurface:pmuSurf];
     _ANEPerformanceStatsIOSurface *pmuStatsSurf = nil;
     if ([_ANEPerformanceStatsIOSurface respondsToSelector:@selector(objectWithIOSurface:statType:)]) {
@@ -1214,20 +1274,18 @@ static NSArray<NSString *> *getANETempBaseDirectories(void) {
     } else {
         pmuStatsSurf = [[_ANEPerformanceStatsIOSurface alloc] initWithIOSurface:pmuObj statType:2];
     }
+    CFRelease(pmuSurf);
     
-    _ANERequest *req = [_ANERequest requestWithInputs:@[inObj]
-                                         inputIndices:@[@0]
-                                              outputs:@[outObj]
-                                        outputIndices:@[@0]
+    _ANERequest *req = [_ANERequest requestWithInputs:inObjects
+                                         inputIndices:inIndices
+                                              outputs:outObjects
+                                        outputIndices:outIndices
                                             perfStats:@[pmuStatsSurf]
                                        procedureIndex:@0];
     
     if (!req) {
         res.statusMessage = @"Failed to construct _ANERequest with perfStats.";
         [client unloadModel:model options:loadOpts qos:25 error:nil];
-        CFRelease(inSurf);
-        CFRelease(outSurf);
-        CFRelease(pmuSurf);
         return res;
     }
     
@@ -1245,9 +1303,6 @@ static NSArray<NSString *> *getANETempBaseDirectories(void) {
     if (!warmOk) {
         res.statusMessage = [NSString stringWithFormat:@"_ANEClient evaluate failed on warmup: %@", evalErr.localizedDescription ?: @"Unknown error"];
         [client unloadModel:model options:loadOpts qos:25 error:nil];
-        CFRelease(inSurf);
-        CFRelease(outSurf);
-        CFRelease(pmuSurf);
         return res;
     }
     
@@ -1375,9 +1430,6 @@ static NSArray<NSString *> *getANETempBaseDirectories(void) {
     
     // Unload model and release resources
     [client unloadModel:model options:loadOpts qos:25 error:nil];
-    CFRelease(inSurf);
-    CFRelease(outSurf);
-    CFRelease(pmuSurf);
     
     return res;
 }

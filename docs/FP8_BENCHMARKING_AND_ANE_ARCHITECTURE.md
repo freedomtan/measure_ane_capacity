@@ -131,7 +131,10 @@ if zeroCount == outputElementCount {
 
 ## 7. Offline Compilation to ANE Binary (`convert_fp8_to_hwx`)
 
-The [`convert_fp8_to_hwx`](file:///Users/freedom/work/measure_ane_capacity/convert_fp8_to_hwx.m) utility allows offline cross-compilation of an MPSGraph FP8 QDQ model to an ANE Mach-O `.hwx` binary for any target architecture:
+The [`convert_fp8_to_hwx`](file:///Users/freedom/work/measure_ane_capacity/convert_fp8_to_hwx.m) utility allows offline cross-compilation of an MPSGraph FP8 QDQ model to an ANE Mach-O `.hwx` binary.
+
+> [!IMPORTANT]
+> **Architecture Compatibility**: `convert_fp8_to_hwx` **only works for H18 variants (e.g. `h18`, `h18g`) and H19**. Earlier architectures (H17 and below) lack hardware FP8 support, causing their respective ANE compilers to reject the FP8 MLIR graph during compilation (`"MLIR MPS to ANEC conversion failed"`).
 
 ```bash
 # Build the tool
@@ -145,10 +148,10 @@ make convert_fp8_to_hwx
 ```
 
 ### Compilation Pipeline
-1. **Device Descriptor**: Creates private `MPSGraphDeviceDescriptor` specifying the target architecture string (`h18`, `h19`, `h17p`, etc.).
+1. **Device Descriptor**: Creates private `MPSGraphDeviceDescriptor` specifying the target architecture string (`h18`, `h18g`, `h19`).
 2. **Graph Construction**: Constructs the FP8 QDQ convolution chain with decoupled scale.
 3. **Compilation**: Sets `preferredDevice = 2` (ANE) and `enableCompileResourcesForPackage = YES`.
-4. **Package Extraction**: Serializes to `.mpsgraphpackage`, extracts `binary_0.hwx`, and parses Mach-O header metadata (`CPU Type: 0x0100000c`, `Subtype: 11`).
+4. **Package Extraction**: Serializes to `.mpsgraphpackage`, extracts `binary_0.hwx`, and parses Mach-O header metadata (`CPU Type: 0x0100000c`, `Subtype: 11` for H19 / `Subtype: 10` for H18).
 
 ---
 

@@ -63,11 +63,11 @@ void run_bench(id<MTLDevice> device, bool useANE, MPSDataType dataType,
 
     MPSGraph *graph = [MPSGraph new];
 
-    // High-throughput GEMM dimensions: B x M x K multiplied by B x K x N
-    // Output shape matches input shape (B x M x N where M == N) allowing seamless chaining of L layers.
+    // High-throughput GEMM dimensions: 4D tensors [B, 1, M, K] x [B, 1, K, N]
+    // ANE natively processes 4D tensors, avoiding layout translation overhead and enabling full hardware saturation.
     NSUInteger B = 1, M = 1024, K = 1024, N = 1024, L = 20;
-    NSArray *inShape = @[ @(B), @(M), @(K) ];
-    NSArray *wShape = @[ @(B), @(K), @(N) ];
+    NSArray *inShape = @[ @(B), @1, @(M), @(K) ];
+    NSArray *wShape = @[ @(B), @1, @(K), @(N) ];
 
     MPSGraphTensor *input = [graph placeholderWithShape:inShape
                                                dataType:dataType

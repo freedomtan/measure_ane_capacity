@@ -81,14 +81,19 @@ static void run_bench_matmul_fp8_qdq(id<MTLDevice> device, bool useANE,
     fflush(stdout);
 
     @try {
-      // Same GEMM dimensions as measure_matmul_universal.m.
+      // Map GEMM to 1x1 2D Convolution on ANE:
+      //   Input:   [B, K, H, W] where H * W = M (32 x 32 = 1024)
+      //   Weights: [N, K, 1, 1]
+      //   Output:  [B, N, H, W]
+      // This maps reduction across the 64-wide ANE channel MAC array and validates QDQ without GPU fallback.
       NSUInteger B = 1, M = 1024, K = 1024, N = 1024, L = 20;
-      NSArray *inShape = @[ @(B), @(M), @(K) ];
-      NSArray *wShape = @[ @(B), @(K), @(N) ];
+      NSUInteger H = 32, W = 32;
+      NSArray *inShape = @[ @(B), @(K), @(H), @(W) ];
+      NSArray *wShape = @[ @(N), @(K), @1, @1 ];
 
       MPSGraph *graph = [MPSGraph new];
       MPSDataType actType = (mode == FP8BenchModeFullQDQ) ? fp8Type : MPSDataTypeFloat16;
-      double fp8Scale = 1.0; // scale 1.0 matches measure_conv_fp8 --logical-shift -1 on H19
+      double fp8Scale = 0.0625; // 2^-4 scale avoiding H18/H19 underflow cliff
 
       MPSGraphTensor *input = [graph placeholderWithShape:inShape
                                                  dataType:actType
@@ -96,7 +101,7 @@ static void run_bench_matmul_fp8_qdq(id<MTLDevice> device, bool useANE,
       MPSGraphTensor *cur = input;
 
       // Weights stored in FP8 (1 byte per element)
-      NSMutableData *wData = [NSMutableData dataWithLength:B * K * N * sizeof(uint8_t)];
+      NSMutableData *wData = [NSMutableData dataWithLength:N * K * 1 * 1 * sizeof(uint8_t)];
       fillFP8Random(wData.mutableBytes, wData.length, 0x5EED5EED5EED5EEDULL);
       MPSGraphTensor *wFP8 = [graph constantWithData:wData shape:wShape dataType:fp8Type];
 
@@ -107,6 +112,12 @@ static void run_bench_matmul_fp8_qdq(id<MTLDevice> device, bool useANE,
                                          dataType:MPSDataTypeFloat16
                                              name:@"w_dequant"];
 
+      MPSGraphConvolution2DOpDescriptor *convDesc = [MPSGraphConvolution2DOpDescriptor
+          descriptorWithStrideInX:1 strideInY:1 dilationRateInX:1 dilationRateInY:1
+                           groups:1 paddingStyle:MPSGraphPaddingStyleTF_SAME
+                       dataLayout:MPSGraphTensorNamedDataLayoutNCHW
+                    weightsLayout:MPSGraphTensorNamedDataLayoutOIHW];
+
       for (int i = 0; i < (int)L; i++) {
         if (mode == FP8BenchModeFullQDQ) {
           // Dequantize activation to FP16
@@ -115,10 +126,11 @@ static void run_bench_matmul_fp8_qdq(id<MTLDevice> device, bool useANE,
                                                  zeroPoint:0.0
                                                   dataType:MPSDataTypeFloat16
                                                       name:nil];
-          // Multiply in FP16
-          MPSGraphTensor *outFP16 = [graph matrixMultiplicationWithPrimaryTensor:inFP16
-                                                                 secondaryTensor:w
-                                                                            name:nil];
+          // 1x1 Convolution in FP16
+          MPSGraphTensor *outFP16 = [graph convolution2DWithSourceTensor:inFP16
+                                                           weightsTensor:w
+                                                              descriptor:convDesc
+                                                                    name:nil];
           // Quantize back to FP8
           cur = [graph quantizeTensor:outFP16
                                 scale:fp8Scale
@@ -127,9 +139,10 @@ static void run_bench_matmul_fp8_qdq(id<MTLDevice> device, bool useANE,
                                  name:nil];
         } else {
           // Weight-only: multiply FP16 activations with dequantized FP8 weights
-          cur = [graph matrixMultiplicationWithPrimaryTensor:cur
-                                             secondaryTensor:w
-                                                        name:nil];
+          cur = [graph convolution2DWithSourceTensor:cur
+                                       weightsTensor:w
+                                          descriptor:convDesc
+                                                name:nil];
         }
       }
 

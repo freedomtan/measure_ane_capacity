@@ -130,7 +130,7 @@ struct BenchmarkView: View {
         if viewModel.selectedOperation == .matmul {
             return [.matmulDimensions, .matmulDepth]
         } else {
-            return [.channels, .spatial, .depth, .kernels, .fullCapacity]
+            return [.channels, .sramResident, .spatial, .depth, .kernels, .fullCapacity]
         }
     }
     
@@ -175,7 +175,8 @@ struct BenchmarkView: View {
     private func sweepDescription(_ s: SweepType) -> String {
         switch s {
         case .none: return "Run single test"
-        case .channels: return "Sweeps C = 32, 64, 128, 256, 512, 1024 (Tests matrix array saturation)"
+        case .channels: return "Sweeps C = 32, 64, 128, 256, 384, 512 (Tests matrix array saturation)"
+        case .sramResident: return "Fixed H=W=64, sweeps C = 32..512 (Activations stay 100% inside ANE L2 SRAM)"
         case .spatial: return "Sweeps H=W = 64, 128, 256, 384, 512, 768 (Tests bandwidth scaling)"
         case .depth: return "Sweeps L = 1, 5, 10, 20, 30, 40 (Measures dispatch latency amortization)"
         case .kernels: return "Tests K=1x1 (GEMM) vs K=3x3 vs K=5x5 (2D Spatial Conv)"
@@ -285,7 +286,7 @@ struct BenchmarkView: View {
                             .fontWeight(.bold)
                     }
                     Picker("Channels", selection: $viewModel.dimensions.inChannels) {
-                        ForEach([16, 32, 64, 128, 256, 512, 1024], id: \.self) { c in
+                        ForEach([16, 32, 64, 128, 256, 384, 512], id: \.self) { c in
                             Text("\(c)").tag(c)
                         }
                     }

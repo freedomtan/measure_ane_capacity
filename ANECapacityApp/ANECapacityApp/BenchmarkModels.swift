@@ -14,7 +14,7 @@ enum PrecisionMode: String, CaseIterable, Identifiable, Codable {
     var elementSize: Int {
         switch self {
         case .fp16: return 2
-        case .int8, .fp8: return 1
+        case .int8, .fp8: return 1 // True 8-bit activations and weights
         case .both, .all: return 2
         }
     }
@@ -80,6 +80,7 @@ enum OperationType: String, CaseIterable, Identifiable, Codable {
 enum SweepType: String, CaseIterable, Identifiable, Codable {
     case none = "Single Run"
     case channels = "Channel Capacity Sweep"
+    case sramResident = "ANE SRAM-Resident Sweep (H=W=64)"
     case spatial = "Spatial Dimension (H=W) Sweep"
     case depth = "Chained Layer Depth Sweep"
     case kernels = "Kernel Size Sweep (1x1 vs 3x3)"
@@ -93,6 +94,7 @@ enum SweepType: String, CaseIterable, Identifiable, Codable {
         switch self {
         case .none: return "Run"
         case .channels: return "Channels (Ci = Co)"
+        case .sramResident: return "Channels (Ci = Co, H=W=64)"
         case .spatial: return "Spatial Resolution (H = W)"
         case .depth: return "Chained Layers (L)"
         case .kernels: return "Kernel Size (KxK)"
@@ -143,7 +145,8 @@ struct ConvDimensions: Codable, Equatable {
             }
             return batch * k * n * 2
         }
-        return outChannels * inChannels * kernelSize * kernelSize * precision.elementSize
+        let weightElem = precision.isFP8 ? 1 : precision.elementSize
+        return outChannels * inChannels * kernelSize * kernelSize * weightElem
     }
     
     func inputBytes(precision: PrecisionMode) -> Int {

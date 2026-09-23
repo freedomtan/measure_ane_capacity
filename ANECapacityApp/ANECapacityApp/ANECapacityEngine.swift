@@ -33,15 +33,17 @@ enum BenchmarkError: LocalizedError {
 }
 
 // MARK: - Benchmark Engine
-private func fillNonZeroData(buffer: UnsafeMutableRawPointer, byteCount: Int, dataType: MPSDataType, seed: UInt64 = 0x5EED5EED5EED5EED) {
+private func fillNonZeroData(
+    buffer: UnsafeMutableRawPointer,
+    byteCount: Int,
+    dataType: MPSDataType,
+    magnitude: Float = 1.0,
+    seed: UInt64 = 0x5EED5EED5EED5EED
+) {
     guard byteCount > 0 else { return }
     var state = seed
     if dataType.rawValue == 0x10430008 { // Float8e4m3
         // Random-sign, physical magnitude 0.5 (E4M3 0x30 = +0.5, 0xB0 = -0.5).
-        // Paired with dequantize/quantize scale 0.0625 (2^-4), logical arithmetic
-        // runs at 0.5 * 0.0625 = 0.03125 (2^-5), keeping expected per-layer RMS gain
-        // near 1.0 (sqrt(reduction)/32) while avoiding the H18 ANE underflow-to-zero cliff
-        // on dynamic activation dequantization (see measure_conv_fp8.m).
         let ptr = buffer.bindMemory(to: UInt8.self, capacity: byteCount)
         for i in 0..<byteCount {
             state ^= state << 13
@@ -50,16 +52,19 @@ private func fillNonZeroData(buffer: UnsafeMutableRawPointer, byteCount: Int, da
             ptr[i] = (state & 1) != 0 ? 0xB0 : 0x30
         }
     } else if dataType == .float16 {
-        // Random-sign, magnitude 1/32 (FP16 0x2800 = +0.03125, 0xA800 = -0.03125).
+        // Xavier/Glorot scaling: weights/inputs initialized with given magnitude.
         // Deterministic xorshift64 avoids symmetric 4-element zero-canceling reductions
         // and maintains stable activation magnitude (~1.0) across 20 chained conv/matmul layers.
+        let val = Float16(magnitude)
+        let posBits = val.bitPattern
+        let negBits = posBits | 0x8000
         let ptr = buffer.bindMemory(to: UInt16.self, capacity: byteCount / 2)
         let count = byteCount / 2
         for i in 0..<count {
             state ^= state << 13
             state ^= state >> 7
             state ^= state << 17
-            ptr[i] = (state & 1) != 0 ? 0xA800 : 0x2800
+            ptr[i] = (state & 1) != 0 ? negBits : posBits
         }
     } else {
         // INT8: Deterministic pseudo-random non-canceling signs {-1, 1}
@@ -102,11 +107,11 @@ private func countZeroElements(buffer: UnsafeMutableRawPointer, elementCount: In
     }
 }
 
-private func createNonZeroData(byteCount: Int, dataType: MPSDataType) -> Data {
+private func createNonZeroData(byteCount: Int, dataType: MPSDataType, magnitude: Float = 1.0) -> Data {
     var data = Data(count: byteCount)
     data.withUnsafeMutableBytes { rawBuf in
         if let baseAddress = rawBuf.baseAddress {
-            fillNonZeroData(buffer: baseAddress, byteCount: byteCount, dataType: dataType, seed: 0x5EED5EED5EED5EED)
+            fillNonZeroData(buffer: baseAddress, byteCount: byteCount, dataType: dataType, magnitude: magnitude, seed: 0x5EED5EED5EED5EED)
         }
     }
     return data
@@ -188,49 +193,93 @@ final class ANECapacityEngine {
         let outputBufferLen: Int
         let outShape: [NSNumber]
         
+        let spatialH: Int
+        let spatialW: Int
+        
         if dims.opType == .matmul {
+            // MatMul (GEMM: [B, M, K] x [B, K, N] -> [B, M, N]) is mapped as a 1x1 2D Convolution on ANE:
+            //   Input:   [B, K, H, W] where H * W = M
+            //   Weights: [N, K, 1, 1]
+            //   Output:  [B, N, H, W]
+            //
+            // Rationale:
+            // 1. Physical ANE MAC array aligns to 64-wide channels and executes reduction across Cin (K),
+            //    not spatial dimensions.
+            // 2. Spatial tile (H, W) divides M into power-of-2 2D spatial coordinates (e.g. 1024 -> 32x32),
+            //    completely avoiding the degenerate C=1 layout failure that causes 100% zero outputs on device.
+            // 3. MPSGraph recognizes [N, K, 1, 1] as standard OIHW weights layout, enabling full native
+            //    W8A8 FP8 QDQ compilation to ANE binary_0.hwx on H18 and H19 with ZERO GPU fallback.
+            let sW = 1 << ((Int(floor(log2(Double(dims.m))))) / 2)
+            let sH = dims.m / sW
+            spatialH = sH
+            spatialW = sW
+            
             inShape = [
                 NSNumber(value: dims.batch),
-                NSNumber(value: dims.m),
-                NSNumber(value: dims.k)
+                NSNumber(value: dims.k),
+                NSNumber(value: spatialH),
+                NSNumber(value: spatialW)
             ]
             let wShape: [NSNumber] = [
-                NSNumber(value: dims.batch),
+                NSNumber(value: dims.n),
                 NSNumber(value: dims.k),
-                NSNumber(value: dims.n)
+                1,
+                1
             ]
             
             input = graph.placeholder(shape: inShape, dataType: mpsType, name: "in")
             cur = input
             
+            guard let d = MPSGraphConvolution2DOpDescriptor(
+                strideInX: 1,
+                strideInY: 1,
+                dilationRateInX: 1,
+                dilationRateInY: 1,
+                groups: 1,
+                paddingStyle: .TF_SAME,
+                dataLayout: .NCHW,
+                weightsLayout: .OIHW
+            ) else {
+                throw BenchmarkError.graphCompilationFailed("Invalid convolution descriptor for 1x1 GEMM")
+            }
+            
+            let weightMag = Float(1.0 / sqrt(Double(max(dims.k, 1))))
+            
             if precision.isFP8 {
                 guard #available(iOS 27.0, macOS 27.0, *) else {
                     throw BenchmarkError.executionFailed("FP8 requires iOS 27.0 / macOS 27.0 or newer.")
                 }
-                let fp8Scale: Double = 1.0
-                let wLength = dims.batch * dims.k * dims.n * 1
+                let wLength = dims.n * dims.k * 1 * 1 * 1
                 let wData = createNonZeroData(byteCount: wLength, dataType: mpsType)
                 let wFP8 = graph.constant(wData, shape: wShape, dataType: mpsType)
-                let w = graph.dequantize(wFP8, scale: fp8Scale, zeroPoint: 0.0, dataType: .float16, name: "w_dequant")
                 
+                // Full W8A8 QDQ: Unit scale 1.0 prevents ANE dynamic placeholder dequantizer underflow
+                let fp8Scale: Double = 1.0
+                let w = graph.dequantize(wFP8, scale: fp8Scale, zeroPoint: 0.0, dataType: .float16, name: "w_dequant")
                 for _ in 0..<dims.layers {
                     let lhs = graph.dequantize(cur, scale: fp8Scale, zeroPoint: 0.0, dataType: .float16, name: "act_dequant")
-                    let outFP16 = graph.matrixMultiplication(primary: lhs, secondary: w, name: nil)
+                    let outFP16 = graph.convolution2D(lhs, weights: w, descriptor: d, name: nil)
                     cur = graph.quantize(outFP16, scale: fp8Scale, zeroPoint: 0.0, dataType: mpsType, name: "act_quant")
                 }
-            } else {
-                let wLength = dims.batch * dims.k * dims.n * 2
-                let wData = createNonZeroData(byteCount: wLength, dataType: .float16)
+            } else if mpsType == .int8 && target != .ane {
+                let wLength = dims.n * dims.k * 1 * 1 * 2
+                let wData = createNonZeroData(byteCount: wLength, dataType: .float16, magnitude: weightMag)
                 let w = graph.constant(wData, shape: wShape, dataType: .float16)
+                for _ in 0..<dims.layers {
+                    let lhs = graph.cast(cur, to: .float16, name: "dequant")
+                    let outFP16 = graph.convolution2D(lhs, weights: w, descriptor: d, name: nil)
+                    cur = graph.cast(outFP16, to: .int8, name: "requant")
+                }
+            } else {
+                let wLength = dims.n * dims.k * 1 * 1 * elementSize
+                let wData = createNonZeroData(byteCount: wLength, dataType: mpsType, magnitude: weightMag)
+                let w = graph.constant(wData, shape: wShape, dataType: mpsType)
                 
                 for _ in 0..<dims.layers {
-                    var lhs = cur
+                    cur = graph.convolution2D(cur, weights: w, descriptor: d, name: nil)
                     if mpsType == .int8 {
-                        lhs = graph.cast(cur, to: .float16, name: "dequant")
-                    }
-                    cur = graph.matrixMultiplication(primary: lhs, secondary: w, name: nil)
-                    if mpsType == .int8 {
-                        cur = graph.cast(cur, to: .int8, name: "requant")
+                        let fp = graph.cast(cur, to: .float16, name: "dequant")
+                        cur = graph.cast(fp, to: .int8, name: "requant")
                     }
                 }
             }
@@ -238,10 +287,13 @@ final class ANECapacityEngine {
             outputBufferLen = dims.batch * dims.m * dims.n * elementSize
             outShape = [
                 NSNumber(value: dims.batch),
-                NSNumber(value: dims.m),
-                NSNumber(value: dims.n)
+                NSNumber(value: dims.n),
+                NSNumber(value: spatialH),
+                NSNumber(value: spatialW)
             ]
         } else {
+            spatialH = dims.height
+            spatialW = dims.width
             inShape = [
                 NSNumber(value: dims.batch),
                 NSNumber(value: dims.inChannels),
@@ -271,16 +323,20 @@ final class ANECapacityEngine {
                 throw BenchmarkError.graphCompilationFailed("Invalid convolution descriptor")
             }
             
+            let convReductionLen = dims.inChannels * dims.kernelSize * dims.kernelSize
+            let weightMag = Float(1.0 / sqrt(Double(max(convReductionLen, 1))))
+            
             if precision.isFP8 {
                 guard #available(iOS 27.0, macOS 27.0, *) else {
                     throw BenchmarkError.executionFailed("FP8 requires iOS 27.0 / macOS 27.0 or newer.")
                 }
-                let fp8Scale: Double = 1.0
                 let wLength = dims.outChannels * dims.inChannels * dims.kernelSize * dims.kernelSize * 1
                 let wData = createNonZeroData(byteCount: wLength, dataType: mpsType)
                 let wFP8 = graph.constant(wData, shape: wShape, dataType: mpsType)
-                let w = graph.dequantize(wFP8, scale: fp8Scale, zeroPoint: 0.0, dataType: .float16, name: "w_dequant")
                 
+                // Full W8A8 QDQ: Unit scale 1.0 prevents ANE dynamic placeholder dequantizer underflow
+                let fp8Scale: Double = 1.0
+                let w = graph.dequantize(wFP8, scale: fp8Scale, zeroPoint: 0.0, dataType: .float16, name: "w_dequant")
                 for _ in 0..<dims.layers {
                     let actFP16 = graph.dequantize(cur, scale: fp8Scale, zeroPoint: 0.0, dataType: .float16, name: "act_dequant")
                     let outFP16 = graph.convolution2D(actFP16, weights: w, descriptor: d, name: nil)
@@ -297,7 +353,7 @@ final class ANECapacityEngine {
                 // path already uses below: dequantize activations to FP16,
                 // convolve in FP16 with FP16 weights, requantize the output.
                 let wLength = dims.outChannels * dims.inChannels * dims.kernelSize * dims.kernelSize * 2
-                let wData = createNonZeroData(byteCount: wLength, dataType: .float16)
+                let wData = createNonZeroData(byteCount: wLength, dataType: .float16, magnitude: weightMag)
                 let w = graph.constant(wData, shape: wShape, dataType: .float16)
 
                 for _ in 0..<dims.layers {
@@ -308,7 +364,7 @@ final class ANECapacityEngine {
             } else {
                 // Constant weights
                 let wLength = dims.outChannels * dims.inChannels * dims.kernelSize * dims.kernelSize * elementSize
-                let wData = createNonZeroData(byteCount: wLength, dataType: mpsType)
+                let wData = createNonZeroData(byteCount: wLength, dataType: mpsType, magnitude: weightMag)
                 let w = graph.constant(wData, shape: wShape, dataType: mpsType)
 
                 // Chain L layers
@@ -466,17 +522,29 @@ final class ANECapacityEngine {
                 let bundleURL = URL(fileURLWithPath: tempDir)
                 logHandler("   [PMU] Found ANE microcode bundle: \(bundleURL.lastPathComponent)")
                 
-                let pmuRes = ANEClientBridge.profileANECIRBundle(
-                    at: bundleURL,
-                    batch: UInt(dims.batch),
-                    height: UInt(dims.height),
-                    width: UInt(dims.width),
-                    inChannels: UInt(dims.inChannels),
-                    outChannels: UInt(dims.outChannels),
-                    dataType: mpsType,
-                    iterations: UInt(iterations),
-                    totalMacs: dims.totalOperations / 2.0
-                )
+                let pmuRes = (dims.opType == .matmul)
+                    ? ANEClientBridge.profileANECIRBundle(
+                        at: bundleURL,
+                        batch: UInt(dims.batch),
+                        height: UInt(spatialH),
+                        width: UInt(spatialW),
+                        inChannels: UInt(dims.k),
+                        outChannels: UInt(dims.n),
+                        dataType: mpsType,
+                        iterations: UInt(iterations),
+                        totalMacs: dims.totalOperations / 2.0
+                    )
+                    : ANEClientBridge.profileANECIRBundle(
+                        at: bundleURL,
+                        batch: UInt(dims.batch),
+                        height: UInt(dims.height),
+                        width: UInt(dims.width),
+                        inChannels: UInt(dims.inChannels),
+                        outChannels: UInt(dims.outChannels),
+                        dataType: mpsType,
+                        iterations: UInt(iterations),
+                        totalMacs: dims.totalOperations / 2.0
+                    )
                 
                 if pmuRes.success && !pmuRes.performanceCounterDeltasPerIter.isEmpty {
                     for (k, v) in pmuRes.performanceCounterDeltasPerIter {
@@ -493,9 +561,9 @@ final class ANECapacityEngine {
                     chipMacsPerCycle = pmuRes.chipMacsPerCycle
                     aluSaturation = (precision == .int8) ? pmuRes.aluSaturationInt8 : pmuRes.aluSaturationFp16
                     effectiveClockGhz = pmuRes.effectiveCoreClockGhz
-                    if pmuRes.topsRealized > 0 {
-                        tops = pmuRes.topsRealized
-                    }
+                    // Note: do not overwrite `tops` with `pmuRes.topsRealized`.
+                    // `tops` is measured from real end-to-end timed iterations of the graph executable,
+                    // whereas `pmuRes.topsRealized` evaluates an isolated microcode bundle with synthetic timing.
                     
                     let pmuSummary = String(
                         format: "   └─ PMU: Compute=+%@, Stalls=+%@, DMA=+%@, ALU Saturation=%.1f%%, Clock=%.2f GHz",

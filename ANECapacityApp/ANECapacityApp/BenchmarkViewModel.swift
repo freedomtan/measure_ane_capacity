@@ -26,7 +26,7 @@ final class BenchmarkViewModel: ObservableObject {
     @Published var selectedSweep: SweepType = .channels
     
     // Custom sweep ranges
-    @Published var customChannelSteps: [Int] = [32, 64, 128, 256, 512, 1024]
+    @Published var customChannelSteps: [Int] = [32, 64, 128, 256, 384, 512]
     @Published var customSpatialSteps: [Int] = [64, 128, 256, 384, 512, 768]
     @Published var customDepthSteps: [Int] = [1, 5, 10, 20, 30, 40]
     @Published var customMatMulSteps: [Int] = [128, 256, 512, 1024, 2048]
@@ -63,7 +63,7 @@ final class BenchmarkViewModel: ObservableObject {
     
     #if targetEnvironment(simulator)
     private func loadSampleResults() {
-        let channelSteps = [32, 64, 128, 256, 512, 1024]
+        let channelSteps = [32, 64, 128, 256, 384, 512]
         let fp16Tops = [3.12, 6.84, 11.45, 14.82, 15.61, 15.84]
         let int8Tops = [6.24, 13.52, 22.81, 29.64, 31.22, 31.85]
         
@@ -112,11 +112,34 @@ final class BenchmarkViewModel: ObservableObject {
                 aluSaturation: min(95.2, 32.0 + Double(i) * 12.2),
                 effectiveClockGhz: 1.82
             ))
+            
+            // FP8 Full QDQ: Throughput is situated directly between FP16 and INT8
+            let fp8Tops = [4.80, 10.20, 17.50, 22.80, 24.10, 24.80][i]
+            let fp8DurSec = ops / (fp8Tops * 1e12)
+            results.append(BenchmarkResult(
+                dimensions: dims,
+                precision: .fp8,
+                target: .ane,
+                avgDurationMs: fp8DurSec * 1000.0,
+                tops: fp8Tops,
+                iterations: 20,
+                sweepType: .channels,
+                sweepValue: Double(c),
+                sweepLabel: "\(c)c",
+                computeCycles: UInt64(Double(c) * 3950 + 110_000),
+                nominalCycles: UInt64(Double(c) * 4300 + 120_000),
+                outputStallCycles: UInt64(13_500 + i * 7_000),
+                inputStallCycles: UInt64(9_000 + i * 4_500),
+                dmaRwBytes: UInt64(dims.weightsBytes(precision: .fp8) + dims.inputBytes(precision: .fp8)),
+                aluSaturation: min(94.8, 31.0 + Double(i) * 12.3),
+                effectiveClockGhz: 1.81
+            ))
         }
 
         let matmulSteps = [128, 256, 512, 1024, 2048]
         let matmulFp16Tops = [2.85, 6.40, 12.10, 15.30, 15.90]
         let matmulInt8Tops = [5.60, 12.80, 24.10, 30.50, 31.80]
+        let matmulFp8Tops = [4.20, 9.60, 18.20, 23.40, 24.20]
         
         for (i, sz) in matmulSteps.enumerated() {
             let dims = ConvDimensions(opType: .matmul, batch: 1, layers: 20, m: sz, k: sz, n: sz)
@@ -163,6 +186,27 @@ final class BenchmarkViewModel: ObservableObject {
                 aluSaturation: min(96.0, 30.0 + Double(i) * 13.0),
                 effectiveClockGhz: 1.82
             ))
+            
+            let f8Tops = matmulFp8Tops[i]
+            let f8DurSec = ops / (f8Tops * 1e12)
+            results.append(BenchmarkResult(
+                dimensions: dims,
+                precision: .fp8,
+                target: .ane,
+                avgDurationMs: f8DurSec * 1000.0,
+                tops: f8Tops,
+                iterations: 20,
+                sweepType: .matmulDimensions,
+                sweepValue: Double(sz),
+                sweepLabel: "\(sz)",
+                computeCycles: UInt64(Double(sz) * 3350 + 75_000),
+                nominalCycles: UInt64(Double(sz) * 3650 + 85_000),
+                outputStallCycles: UInt64(9_000 + i * 4_500),
+                inputStallCycles: UInt64(7_000 + i * 3_500),
+                dmaRwBytes: UInt64(dims.weightsBytes(precision: .fp8) + dims.inputBytes(precision: .fp8)),
+                aluSaturation: min(95.5, 29.0 + Double(i) * 13.0),
+                effectiveClockGhz: 1.81
+            ))
         }
     }
     #endif
@@ -177,7 +221,7 @@ final class BenchmarkViewModel: ObservableObject {
     }
     
     var peakFP8TOPS: Double {
-        results.filter { $0.precision == .fp8 }.map(\.tops).max() ?? 0.0
+        results.filter { $0.precision.isFP8 }.map(\.tops).max() ?? 0.0
     }
     
     var speedupRatio: Double? {
@@ -195,6 +239,7 @@ final class BenchmarkViewModel: ObservableObject {
         if consoleLogs.count > 500 {
             consoleLogs.removeFirst(100)
         }
+        NSLog("%@", formatted)
     }
     
     func clearLogs() {
@@ -302,6 +347,16 @@ final class BenchmarkViewModel: ObservableObject {
                 d.outChannels = ch
                 points.append(SweepPoint(dims: d, value: Double(ch), label: "\(ch)"))
             }
+        case .sramResident:
+            // Fixed H=W=64 to keep activation buffers strictly resident in ANE on-chip SRAM cache
+            for ch in customChannelSteps {
+                var d = dimensions
+                d.height = 64
+                d.width = 64
+                d.inChannels = ch
+                d.outChannels = ch
+                points.append(SweepPoint(dims: d, value: Double(ch), label: "\(ch)c"))
+            }
         case .spatial:
             for sz in customSpatialSteps {
                 var d = dimensions
@@ -323,7 +378,7 @@ final class BenchmarkViewModel: ObservableObject {
             }
         case .fullCapacity:
             // Comprehensive sweep across channels with fixed H=256, W=256, K=3, L=20
-            for ch in [32, 64, 128, 256, 512, 1024] {
+            for ch in [32, 64, 128, 256, 384, 512] {
                 var d = ConvDimensions(opType: .conv2d, batch: 1, height: 256, width: 256, inChannels: ch, outChannels: ch, kernelSize: 3, layers: 20)
                 points.append(SweepPoint(dims: d, value: Double(ch), label: "\(ch)c"))
             }
