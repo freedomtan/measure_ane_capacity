@@ -207,6 +207,25 @@ It systematically evaluates 5 distinct quantization patterns on Apple Silicon ($
 > [!NOTE]
 > **Key Architectural Insight**: In MPSGraph, **True W8A8 QDQ (Pattern 2)** allows the Apple ANE compiler to fuse the operations directly into native INT8 execution, matching Native INT8 convolution (~36.5 TOPS) and CoreML MIL INT8 (~34.7 TOPS) clock-for-clock. Furthermore, while native INT8 convolution is unsupported on Metal GPU, all QDQ patterns run gracefully on GPU at full FP16 compute capacity (~9.8 TOPS).
 
+### FP8 (Float8E4M3) QDQ Benchmarks & HWX Converter
+FP8 benchmarks evaluate 8-bit floating-point Quantize-Dequantize execution across Metal GPU and Apple Neural Engine (`measure_conv_fp8`, `measure_matmul_fp8`), and provide offline compilation to native ANE Mach-O `.hwx` binaries (`convert_fp8_to_hwx`).
+
+> For an in-depth reference covering mathematical stability, the decoupled scale pattern ($2^{-1}$ physical vs $2^{-5}$ logical), zero-skip detection, and per-generation ANE support (H13–H19), see the [**FP8 Benchmarking & ANE Architecture Guide**](docs/FP8_BENCHMARKING_AND_ANE_ARCHITECTURE.md).
+
+```bash
+# Build FP8 tools
+make measure_conv_fp8 measure_matmul_fp8 convert_fp8_to_hwx
+
+# Run FP8 convolution benchmark
+./measure_conv_fp8
+
+# Run FP8 GEMM benchmark
+./measure_matmul_fp8
+
+# Offline compile FP8 QDQ graph to ANE .hwx for H19 (A20 Pro)
+./convert_fp8_to_hwx --arch h19 --layers 20 --output hwx_output
+```
+
 ### Advanced Silicon PMU Profiler & MPSGraphPackage Exporter (`measure_ane_pmu`)
 `measure_ane_pmu` provides deep physical hardware profiling for Apple Neural Engine via `_ANEClient` performance statistics, comparing FP16, INT8, QDQ, and GPU baselines while exporting self-contained `.mpsgraphpackage` bundles.
 
