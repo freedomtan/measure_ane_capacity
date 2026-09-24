@@ -29,7 +29,7 @@ final class BenchmarkViewModel: ObservableObject {
     @Published var customChannelSteps: [Int] = [32, 64, 128, 256, 384, 512]
     @Published var customSpatialSteps: [Int] = [64, 128, 256, 384, 512, 768]
     @Published var customDepthSteps: [Int] = [1, 5, 10, 20, 40, 60, 80, 100]
-    @Published var customMatMulSteps: [Int] = [128, 256, 512, 1024, 2048, 4096]
+    @Published var customMatMulSteps: [Int] = [128, 256, 512, 1024, 2048, 4096, 8192]
     
     // Benchmark execution state
     @Published var isRunning: Bool = false
@@ -136,10 +136,10 @@ final class BenchmarkViewModel: ObservableObject {
             ))
         }
 
-        let matmulSteps = [128, 256, 512, 1024, 2048, 4096]
-        let matmulFp16Tops = [2.85, 6.40, 12.10, 15.30, 15.90, 16.20]
-        let matmulInt8Tops = [5.60, 12.80, 24.10, 30.50, 31.80, 32.50]
-        let matmulFp8Tops = [4.20, 9.60, 18.20, 23.40, 24.20, 24.80]
+        let matmulSteps = [128, 256, 512, 1024, 2048, 4096, 8192]
+        let matmulFp16Tops = [2.85, 6.40, 12.10, 15.30, 15.90, 16.20, 16.40]
+        let matmulInt8Tops = [5.60, 12.80, 24.10, 30.50, 31.80, 32.50, 33.10]
+        let matmulFp8Tops = [4.20, 9.60, 18.20, 23.40, 24.20, 24.80, 25.20]
         
         for (i, sz) in matmulSteps.enumerated() {
             let dims = ConvDimensions(opType: .matmul, batch: 1, layers: 20, m: sz, k: sz, n: sz)
@@ -370,6 +370,19 @@ final class BenchmarkViewModel: ObservableObject {
                 d.layers = layers
                 points.append(SweepPoint(dims: d, value: Double(layers), label: "L=\(layers)"))
             }
+        case .pointwiseDepth:
+            // Fixed K=1, H=W=64, C=512 to keep working set strictly resident in ANE L2 SRAM
+            // and eliminate spatial reduction bubbles (bridges FP8 to INT8 parity)
+            for layers in customDepthSteps {
+                var d = dimensions
+                d.kernelSize = 1
+                d.height = 64
+                d.width = 64
+                d.inChannels = 512
+                d.outChannels = 512
+                d.layers = layers
+                points.append(SweepPoint(dims: d, value: Double(layers), label: "L=\(layers)"))
+            }
         case .kernels:
             for k in [1, 3, 5] {
                 var d = dimensions
@@ -397,6 +410,17 @@ final class BenchmarkViewModel: ObservableObject {
                 d.opType = .matmul
                 d.layers = layers
                 points.append(SweepPoint(dims: d, value: Double(layers), label: "L=\(layers)"))
+            }
+        case .matmulAsymmetric:
+            // High-intensity rectangular GEMM: Keep K=N=1024 (1MB weights), scale M=512..8192
+            // Total working set stays under 17MB (100% resident in L2 SRAM) with zero DRAM spills
+            for m in [512, 1024, 2048, 4096, 8192] {
+                var d = dimensions
+                d.opType = .matmul
+                d.m = m
+                d.k = 1024
+                d.n = 1024
+                points.append(SweepPoint(dims: d, value: Double(m), label: "M=\(m)"))
             }
         }
         

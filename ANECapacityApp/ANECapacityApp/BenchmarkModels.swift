@@ -83,10 +83,12 @@ enum SweepType: String, CaseIterable, Identifiable, Codable {
     case sramResident = "ANE SRAM-Resident Sweep (H=W=64)"
     case spatial = "Spatial Dimension (H=W) Sweep"
     case depth = "Chained Layer Depth Sweep"
+    case pointwiseDepth = "Pointwise Depth Sweep (K=1, H=W=64)"
     case kernels = "Kernel Size Sweep (1x1 vs 3x3)"
     case fullCapacity = "Full Capacity Comparison"
     case matmulDimensions = "Matrix Dimension (M=K=N) Sweep"
     case matmulDepth = "GEMM Chained Depth Sweep"
+    case matmulAsymmetric = "Rectangular Matrix Sweep (K=N=1024)"
     
     var id: String { rawValue }
     
@@ -97,10 +99,12 @@ enum SweepType: String, CaseIterable, Identifiable, Codable {
         case .sramResident: return "Channels (Ci = Co, H=W=64)"
         case .spatial: return "Spatial Resolution (H = W)"
         case .depth: return "Chained Layers (L)"
+        case .pointwiseDepth: return "Chained Layers (L, K=1)"
         case .kernels: return "Kernel Size (KxK)"
         case .fullCapacity: return "Channels (Ci = Co)"
         case .matmulDimensions: return "Matrix Size (M=K=N)"
         case .matmulDepth: return "Chained Layers (L)"
+        case .matmulAsymmetric: return "Matrix Row Dimension (M)"
         }
     }
 }

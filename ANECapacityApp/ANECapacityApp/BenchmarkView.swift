@@ -128,9 +128,9 @@ struct BenchmarkView: View {
     // MARK: - Preset Sweeps Card
     private var availableSweepsForCurrentOp: [SweepType] {
         if viewModel.selectedOperation == .matmul {
-            return [.matmulDimensions, .matmulDepth]
+            return [.matmulDimensions, .matmulDepth, .matmulAsymmetric]
         } else {
-            return [.channels, .sramResident, .spatial, .depth, .kernels, .fullCapacity]
+            return [.channels, .sramResident, .spatial, .depth, .pointwiseDepth, .kernels, .fullCapacity]
         }
     }
     
@@ -179,10 +179,12 @@ struct BenchmarkView: View {
         case .sramResident: return "Fixed H=W=64, sweeps C = 32..512 (Activations stay 100% inside ANE L2 SRAM)"
         case .spatial: return "Sweeps H=W = 64, 128, 256, 384, 512, 768 (Tests bandwidth scaling)"
         case .depth: return "Sweeps L = 1, 5, 10, 20, 40, 60, 80, 100 (Measures dispatch latency amortization)"
+        case .pointwiseDepth: return "Fixed K=1, H=W=64, C=512, sweeps L=1..100 (Bypasses spatial reduction, tests pure FP8/INT8 MAC throughput)"
         case .kernels: return "Tests K=1x1 (GEMM) vs K=3x3 vs K=5x5 (2D Spatial Conv)"
         case .fullCapacity: return "Evaluates FP16 and INT8 across all major tensor footprints"
         case .matmulDimensions: return "Sweeps M=K=N = 128, 256, 512, 1024, 2048, 4096 (Tests dense GEMM array scaling)"
         case .matmulDepth: return "Sweeps L = 1, 5, 10, 20, 40, 60, 80, 100 (Measures GEMM pipeline latency amortization)"
+        case .matmulAsymmetric: return "Fixed K=N=1024, sweeps M=512..8192 (High arithmetic intensity, fits 100% in L2 SRAM)"
         }
     }
     
@@ -212,7 +214,7 @@ struct BenchmarkView: View {
                             .fontWeight(.bold)
                     }
                     Picker("M", selection: $viewModel.dimensions.m) {
-                        ForEach([128, 256, 512, 1024, 2048, 4096], id: \.self) { val in
+                        ForEach([128, 256, 512, 1024, 2048, 4096, 8192], id: \.self) { val in
                             Text("\(val)").tag(val)
                         }
                     }

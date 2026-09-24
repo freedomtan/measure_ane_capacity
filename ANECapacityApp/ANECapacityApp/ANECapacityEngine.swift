@@ -43,13 +43,16 @@ private func fillNonZeroData(
     guard byteCount > 0 else { return }
     var state = seed
     if dataType.rawValue == 0x10430008 { // Float8e4m3
-        // Random-sign, physical magnitude 0.5 (E4M3 0x30 = +0.5, 0xB0 = -0.5).
+        // Multi-tier physical magnitudes [0.25, 0.5, 0.75, 1.0] to break symmetric binomial zero cancellation
+        let posTiers: [UInt8] = [0x28, 0x30, 0x38, 0x40]
+        let negTiers: [UInt8] = [0xA8, 0xB0, 0xB8, 0xC0]
         let ptr = buffer.bindMemory(to: UInt8.self, capacity: byteCount)
         for i in 0..<byteCount {
             state ^= state << 13
             state ^= state >> 7
             state ^= state << 17
-            ptr[i] = (state & 1) != 0 ? 0xB0 : 0x30
+            let tier = Int((state >> 1) & 3)
+            ptr[i] = (state & 1) != 0 ? negTiers[tier] : posTiers[tier]
         }
     } else if dataType == .float16 {
         // Multi-tier non-zero dithering breaks binomial zero-cancellation at L=1
@@ -68,13 +71,14 @@ private func fillNonZeroData(
             ptr[i] = (state & 1) != 0 ? negBits : posBits
         }
     } else {
-        // INT8: Deterministic pseudo-random non-canceling signs {-1, 1}
+        // INT8: Multi-tier non-zero pseudo-random magnitudes {±1, ±2, ±3, ±4} to break symmetric zero cancellation
         let ptr = buffer.bindMemory(to: Int8.self, capacity: byteCount)
         for i in 0..<byteCount {
             state ^= state << 13
             state ^= state >> 7
             state ^= state << 17
-            ptr[i] = (state & 1) != 0 ? -1 : 1
+            let tier: Int8 = Int8((state >> 1) & 3) + 1
+            ptr[i] = (state & 1) != 0 ? -tier : tier
         }
     }
 }
