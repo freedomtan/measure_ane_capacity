@@ -178,11 +178,11 @@ struct BenchmarkView: View {
         case .channels: return "Sweeps C = 32, 64, 128, 256, 384, 512 (Tests matrix array saturation)"
         case .sramResident: return "Fixed H=W=64, sweeps C = 32..512 (Activations stay 100% inside ANE L2 SRAM)"
         case .spatial: return "Sweeps H=W = 64, 128, 256, 384, 512, 768 (Tests bandwidth scaling)"
-        case .depth: return "Sweeps L = 1, 5, 10, 20, 30, 40 (Measures dispatch latency amortization)"
+        case .depth: return "Sweeps L = 1, 5, 10, 20, 40, 60, 80, 100 (Measures dispatch latency amortization)"
         case .kernels: return "Tests K=1x1 (GEMM) vs K=3x3 vs K=5x5 (2D Spatial Conv)"
         case .fullCapacity: return "Evaluates FP16 and INT8 across all major tensor footprints"
-        case .matmulDimensions: return "Sweeps M=K=N = 128, 256, 512, 1024, 2048 (Tests dense GEMM array scaling)"
-        case .matmulDepth: return "Sweeps L = 1, 5, 10, 20, 30, 40 (Measures GEMM pipeline latency amortization)"
+        case .matmulDimensions: return "Sweeps M=K=N = 128, 256, 512, 1024, 2048, 4096 (Tests dense GEMM array scaling)"
+        case .matmulDepth: return "Sweeps L = 1, 5, 10, 20, 40, 60, 80, 100 (Measures GEMM pipeline latency amortization)"
         }
     }
     
@@ -212,7 +212,7 @@ struct BenchmarkView: View {
                             .fontWeight(.bold)
                     }
                     Picker("M", selection: $viewModel.dimensions.m) {
-                        ForEach([128, 256, 512, 1024, 2048], id: \.self) { val in
+                        ForEach([128, 256, 512, 1024, 2048, 4096], id: \.self) { val in
                             Text("\(val)").tag(val)
                         }
                     }
@@ -230,7 +230,7 @@ struct BenchmarkView: View {
                             .fontWeight(.bold)
                     }
                     Picker("K", selection: $viewModel.dimensions.k) {
-                        ForEach([128, 256, 512, 1024, 2048], id: \.self) { val in
+                        ForEach([128, 256, 512, 1024, 2048, 4096], id: \.self) { val in
                             Text("\(val)").tag(val)
                         }
                     }
@@ -248,7 +248,7 @@ struct BenchmarkView: View {
                             .fontWeight(.bold)
                     }
                     Picker("N", selection: $viewModel.dimensions.n) {
-                        ForEach([128, 256, 512, 1024, 2048], id: \.self) { val in
+                        ForEach([128, 256, 512, 1024, 2048, 4096], id: \.self) { val in
                             Text("\(val)").tag(val)
                         }
                     }
@@ -266,7 +266,7 @@ struct BenchmarkView: View {
                             .fontWeight(.bold)
                     }
                     Picker("Layers", selection: $viewModel.dimensions.layers) {
-                        ForEach([1, 5, 10, 20, 30, 40], id: \.self) { l in
+                        ForEach([1, 5, 10, 20, 40, 60, 80, 100], id: \.self) { l in
                             Text("\(l)").tag(l)
                         }
                     }
@@ -330,7 +330,7 @@ struct BenchmarkView: View {
                             .fontWeight(.bold)
                     }
                     Picker("Layers", selection: $viewModel.dimensions.layers) {
-                        ForEach([1, 5, 10, 20, 30, 40], id: \.self) { l in
+                        ForEach([1, 5, 10, 20, 40, 60, 80, 100], id: \.self) { l in
                             Text("\(l)").tag(l)
                         }
                     }

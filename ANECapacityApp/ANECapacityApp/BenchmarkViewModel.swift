@@ -20,7 +20,7 @@ final class BenchmarkViewModel: ObservableObject {
     @Published var dimensions: ConvDimensions = ConvDimensions()
     @Published var selectedPrecision: PrecisionMode = .both
     @Published var selectedTarget: DeviceTarget = .ane
-    @Published var iterations: Int = 20
+    @Published var iterations: Int = 10
     
     // Sweep options
     @Published var selectedSweep: SweepType = .channels
@@ -28,8 +28,8 @@ final class BenchmarkViewModel: ObservableObject {
     // Custom sweep ranges
     @Published var customChannelSteps: [Int] = [32, 64, 128, 256, 384, 512]
     @Published var customSpatialSteps: [Int] = [64, 128, 256, 384, 512, 768]
-    @Published var customDepthSteps: [Int] = [1, 5, 10, 20, 30, 40]
-    @Published var customMatMulSteps: [Int] = [128, 256, 512, 1024, 2048]
+    @Published var customDepthSteps: [Int] = [1, 5, 10, 20, 40, 60, 80, 100]
+    @Published var customMatMulSteps: [Int] = [128, 256, 512, 1024, 2048, 4096]
     
     // Benchmark execution state
     @Published var isRunning: Bool = false
@@ -136,10 +136,10 @@ final class BenchmarkViewModel: ObservableObject {
             ))
         }
 
-        let matmulSteps = [128, 256, 512, 1024, 2048]
-        let matmulFp16Tops = [2.85, 6.40, 12.10, 15.30, 15.90]
-        let matmulInt8Tops = [5.60, 12.80, 24.10, 30.50, 31.80]
-        let matmulFp8Tops = [4.20, 9.60, 18.20, 23.40, 24.20]
+        let matmulSteps = [128, 256, 512, 1024, 2048, 4096]
+        let matmulFp16Tops = [2.85, 6.40, 12.10, 15.30, 15.90, 16.20]
+        let matmulInt8Tops = [5.60, 12.80, 24.10, 30.50, 31.80, 32.50]
+        let matmulFp8Tops = [4.20, 9.60, 18.20, 23.40, 24.20, 24.80]
         
         for (i, sz) in matmulSteps.enumerated() {
             let dims = ConvDimensions(opType: .matmul, batch: 1, layers: 20, m: sz, k: sz, n: sz)
