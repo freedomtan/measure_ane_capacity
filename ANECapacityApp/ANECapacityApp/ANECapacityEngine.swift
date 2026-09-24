@@ -52,18 +52,19 @@ private func fillNonZeroData(
             ptr[i] = (state & 1) != 0 ? 0xB0 : 0x30
         }
     } else if dataType == .float16 {
-        // Xavier/Glorot scaling: weights/inputs initialized with given magnitude.
-        // Deterministic xorshift64 avoids symmetric 4-element zero-canceling reductions
-        // and maintains stable activation magnitude (~1.0) across 20 chained conv/matmul layers.
-        let val = Float16(magnitude)
-        let posBits = val.bitPattern
-        let negBits = posBits | 0x8000
+        // Multi-tier non-zero dithering breaks binomial zero-cancellation at L=1
+        // and maintains bounded, non-overflowing variance across deep chains (L=100).
         let ptr = buffer.bindMemory(to: UInt16.self, capacity: byteCount / 2)
         let count = byteCount / 2
         for i in 0..<count {
             state ^= state << 13
             state ^= state >> 7
             state ^= state << 17
+            let tier = Float((state >> 1) & 3)
+            let mag = magnitude * (0.85 + tier * 0.10)
+            let val = Float16(mag)
+            let posBits = val.bitPattern
+            let negBits = posBits | 0x8000
             ptr[i] = (state & 1) != 0 ? negBits : posBits
         }
     } else {
@@ -243,7 +244,7 @@ final class ANECapacityEngine {
                 throw BenchmarkError.graphCompilationFailed("Invalid convolution descriptor for 1x1 GEMM")
             }
             
-            let weightMag = Float(1.0 / sqrt(Double(max(dims.k, 1))))
+            let weightMag = Float(0.96 / sqrt(Double(max(dims.k, 1))))
             
             if precision.isFP8 {
                 guard #available(iOS 27.0, macOS 27.0, *) else {
@@ -324,7 +325,7 @@ final class ANECapacityEngine {
             }
             
             let convReductionLen = dims.inChannels * dims.kernelSize * dims.kernelSize
-            let weightMag = Float(1.0 / sqrt(Double(max(convReductionLen, 1))))
+            let weightMag = Float(0.96 / sqrt(Double(max(convReductionLen, 1))))
             
             if precision.isFP8 {
                 guard #available(iOS 27.0, macOS 27.0, *) else {
