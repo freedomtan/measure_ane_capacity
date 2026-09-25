@@ -311,6 +311,15 @@ When `--save-package` is enabled, `measure_ane_pmu` serializes each variant into
 >
 > *(For an exhaustive breakdown of each register, see [`How_to_Interpret_measure_ane_pmu_Numbers.md`](docs/How_to_Interpret_measure_ane_pmu_Numbers.md).)*
 
+### Technical Documentation & Architecture Reports
+
+For in-depth microarchitectural investigations, register breakdowns, theoretical derivations, and empirical benchmark analyses across H18 and H19, consult:
+
+* [**`ANE_FP8_vs_INT8_FP16_Performance_Report.md`**](docs/ANE_FP8_vs_INT8_FP16_Performance_Report.md): Complete cross-precision performance analysis comparing FP8, FP16, and INT8 on iPhone 17 Pro (H18) and iPhone 18 Pro (H19). Explains why INT8 reaches **90.25 TOPS** via 1D Winograd, why FP16 hits **43.80 TFLOPS**, and why FP8 peaks at **55.41 TOPS** under the 1.87 GHz power clamp.
+* [**`ANE_H19_Theoretical_Peak_and_Winograd_FP8_Analysis.md`**](docs/ANE_H19_Theoretical_Peak_and_Winograd_FP8_Analysis.md): Mathematical derivation of theoretical compute ceilings for Dual 16-Core H19 (2130 MHz) and Single 16-Core H18 (2172 MHz), complete with binary disassembly proof from `ANECompiler.framework` establishing that 1D Winograd minimal filtering is explicitly prohibited on FP8 (`e4_m3`).
+* [**`How_to_Interpret_measure_ane_pmu_Numbers.md`**](docs/How_to_Interpret_measure_ane_pmu_Numbers.md): Guide to interpreting raw Apple Neural Engine silicon PMU hardware performance counters.
+* [**`FP8_BENCHMARKING_AND_ANE_ARCHITECTURE.md`**](docs/FP8_BENCHMARKING_AND_ANE_ARCHITECTURE.md): Technical guide to FP8 (Float8E4M3) Quantize-Dequantize (QDQ) execution in MPSGraph.
+
 ### Non-Zero Tensor Initialization (Required for H17 and Later)
 
 > [!IMPORTANT]
