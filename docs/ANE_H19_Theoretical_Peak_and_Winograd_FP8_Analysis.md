@@ -8,15 +8,15 @@
 
 ## Executive Summary
 
-Recent empirical benchmarks across the **iPhone 18 Pro (H19)** and **iPhone 17 Pro (H18)** show that **INT8 $3\times 3$ convolutions** substantially outperform raw matrix multiplication and FP8 direct operations:
-* **iPhone 18 Pro (H19):** Hits **90.25 TOPS** in INT8 ($3\times 3\text{ Conv}, H=W=64, L=80$), while FP8 reaches **54.10 TOPS** in $3\times 3$ and **50.33 TOPS** in GEMM.
-* **iPhone 17 Pro (H18):** Hits **41.29 TOPS** in INT8 ($3\times 3\text{ Conv}, L=20$), while FP8 reaches **29.01 TOPS**.
+Recent empirical benchmarks across the **iPhone 18 Pro (H19)** and **iPhone 17 Pro (H18)** show that **INT8 3×3 convolutions** substantially outperform raw matrix multiplication and FP8 direct operations:
+* **iPhone 18 Pro (H19):** Hits **90.25 TOPS** in INT8 (3×3 Conv, H=W=64, L=80), while FP8 reaches **54.10 TOPS** in 3×3 and **50.33 TOPS** in GEMM.
+* **iPhone 17 Pro (H18):** Hits **41.29 TOPS** in INT8 (3×3 Conv, L=20), while FP8 reaches **29.01 TOPS**.
 
-By integrating the exact peak ANE clock frequencies (**$2130\text{ MHz}$ for H19** and **$2172\text{ MHz}$ for H18**) with binary reverse engineering of Apple's `ANECompiler.framework`, the compute model resolves with cross-generational symmetry:
-1. **iPhone 18 Pro (H19, TSMC N2 @ 2130 MHz):** Dual 16-Core (32 cores total, $16,384\text{ MACs/cycle}$) has a raw physical MAC ceiling of **$69.80\text{ TOPS}$** and an effective 1D Winograd ($1.5\times$) ceiling of **$104.70\text{ TOPS}$**. Measured 90.25 TOPS INT8 represents **$86.2\%$ sustained efficiency**.
-2. **iPhone 17 Pro (H18, TSMC N3P @ 2172 MHz):** Single 16-Core ($8,192\text{ MACs/cycle}$) has a raw physical MAC ceiling of **$35.58\text{ TOPS}$** and an effective 1D Winograd ($1.5\times$) ceiling of **$53.38\text{ TOPS}$**. Measured 41.29 TOPS INT8 represents **$77.4\%$ sustained efficiency**.
-3. **Cross-Generational Proof of 1D Winograd:** Both H18 ($41.29 > 35.58$) and H19 ($90.25 > 69.80$) exceed their physical MAC limits in INT8 $3\times 3$, proving that both chips activate the $1.5\times$ 1D Winograd transform.
-4. **FP8 Hardware Boundary:** In both generations, FP8 is strictly capped below the physical MAC ceiling (H18: $29.01 < 35.58$; H19: $54.10 < 69.80$) because `ANECompiler` explicitly enforces `winograd1_d_en == 0` for `e4_m3`.
+By integrating the exact peak ANE clock frequencies (**2130 MHz for H19** and **2172 MHz for H18**) with binary reverse engineering of Apple's `ANECompiler.framework`, the compute model resolves with cross-generational symmetry:
+1. **iPhone 18 Pro (H19, TSMC N2 @ 2130 MHz):** Dual 16-Core (32 cores total, 16,384 MACs/cycle) has a raw physical MAC ceiling of **69.80 TOPS** and an effective 1D Winograd (1.5×) ceiling of **104.70 TOPS**. Measured 90.25 TOPS INT8 represents **86.2% sustained efficiency**.
+2. **iPhone 17 Pro (H18, TSMC N3P @ 2172 MHz):** Single 16-Core (8,192 MACs/cycle) has a raw physical MAC ceiling of **35.58 TOPS** and an effective 1D Winograd (1.5×) ceiling of **53.38 TOPS**. Measured 41.29 TOPS INT8 represents **77.4% sustained efficiency**.
+3. **Cross-Generational Proof of 1D Winograd:** Both H18 (41.29 > 35.58) and H19 (90.25 > 69.80) exceed their physical MAC limits in INT8 3×3, proving that both chips activate the 1.5× 1D Winograd transform.
+4. **FP8 Hardware Boundary:** In both generations, FP8 is strictly capped below the physical MAC ceiling (H18: 29.01 < 35.58; H19: 54.10 < 69.80) because `ANECompiler` explicitly enforces `winograd1_d_en == 0` for `e4_m3`.
 
 ---
 
@@ -24,48 +24,50 @@ By integrating the exact peak ANE clock frequencies (**$2130\text{ MHz}$ for H19
 
 The fundamental equation for ANE compute capacity is:
 
-$$\text{TOPS}_{\text{peak}} = 2 \times N_{\text{MACs/cycle}} \times f_{\text{clk}} \times 10^{-3}$$
+```math
+\text{TOPS}_{\text{peak}} = 2 \times N_{\text{MACs/cycle}} \times f_{\text{clk}} \times 10^{-3}
+```
 
 Where:
-* Factor of $2$: $1\text{ MAC} = 1\text{ Multiply} + 1\text{ Add} = 2\text{ Operations}$.
+* Factor of 2: 1 MAC = 1 Multiply + 1 Add = 2 Operations.
 
 ### 1.1 iPhone 18 Pro (H19 @ 2130 MHz)
-* **Core Count:** 2 clusters $\times$ 16 cores = **32 physical cores**.
-* **Physical MACs per Cycle:** $32 \text{ cores} \times 512 \text{ MACs/core} = \mathbf{16,384 \text{ MACs/cycle}}$.
-* **Physical Peak (Direct GEMM / $1\times 1$):**
-  $$\text{Physical Peak TOPS} = 2 \times 16,384 \times 2.130\text{ GHz} \times 10^{-3} = \mathbf{69.80\text{ TOPS}}$$
-* **Effective Peak with 1D Winograd ($1.5\times$ for $3\times 3$):**
-  $$\text{Effective Winograd Peak TOPS} = 69.798 \times 1.5 = \mathbf{104.70\text{ TOPS}}$$
+* **Core Count:** 2 clusters × 16 cores = **32 physical cores**.
+* **Physical MACs per Cycle:** 32 cores × 512 MACs/core = **16,384 MACs/cycle**.
+* **Physical Peak (Direct GEMM / 1×1 / FP8):**  
+  `2 × 16,384 MACs/cycle × 2.130 GHz × 10⁻³ =` **69.80 TOPS**
+* **Effective Peak with 1D Winograd (1.5× for 3×3 INT8):**  
+  `69.798 TOPS × 1.5 =` **104.70 TOPS** (24,576 effective MACs/cycle)
 
 ### 1.2 iPhone 17 Pro (H18 @ 2172 MHz)
-* **Core Count:** 1 cluster $\times$ 16 cores = **16 physical cores**.
-* **Physical MACs per Cycle:** $16 \text{ cores} \times 512 \text{ MACs/core} = \mathbf{8,192 \text{ MACs/cycle}}$.
-* **Physical Peak (Direct GEMM / $1\times 1$):**
-  $$\text{Physical Peak TOPS} = 2 \times 8,192 \times 2.172\text{ GHz} \times 10^{-3} = \mathbf{35.58\text{ TOPS}}$$
-* **Effective Peak with 1D Winograd ($1.5\times$ for $3\times 3$):**
-  $$\text{Effective Winograd Peak TOPS} = 35.585 \times 1.5 = \mathbf{53.38\text{ TOPS}}$$
+* **Core Count:** 1 cluster × 16 cores = **16 physical cores**.
+* **Physical MACs per Cycle:** 16 cores × 512 MACs/core = **8,192 MACs/cycle**.
+* **Physical Peak (Direct GEMM / 1×1 / FP8):**  
+  `2 × 8,192 MACs/cycle × 2.172 GHz × 10⁻³ =` **35.58 TOPS**
+* **Effective Peak with 1D Winograd (1.5× for 3×3 INT8):**  
+  `35.585 TOPS × 1.5 =` **53.38 TOPS** (12,288 effective MACs/cycle)
 
 ---
 
 ## 2. Empirical Performance & Cross-Generational Verification
 
 | Device & Workload | Measured TOPS | Physical MAC Ceiling | 1D Winograd Ceiling | Sustained Utilization | Operating Regime |
-| :--- | :--- | :--- | :--- | :--- | :--- |
-| **iPhone 18 Pro INT8 $3\times 3$** ($L=80$) | **90.25 TOPS** | 69.80 TOPS | **104.70 TOPS** | **86.2%** | L2 SRAM resident, Winograd 1D active |
-| **iPhone 18 Pro INT8 $3\times 3$** ($L=100$) | **88.29 TOPS** | 69.80 TOPS | **104.70 TOPS** | **84.3%** | DRAM spill (32MB tensor ping-pong) |
-| **iPhone 18 Pro FP8 $3\times 3$** ($L=100$) | **54.10 TOPS** | **69.80 TOPS** | 104.70 TOPS *(disabled)* | **77.5%** | Direct spatial MAC, Winograd barred |
-| **iPhone 18 Pro FP8 GEMM** ($M=4096$) | **50.33 TOPS** | **69.80 TOPS** | N/A | **72.1%** | Pure GEMM, no Winograd possible |
-| **iPhone 17 Pro INT8 $3\times 3$** ($L=20$) | **41.29 TOPS** | 35.58 TOPS | **53.38 TOPS** | **77.4%** | Peak boost (2172 MHz), Winograd 1D active |
-| **iPhone 17 Pro FP8 $3\times 3$** ($L=20$) | **29.01 TOPS** | **35.58 TOPS** | 53.38 TOPS *(disabled)* | **81.5%** | Direct spatial MAC, Winograd barred |
-| **iPhone 17 Pro FP16 $3\times 3$** ($L=20$) | **20.88 TFLOPS**| **35.58 TFLOPS** | 53.38 TFLOPS | **58.7%** | Native half-precision datapath |
+| :--- | :--- | :--- | :--- | :---: | :--- |
+| **iPhone 18 Pro INT8 3×3** (L=80) | **90.25 TOPS** | 69.80 TOPS | **104.70 TOPS** | **86.2%** | L2 SRAM resident, Winograd 1D active |
+| **iPhone 18 Pro INT8 3×3** (L=100) | **88.29 TOPS** | 69.80 TOPS | **104.70 TOPS** | **84.3%** | DRAM spill (32MB tensor ping-pong) |
+| **iPhone 18 Pro FP8 3×3** (L=100) | **54.10 TOPS** | **69.80 TOPS** | 104.70 TOPS *(disabled)* | **77.5%** | Direct spatial MAC, Winograd barred |
+| **iPhone 18 Pro FP8 GEMM** (M=4096) | **50.33 TOPS** | **69.80 TOPS** | N/A | **72.1%** | Pure GEMM, no Winograd possible |
+| **iPhone 17 Pro INT8 3×3** (L=20) | **41.29 TOPS** | 35.58 TOPS | **53.38 TOPS** | **77.4%** | Peak boost (2172 MHz), Winograd 1D active |
+| **iPhone 17 Pro FP8 3×3** (L=20) | **29.01 TOPS** | **35.58 TOPS** | 53.38 TOPS *(disabled)* | **81.5%** | Direct spatial MAC, Winograd barred |
+| **iPhone 17 Pro FP16 3×3** (L=20) | **20.88 TFLOPS**| **35.58 TFLOPS** | 53.38 TFLOPS | **58.7%** | Native half-precision datapath |
 
 ### Key Takeaways:
 1. **INT8 Exceeds Physical Silicon Limits:** 
-   * On iPhone 17 Pro, $41.29\text{ TOPS} > 35.58\text{ TOPS}$ physical ceiling ($+16.0\%$).
-   * On iPhone 18 Pro, $90.25\text{ TOPS} > 69.80\text{ TOPS}$ physical ceiling ($+29.3\%$).
-   Without 1D Winograd's $1.5\times$ algorithmic expansion, these numbers would violate the physical laws of the silicon clock and MAC array dimensions.
+   * On iPhone 17 Pro, **41.29 TOPS > 35.58 TOPS** physical ceiling (+16.0%).
+   * On iPhone 18 Pro, **90.25 TOPS > 69.80 TOPS** physical ceiling (+29.3%).
+   Without 1D Winograd's 1.5× algorithmic expansion, these numbers would violate the physical laws of the silicon clock and MAC array dimensions.
 2. **FP8 is Physically Capped:**
-   * On both chips, FP8 tracks the raw physical MAC ceiling closely ($77.5\%$ on H19, $81.5\%$ on H18) without ever breaching it.
+   * On both chips, FP8 tracks the raw physical MAC ceiling closely (77.5% on H19, 81.5% on H18) without ever breaching it.
 
 ---
 
@@ -112,10 +114,18 @@ The exclusion of FP8 from the 1D Winograd pipeline stems from fundamental algori
 
 ### 4.1 Numerical Catastrophic Cancellation (3-Bit Mantissa)
 Winograd filtering computes an algebraic linear pre-transform on data and weights before convolution:
-$$Y = A^T \left[ (G g G^T) \odot (B^T d B) \right] A$$
+
+```math
+Y = A^T \left[ (G g G^T) \odot (B^T d B) \right] A
+```
+
 For 1D Winograd $F(2,3)$, the transformation matrix involves addition and subtraction:
-$$B^T = \begin{bmatrix} 1 & 0 & -1 & 0 \\ 0 & 1 & 1 & 0 \\ 0 & -1 & 1 & 0 \\ 0 & 1 & 0 & -1 \end{bmatrix}$$
-* **Mantissa Precision:** FP8 E4M3 possesses only **3 bits of mantissa** (a relative resolution step of $\sim 12.5\%$).
+
+```math
+B^T = \begin{bmatrix} 1 & 0 & -1 & 0 \\ 0 & 1 & 1 & 0 \\ 0 & -1 & 1 & 0 \\ 0 & 1 & 0 & -1 \end{bmatrix}
+```
+
+* **Mantissa Precision:** FP8 E4M3 possesses only **3 bits of mantissa** (a relative resolution step of ~12.5%).
 * **Dynamic Range Expansion:** Computing $(d_1 - d_3)$ or $(d_2 + d_3)$ in low-precision float without higher internal guard bits causes immediate exponent misalignment, round-off error amplification, and catastrophic cancellation. In deep networks ($L \ge 20$), this produces cascading numerical divergence.
 
 ### 4.2 Fixed-Function Activation Feeder Crossbars
@@ -127,31 +137,24 @@ The ANE Activation Feeder contains dedicated hardware transform crossbars that p
 
 ## 5. Architectural Comparison: H18 vs. H19
 
-```
-+--------------------------------------------------------------------------------------------------+
-|                                    APPLE NEURAL ENGINE CLUSTERS                                  |
-+-------------------------------------------------+------------------------------------------------+
-|             Apple H18 (iPhone 17 Pro)           |            Apple H19 (iPhone 18 Pro)           |
-|                     TSMC N3P                    |                     TSMC N2                    |
-+-------------------------------------------------+------------------------------------------------+
-|  Cluster Architecture: Single 16-Core           |  Cluster Architecture: Dual 16-Core (32 Cores) |
-|  Peak ANE Frequency:   2172 MHz                 |  Peak ANE Frequency:   2130 MHz                |
-|  Physical MACs/Cycle:  8,192 MACs/cycle         |  Physical MACs/Cycle:  16,384 MACs/cycle       |
-|  Physical MAC Ceiling: 35.58 TOPS               |  Physical MAC Ceiling: 69.80 TOPS              |
-|  Winograd 1D Ceiling:  53.38 TOPS (INT8) / 26.69 (FP16) |  Winograd 1D Ceiling:  104.70 TOPS (INT8) / 52.35 (FP16) |
-|  Measured Peak INT8:   41.29 TOPS (77.4% peak)          |  Measured Peak INT8:   90.25 TOPS (86.2% peak)          |
-|  Measured Peak FP8:    29.01 TOPS (81.5% direct)        |  Measured Peak FP8:    55.41 TOPS (79.4% nom / 90.4% act) 🏆 |
-|  Measured Peak FP16:   20.88 TFLOPS (78.2% peak)        |  Measured Peak FP16:   43.80 TFLOPS (83.7% peak) 🏆     |
-+-------------------------------------------------+------------------------------------------------+
-```
+| Architectural Specification | Apple H18 (iPhone 17 Pro)<br>*TSMC N3P* | Apple H19 (iPhone 18 Pro)<br>*TSMC N2* |
+| :--- | :---: | :---: |
+| **Cluster Architecture** | Single 16-Core | Dual 16-Core (32 Cores) |
+| **Peak ANE Frequency** | 2172 MHz | 2130 MHz |
+| **Physical MACs / Cycle** | 8,192 MACs/cycle | 16,384 MACs/cycle |
+| **Physical MAC Ceiling** | 35.58 TOPS | 69.80 TOPS |
+| **Winograd 1D Ceiling** | 53.38 TOPS (INT8) / 26.69 (FP16) | 104.70 TOPS (INT8) / 52.35 (FP16) |
+| **Measured Peak INT8** | **41.29 TOPS** (77.4% peak) | **90.25 TOPS** 🏆 (86.2% peak) |
+| **Measured Peak FP8** | **29.01 TOPS** (81.5% direct) | **55.41 TOPS** 🏆 (79.4% nom / 90.4% act) |
+| **Measured Peak FP16** | **20.88 TFLOPS** (78.2% peak) | **43.80 TFLOPS** 🏆 (83.7% peak) |
 
 ---
 
 ## 6. Conclusions & Practical Recommendations
 
 1. **For Maximum Compute Density (INT8):**
-   * Keep working set resident in ANE on-chip L2 SRAM ($H=W=64$, Working Set $\approx 2.0\text{–}4.0\text{ MB}$).
-   * Use $3\times 3$ kernel convolutions ($K=3$) with chained layer depths of $L=60\text{–}80$ to unlock the **$1.5\times$ 1D Winograd engine** and achieve **>90 TOPS** on iPhone 18 Pro (and $L=20$ for **>41 TOPS** on iPhone 17 Pro).
+   * Keep working set resident in ANE on-chip L2 SRAM ($H=W=64$, Working Set ≈ 2.0–4.0 MB).
+   * Use 3×3 kernel convolutions (K = 3) with chained layer depths of L = 60–80 to unlock the **1.5× 1D Winograd engine** and achieve **>90 TOPS** on iPhone 18 Pro (and L = 20 for **>41 TOPS** on iPhone 17 Pro).
 2. **For FP8 (E4M3) Deployment:**
    * Recognize that FP8 is legally capped by the direct physical datapath ceiling (**69.80 TOPS on H19**, **35.58 TOPS on H18**).
-   * Do not design models relying on Winograd speedups for FP8; instead, structure FP8 layers as compute-intensive GEMMs or $1\times 1$ convolutions where physical MAC utilization reaches **~72–81%**.
+   * Do not design models relying on Winograd speedups for FP8; instead, structure FP8 layers as compute-intensive GEMMs or 1×1 convolutions where physical MAC utilization reaches **~72–81%**.
