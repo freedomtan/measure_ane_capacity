@@ -16,7 +16,7 @@ Benchmarking on physical iPhone 17 Pro (H18) and iPhone 18 Pro (H19) demonstrate
 | Silicon & Clock | FP16 (Half) | FP8 (E4M3) | INT8 (Signed Integer) |
 | :--- | :---: | :---: | :---: |
 | **iPhone 17 Pro (H18)**<br>*(16-Core @ 2172 MHz)* | 20.88 TFLOPS<br>*(58.7% MAC Peak)* | 29.01 TOPS<br>*(81.5% Direct MAC)* | **41.29 TOPS**<br>*(77.4% Winograd 1D Peak)* |
-| **iPhone 18 Pro (H19)**<br>*(Dual 16-Core @ 2130 MHz)* | **43.80 TFLOPS** 🏆<br>*(83.7% Wino Peak)* | **55.41 TOPS** 🏆<br>*(79.4% nom / 90.4% act)* | **90.25 TOPS** 🏆<br>*(86.2% Winograd 1D Peak)* |
+| **iPhone 18 Pro (H19)**<br>*(Dual 16-Core @ 2130 MHz)* | **43.80 TFLOPS**<br>*(83.7% Wino Peak)* | **55.41 TOPS**<br>*(79.4% nom / 90.4% act)* | **90.25 TOPS**<br>*(86.2% Winograd 1D Peak)* |
 
 ### Primary Discoveries & Microarchitectural Answers:
 
@@ -137,11 +137,11 @@ In 3×3 convolutions with $C_{in}=512$:
 
 | Workload | Kernel | Depth (L) | Channels | Precision | Duration | TOPS | Efficiency vs Ceiling | Mode |
 | :--- | :---: | :---: | :---: | :--- | ---: | ---: | :---: | :--- |
-| **SRAM-Resident Conv2D** | 3×3 | **80** | 512 | **INT8** | **9.53 ms** | **90.25** 🏆 | **86.2%** | Winograd 1D, 100% L2 Resident |
+| **SRAM-Resident Conv2D** | 3×3 | **80** | 512 | **INT8** | **9.53 ms** | **90.25** | **86.2%** | Winograd 1D, 100% L2 Resident |
 | **Deep-Chained Conv2D** | 3×3 | 100 | 256 | **INT8** | 46.52 ms | 88.29 | 84.3% | Winograd 1D, DRAM spill |
-| **SRAM-Optimized Conv2D** | 3×3 | **100** | **512** (H=128) | **FP8** | **29.74 ms** | **55.41** 🏆 | **79.4% / 90.4%** | Direct MAC, 1.87 GHz Thermal Limit |
+| **SRAM-Optimized Conv2D** | 3×3 | **100** | **512** (H=128) | **FP8** | **29.74 ms** | **55.41** | **79.4% / 90.4%** | Direct MAC, 1.87 GHz Thermal Limit |
 | **Deep-Chained Conv2D** | 3×3 | 100 | 256 | **FP8** | 75.92 ms | 54.10 | 77.5% | Direct MAC (No Winograd) |
-| **SRAM-Optimized Conv2D** | 3×3 | **80** | **256** (H=128) | **FP16** | **30.55 ms** | **43.80** 🏆 | **83.7%** | Winograd 1D, Reduced Halo, Deep Chain |
+| **SRAM-Optimized Conv2D** | 3×3 | **80** | **256** (H=128) | **FP16** | **30.55 ms** | **43.80** | **83.7%** | Winograd 1D, Reduced Halo, Deep Chain |
 | **Deep-Chained Conv2D** | 3×3 | 100 | 256 | **FP16** | 96.68 ms | 42.48 | 81.2% | Winograd 1D, Half-Rate MAC |
 | **Large GEMM** | 1×1 | 20 | M = 4096 | **FP8** | 27.28 ms | **50.33** | **72.1%** | Direct Matrix Multiply |
 | **Large GEMM** | 1×1 | 20 | M = 4096 | **INT8** | 28.52 ms | 48.14 | 69.0% | Direct Matrix Multiply |
@@ -153,7 +153,7 @@ In 3×3 convolutions with $C_{in}=512$:
 
 | Workload | Kernel | Depth (L) | Channels | Precision | Duration | TOPS | Efficiency vs Ceiling | Mode |
 | :--- | :---: | :---: | :---: | :--- | ---: | ---: | :---: | :--- |
-| **Peak Conv2D** | 3×3 | **20** | 512 | **INT8** | **9.36 ms** | **41.29** 🏆 | **77.4%** | Winograd 1D, Peak Boost |
+| **Peak Conv2D** | 3×3 | **20** | 512 | **INT8** | **9.36 ms** | **41.29** | **77.4%** | Winograd 1D, Peak Boost |
 | **Peak Conv2D** | 3×3 | **20** | 512 | **FP8** | **13.33 ms** | **29.01** | **81.5%** | Direct MAC (No Winograd) |
 | **Peak Conv2D** | 3×3 | **20** | 512 | **FP16** | **18.52 ms** | **20.88** | **58.7%** | Direct Half-Precision MAC |
 | **Large Conv2D** | 3×3 | 20 | 256 | **FP8** | 70.24 ms | 22.01 | 61.9% | Direct MAC, Thermal limited |

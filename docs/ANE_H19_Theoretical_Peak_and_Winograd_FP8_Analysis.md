@@ -144,9 +144,9 @@ The ANE Activation Feeder contains dedicated hardware transform crossbars that p
 | **Physical MACs / Cycle** | 8,192 MACs/cycle | 16,384 MACs/cycle |
 | **Physical MAC Ceiling** | 35.58 TOPS | 69.80 TOPS |
 | **Winograd 1D Ceiling** | 53.38 TOPS (INT8) / 26.69 (FP16) | 104.70 TOPS (INT8) / 52.35 (FP16) |
-| **Measured Peak INT8** | **41.29 TOPS** (77.4% peak) | **90.25 TOPS** 🏆 (86.2% peak) |
-| **Measured Peak FP8** | **29.01 TOPS** (81.5% direct) | **55.41 TOPS** 🏆 (79.4% nom / 90.4% act) |
-| **Measured Peak FP16** | **20.88 TFLOPS** (78.2% peak) | **43.80 TFLOPS** 🏆 (83.7% peak) |
+| **Measured Peak INT8** | **41.29 TOPS** (77.4% peak) | **90.25 TOPS** (86.2% peak) |
+| **Measured Peak FP8** | **29.01 TOPS** (81.5% direct) | **55.41 TOPS** (79.4% nom / 90.4% act) |
+| **Measured Peak FP16** | **20.88 TFLOPS** (78.2% peak) | **43.80 TFLOPS** (83.7% peak) |
 
 ---
 
