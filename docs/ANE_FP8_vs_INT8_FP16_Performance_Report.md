@@ -26,7 +26,7 @@ Benchmarking on physical iPhone 17 Pro (H18) and iPhone 18 Pro (H19) demonstrate
      ```text
      in_fmt == e4_m3  =>  winograd1_d_en == 0
      ```
-     Because FP8 E4M3 has only **3 bits of mantissa**, algebraic Winograd pre-transforms cause catastrophic cancellation and numerical collapse. As a result, the compiler restricts FP8 to direct spatial convolution (**71.17 TOPS** physical ceiling on H19, **35.58 TOPS** on H18).
+     Because FP8 E4M3 has only **3 bits of mantissa**, algebraic Winograd pre-transforms cause catastrophic cancellation and numerical collapse. As a result, the compiler restricts FP8 to direct spatial convolution (**69.80 TOPS** physical ceiling on H19, **35.58 TOPS** on H18).
 2. **Why FP8 Matches and Slightly Exceeds INT8 in GEMM (1×1 Conv):**
    * In raw Matrix Multiplication (M = 2048–4096), Winograd cannot be applied to 1×1 kernels.
    * On H19 at M = 4096, **FP8 hits 50.33 TOPS** (≈72.1% of the 69.80 TOPS physical MAC ceiling), matching the un-transformed capability of INT8. This empirically verifies that **the physical silicon contains 2× packed MAC units for FP8** matching INT8 width.

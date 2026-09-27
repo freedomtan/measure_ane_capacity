@@ -1,12 +1,12 @@
 # Guide to Interpreting Apple Neural Engine (ANE) PMU Profiling Numbers
 
-This report provides a comprehensive microarchitectural guide to interpreting the performance telemetry, hardware performance monitor (PMU) counters, and benchmark metrics emitted by [`measure_ane_pmu`](file:///Users/freedom/work/measure_ane_capacity/measure_ane_pmu.m) on Apple Silicon (benchmarked on **Apple M4 Pro, H16g microarchitecture, 16 physical ANE cores**).
+This report provides a comprehensive microarchitectural guide to interpreting the performance telemetry, hardware performance monitor (PMU) counters, and benchmark metrics emitted by [`measure_ane_pmu`](../measure_ane_pmu.m) on Apple Silicon (benchmarked on **Apple M4 Pro, H16g microarchitecture, 16 physical ANE cores**).
 
 ---
 
 ## 1. Executive Summary & Core Telemetry Matrix
 
-When benchmarking a chain of 2D convolutions ($B=1, C=128, H=256, W=256, K=3\times 3, L=20$, totaling **386.55 GOPs / 193.27 Billion MACs**), [`measure_ane_pmu`](file:///Users/freedom/work/measure_ane_capacity/measure_ane_pmu.m) outputs the following comparison matrix:
+When benchmarking a chain of 2D convolutions ($B=1, C=128, H=256, W=256, K=3\times 3, L=20$, totaling **386.55 GOPs / 193.27 Billion MACs**), [`measure_ane_pmu`](../measure_ane_pmu.m) outputs the following comparison matrix:
 
 | Benchmark Variant | Target Silicon | Latency | Realized TOPS | Active Compute (`[13]`) | Output Stalls (`[15]`) | Planar Cycles (`[21]`) | DMA Traffic (`[17]`) |
 | :--- | :--- | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -183,7 +183,7 @@ Large Tensors (H=256, W=256 | 16 MB/layer)         Cache-Resident Tensors (H=64,
 | Workload Dimension | Precision | Latency | TOPS | Output Stalls ([15]) | DMA I/O ([17]) | Throughput / Core ([10]) | Total Chip Throughput | Peak Saturation |
 | :--- | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
 | **Max Saturation (256×256, C=256, L=50)** | FP16 | 205.48 ms | **18.81** | 5,346,498,518 | 350.10 MB | **248.9 MACs/cyc/core** | 3,982.2 MACs/cycle | **97.22%** (of 256 peak) |
-| **Max Saturation (256×256, C=256, L=50)** | INT8 | 101.67 ms | **38.02** 🏆 | 1,914,275,704 | 173.11 MB | **503.4 MACs/cyc/core** | 8,054.1 MACs/cycle | **98.32%** (of 512 peak) |
+| **Max Saturation (256×256, C=256, L=50)** | INT8 | 101.67 ms | **38.02** | 1,914,275,704 | 173.11 MB | **503.4 MACs/cyc/core** | 8,054.1 MACs/cycle | **98.32%** (of 512 peak) |
 | **Standard (256×256, C=128, L=20)** | FP16 | 20.61 ms | **18.76** | 503,317,431 | 34.99 MB | **248.2 MACs/cyc/core** | 3,971.2 MACs/cycle | **96.95%** (of 256 peak) |
 | **Standard (256×256, C=128, L=20)** | INT8 | 10.78 ms | **35.87** | 233,509,350 | 18.35 MB | **472.0 MACs/cyc/core** | 7,552.0 MACs/cycle | **92.19%** (of 512 peak) |
 | **Cache-Resident (64×64, C=128, L=10)** | FP16 | 1.15 ms | **10.50** | 15,587,386 | 1.80 MB | **156.5 MACs/cyc/core** | 2,504.0 MACs/cycle | **61.13%** (of 256 peak) |
@@ -271,17 +271,20 @@ H17+ with Non-Zero Initialization (True Dense Execution):
    In Objective-C and Swift, allocating buffers via `[NSMutableData dataWithLength:]` or `[device newBufferWithLength:options:]` yields memory that the OS kernel automatically zeroes out for security. On H16 and earlier, this did not affect ALU cycles because the hardware processed all zeros through the MAC matrices. On H17 and later, however, zero-skipping resulted in artificially inflated measurements (e.g. ~44.4 TOPS FP16 and ~63.2 TOPS QDQ).
 
 ### 6.2 The Non-Zero Solution
-To benchmark the true dense hardware capacity on H17 and later, all buffers must be populated with non-zero values. To prevent activation values from exploding or underflowing across 20–50 consecutive convolution layers, this repository uses bounded alternating patterns:
-- **FP16**: `+0.0625` (`0x2C00`), `-0.0625` (`0xAC00`), `+0.03125` (`0x2800`), `-0.03125` (`0xA800`)
-- **INT8**: `+1`, `-1`, `+2`, `-2`
+To benchmark the true dense hardware capacity on H17 and later, all buffers must be populated with non-zero values.
 
-Under this dense initialization, H17 and H18 measure true dense capacity: **~24.5 TOPS FP16** and **~51.6 TOPS INT8** (via 1D Winograd $F(2, 3)$).
+> [!NOTE]
+> **Deterministic Non-Canceling Pseudo-Random Fill (`fillNonZeroData`)**: The legacy tiled `+0.0625, -0.0625` pattern only protected layer 1—it cancelled exactly across the $C_i \times K \times K = 1152$ spatial reduction window, causing subsequent layers to run on an all-zero tensor and triggering zero-skipping. The benchmark suite was updated across MPSGraph, CoreML MIL, and `ANECapacityApp` to use deterministic `xorshift64` non-canceling pseudo-random fill ($\pm 0.03125$ for FP16, $\pm 1$ for INT8, $\pm 0.03125$ for FP8).
+
+Under verified non-canceling dense initialization, true sustained dense throughput is measured:
+- **iPhone 17 Pro (H18)**: **20.88 TFLOPS (FP16)** and **41.29 TOPS (INT8)** via 1D Winograd $F(2,3)$.
+- **iPhone 18 Pro (H19)**: **43.80 TFLOPS (FP16)** and **90.25 TOPS (INT8)** via 1D Winograd $F(2,3)$.
 
 ---
 
 ## 7. Performance Diagnostic Playbook
 
-Use this flowchart to interpret metrics from [`measure_ane_pmu`](file:///Users/freedom/work/measure_ane_capacity/measure_ane_pmu.m) on any neural network:
+Use this flowchart to interpret metrics from [`measure_ane_pmu`](../measure_ane_pmu.m) on any neural network:
 
 ```mermaid
 graph TD

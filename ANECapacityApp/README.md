@@ -15,22 +15,25 @@ Based directly on [`measure_conv_universal.m`](../measure_conv_universal.m) from
 2. **Precision Support**:
    - **FP16 (Half Precision)**: High-throughput floating point convolution and GEMM on the ANE matrix compute array.
    - **INT8 (Simulated QDQ)**: Realistic quantization flow (`Int8` $\rightarrow$ `Dequant FP16` $\rightarrow$ `Compute` $\rightarrow$ `Requant Int8`) matching `measure_conv_universal.m` and `measure_matmul_universal.m`.
-   - **Both Mode**: Runs FP16 and INT8 back-to-back to directly observe the INT8 speedup multiplier.
-   - **Dense Non-Zero Initialization (H17+ Ready)**: Both weight and input tensors are initialized with bounded alternating non-zero values to bypass hardware zero-skipping and lossless zero-compression on H17 (A18 Pro) and H18 (A19 Pro), ensuring true dense silicon capacity is measured.
+   - **FP8 (Float8E4M3 QDQ)**: 8-bit floating-point Quantize-Dequantize execution with decoupled scaling and dithering protection for H18 and H19 silicon.
+   - **Multi-Precision Comparison**: Runs FP16, INT8, and FP8 back-to-back to directly observe throughput and arithmetic multiplier behaviors.
+   - **Deterministic Non-Canceling Initialization (H17+ Ready)**: Both weight and input tensors are populated using deterministic `xorshift64` pseudo-random signs ($\pm 0.03125$ for FP16, $\pm 1$ for INT8, $\pm 0.03125$ for FP8) to prevent zero-cancellation across layers and eliminate hardware zero-skipping artifacts on H17 (A18 Pro), H18 (A19 Pro), and H19 (A20 Pro).
 
 3. **Configurable Dimensions & Hyperparameters**:
-   - **Conv2D Parameters**: Channels ($C_{in}, C_{out} \in [16 \dots 1024]$), Spatial ($H \times W \in [64 \times 64 \dots 1024 \times 1024]$), Kernels ($1 \times 1, 3 \times 3, 5 \times 5$), Layers ($L \in [1 \dots 40]$).
-   - **MatMul Parameters**: $M, K, N \in [128, 256, 512, 1024, 2048]$, Chained Depth ($L \in [1 \dots 40]$).
+   - **Conv2D Parameters**: Channels ($C_{in}, C_{out} \in [16 \dots 1024]$), Spatial ($H \times W \in [64 \times 64 \dots 1024 \times 1024]$), Kernels ($1 \times 1, 3 \times 3, 5 \times 5$), Layers ($L \in [1 \dots 100]$).
+   - **MatMul Parameters**: $M, K, N \in [128 \dots 8192]$, Chained Depth ($L \in [1 \dots 40]$).
    - **Batch Size ($B$)**: Configurable (default $B=1$).
 
 4. **Automated Capacity Sweeps**:
    - **Conv2D Channel Capacity Sweep**: Holds $H=W=256$, sweeps channels $C \in [32, 64, 128, 256, 512, 1024]$ to find the ANE matrix tile saturation point.
    - **Conv2D Spatial Dimension Sweep**: Holds $C=128$, sweeps spatial resolutions $H=W \in [64, 128, 256, 384, 512, 768]$.
-   - **Conv2D Chained Depth Sweep**: Sweeps $L \in [1, 5, 10, 20, 30, 40]$ to characterize driver submission latency overhead vs. sustained hardware capacity.
+   - **Conv2D Chained Depth Sweep**: Sweeps $L \in [1, 5, 10, 20, 40, 80, 100]$ to characterize driver submission latency overhead vs. sustained hardware capacity.
+   - **Conv2D Pointwise Depth Sweep**: Sweeps $L \in [1 \dots 100]$ with $K=1\times 1$ to isolate weight reuse and kernel-memory stall differences between GEMM and $3\times 3$ convolutions.
    - **Conv2D Kernel Size Sweep**: Compares $K=1\times1$ vs $K=3\times3$ vs $K=5\times5$.
-   - **MatMul Dimension Sweep**: Sweeps $M=K=N \in [128, 256, 512, 1024, 2048]$ to map GEMM tile saturation on ANE.
+   - **MatMul Dimension Sweep**: Sweeps square dimensions $M=K=N \in [128 \dots 4096]$ to map GEMM tile saturation on ANE.
+   - **MatMul Rectangular Sweep**: Sweeps large batch/sequence length $M \in [1024, 2048, 4096, 8192]$ with fixed $K=N=1024$.
    - **MatMul Depth Sweep**: Sweeps $L \in [1, 5, 10, 20, 30, 40]$ for dense matrix multiplications.
-   - **Full Capacity Comparison**: Complete sweep for both FP16 and INT8.
+   - **Full Capacity Comparison**: Multi-variant sweeps across FP16, INT8, and FP8.
 
 5. **Interactive Figures & Visualizations (Swift Charts)**:
    - **Throughput (TOPS) vs. Size**: Line and point chart with smooth interpolation.
@@ -106,7 +109,9 @@ ANECapacityApp/
     ├── HistoryView.swift          # Tabular run logs, filtering, CSV export
     ├── DeviceInfoView.swift       # Hardware capabilities, Metal specs, formula documentation
     ├── BenchmarkViewModel.swift   # Async task management, state updates, CSV exporter
-    ├── ANECapacityEngine.swift    # Core MPSGraph convolution engine (ANE/GPU, FP16/INT8)
+    ├── ANECapacityEngine.swift    # Core MPSGraph convolution engine (ANE/GPU, FP16/INT8/FP8)
+    ├── ANEClientBridge.mm         # Private _ANEClient PMU performance counter interface
+    ├── ANECapacityApp-Bridging-Header.h # Bridging header for private ANE telemetry
     ├── BenchmarkModels.swift      # Data models, dimensions, presets, results
     ├── Info.plist                 # iOS app bundle configuration
     └── Assets.xcassets/           # App icon & accent colors

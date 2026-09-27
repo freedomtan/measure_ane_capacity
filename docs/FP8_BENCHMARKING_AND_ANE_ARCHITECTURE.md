@@ -11,8 +11,8 @@ This document details the technical implementation, mathematical stability const
 * **Core Constraint**: `mps.conv_2d` and `mps.matmul` do not accept raw FP8 tensor operands. All FP8 arithmetic in MPSGraph must follow a **Quantize-Dequantize (QDQ)** pattern where computation executes in FP16.
 * **ANE Generation Matrix**:
   * **H13–H16 (A14–A17 Pro, M1–M4 Pro)**: Physical ANE MAC units lack FP8 ALUs. ANE compilation rejects FP8 MLIR; MPSGraph falls back to Metal GPU automatically.
-  * **H18 (A19 / iPhone 18 Pro)**: ANE compiler accepts FP8 MLIR, but runtime dynamic activation QDQ outputs all zeros on physical silicon.
-  * **H19 (A20 Pro / H19)**: Target architecture for validated native FP8 execution.
+  * **H18 (A19 Pro / iPhone 17 Pro)**: ANE compiler accepts FP8 MLIR. Native FP8 QDQ runs cleanly using decoupled scale ($2^{-1}$ physical byte storage), sustaining 29.01 TOPS. Naive unit scale underflows on dynamic activations.
+  * **H19 (A20 Pro / iPhone 18 Pro)**: Dual 16-Core ANE with validated native FP8 QDQ execution, reaching 55.41 TOPS (conv) and 50.33 TOPS (GEMM).
 * **Decoupled Scale Pattern**: Physical FP8 storage magnitude ($2^{-1} = 0.5$) is decoupled from logical FP16 math magnitude ($2^{-5} = 0.03125$) using QDQ `scale = 0.0625` to avoid both the H18 underflow cliff and 20-layer compounding saturation.
 
 ---
@@ -62,19 +62,30 @@ Both activations and weights reside in FP8 memory:
 
 ### A. The Compounding Magnitude Problem
 In a 20-layer chained convolution with a spatial reduction window:
-$$C_i \times K \times K = 128 \times 3 \times 3 = 1152$$
+
+```math
+C_i \times K \times K = 128 \times 3 \times 3 = 1152
+```
+
 If input activations and weights are populated with magnitude $\approx 1.0$, the expected value compounds by $\approx 1152\times$ per layer:
 * **Layer 1**: Magnitude $\approx 10^3$
 * **Layer 2**: Magnitude $\approx 10^6$ (overflows FP16 max 65,504 and FP8 max 448 to `NaN` / `Inf`)
 * **Layers 3–20**: Benchmarking pure saturation propagation rather than real arithmetic.
 
 To keep the per-layer root-mean-square (RMS) gain near unity ($\approx 1.0$):
-$$\text{Expected Gain} = \frac{\sqrt{C_i \times K \times K}}{2^{\text{shift}}} = \frac{\sqrt{1152}}{32} \approx 1.06$$
+
+```math
+\text{Expected Gain} = \frac{\sqrt{C_i \times K \times K}}{2^{\text{shift}}} = \frac{\sqrt{1152}}{32} \approx 1.06
+```
+
 Thus, the arithmetic domain **must** operate at logical magnitude:
-$$\text{Logical Magnitude} = 2^{-5} = \frac{1}{32} \approx 0.03125$$
+
+```math
+\text{Logical Magnitude} = 2^{-5} = \frac{1}{32} \approx 0.03125
+```
 
 ### B. The H18 ANE Underflow Cliff
-On iPhone 18 Pro (H18 ANE), physically encoding dynamic activation FP8 bytes at $2^{-5} = 0.03125$ and dequantizing with $\text{scale} = 1.0$ hits a hardware underflow-to-zero cliff:
+On iPhone 17 Pro (H18 ANE), physically encoding dynamic activation FP8 bytes at $2^{-5} = 0.03125$ and dequantizing with $\text{scale} = 1.0$ hits a hardware underflow-to-zero cliff:
 * 100% of the output tensor elements become exactly `0.0`.
 * This triggers H17+ zero-skipping logic, inflating wall-clock measurement to an artificial ~65+ TOPS on degenerate output.
 * However, physical FP8 bytes encoded at $2^{-1} = 0.5$ measure completely clean (linear response, zero underflow).
@@ -82,9 +93,13 @@ On iPhone 18 Pro (H18 ANE), physically encoding dynamic activation FP8 bytes at 
 ### C. The Decoupled Scale Solution
 To simultaneously satisfy **20-layer math stability** and **H18 hardware underflow safety**, physical byte storage is decoupled from logical math magnitude:
 
-$$\text{Dequantized FP16} = \text{Physical Stored Value} \times \text{scale}$$
+```math
+\text{Dequantized FP16} = \text{Physical Stored Value} \times \text{scale}
+```
 
-$$\text{scale} = 2^{(\text{logical\_shift} - \text{physical\_shift})} = 2^{-5 - (-1)} = 2^{-4} = 0.0625$$
+```math
+\text{scale} = 2^{(\text{logical\_shift} - \text{physical\_shift})} = 2^{-5 - (-1)} = 2^{-4} = 0.0625
+```
 
 | Domain | Shift | Magnitude | Purpose |
 | :--- | :---: | :---: | :--- |
@@ -104,8 +119,8 @@ $$\text{scale} = 2^{(\text{logical\_shift} - \text{physical\_shift})} = 2^{-5 - 
 | **H14** | A15, M2 | ❌ None | MAC array is FP16/INT8 only. MPSGraph falls back to Metal GPU. |
 | **H15** | A16, M3 | ❌ None | MAC array is FP16/INT8 only. MPSGraph falls back to Metal GPU. |
 | **H16 / H16g / H16s** | A17 Pro, M4 / Pro / Max | ❌ None | `ANECCompile` returns MLIR conversion error; falls back to Metal GPU. |
-| **H18** | A19 (iPhone 18 Pro) | ⚠️ Partial | Compiles to ANE, but dynamic activation QDQ outputs all zeros on silicon. Weight-only QDQ works (constant-folded). |
-| **H19** | A20 Pro | ✅ Native | Target architecture for native FP8 QDQ execution on ANE. |
+| **H18** | A19 Pro (iPhone 17 Pro) | ✅ Native (Decoupled) | Native FP8 QDQ runs cleanly using decoupled scale ($2^{-1}$ physical / $2^{-5}$ logical), reaching 29.01 TOPS. Naive unit scale underflows to zero. |
+| **H19** | A20 Pro (iPhone 18 Pro) | ✅ Native | Dual 16-Core ANE with native FP8 QDQ execution, reaching 55.41 TOPS (conv) and 50.33 TOPS (GEMM). |
 
 ---
 
@@ -117,7 +132,7 @@ Beginning with the H17 architecture, the ANE includes hardware-level zero-skippi
 3. Wall-clock calculations report implausibly high TOPS metrics (~65+ TOPS) on garbage data.
 
 ### Verification Protocol
-Both [`measure_conv_fp8`](file:///Users/freedom/work/measure_ane_capacity/measure_conv_fp8.m) and [`ANECapacityEngine.swift`](file:///Users/freedom/work/measure_ane_capacity/ANECapacityApp/ANECapacityApp/ANECapacityEngine.swift) enforce post-execution buffer validation:
+Both [`measure_conv_fp8`](../measure_conv_fp8.m) and [`ANECapacityEngine.swift`](../ANECapacityApp/ANECapacityApp/ANECapacityEngine.swift) enforce post-execution buffer validation:
 
 ```swift
 let outputElementCount = outputBufferLen / elementSize
@@ -131,7 +146,7 @@ if zeroCount == outputElementCount {
 
 ## 7. Offline Compilation to ANE Binary (`convert_fp8_to_hwx`)
 
-The [`convert_fp8_to_hwx`](file:///Users/freedom/work/measure_ane_capacity/convert_fp8_to_hwx.m) utility allows offline cross-compilation of an MPSGraph FP8 QDQ model to an ANE Mach-O `.hwx` binary.
+The [`convert_fp8_to_hwx`](../convert_fp8_to_hwx.m) utility allows offline cross-compilation of an MPSGraph FP8 QDQ model to an ANE Mach-O `.hwx` binary.
 
 > [!IMPORTANT]
 > **Architecture Compatibility**: `convert_fp8_to_hwx` **only works for H18 variants (e.g. `h18`, `h18g`) and H19**. Earlier architectures (H17 and below) lack hardware FP8 support, causing their respective ANE compilers to reject the FP8 MLIR graph during compilation (`"MLIR MPS to ANEC conversion failed"`).
@@ -143,7 +158,7 @@ make convert_fp8_to_hwx
 # Compile FP8 QDQ Conv for H19 (A20 Pro)
 ./convert_fp8_to_hwx --arch h19 --layers 20 --output hwx_output
 
-# Compile FP8 QDQ Conv for H18 (A19)
+# Compile FP8 QDQ Conv for H18 (A19 Pro)
 ./convert_fp8_to_hwx --arch h18 --layers 20 --output hwx_output
 ```
 
