@@ -36,6 +36,9 @@ typedef NS_ENUM(NSInteger, MILPrecision) {
   /// Quantized INT8 / W8A8 QDQ: activation quantize/dequantize, INT8 weights
   /// dequantized to FP16, and FP16 conv executed on the ANE matrix engine.
   MILPrecisionINT8 = 1,
+  /// Quantized FP8 / W8A8 QDQ: activation quantize/dequantize to FP8 E4M3,
+  /// FP8 weights dequantized to FP16, targeting native FP8 ANE engines on H18/H19.
+  MILPrecisionFP8 = 2,
 };
 
 /// The workload: `layers` chained KxK convolutions over [batch, channelsIn,

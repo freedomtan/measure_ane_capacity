@@ -269,6 +269,8 @@ static BOOL resolveDimensions(MLModel *model, BenchConfig *cfg, BOOL *fromMetada
   if (prec) {
     if ([prec isEqualToString:@"INT8"]) {
       cfg->precision = MILPrecisionINT8;
+    } else if ([prec isEqualToString:@"FP8"]) {
+      cfg->precision = MILPrecisionFP8;
     } else {
       cfg->precision = MILPrecisionFP16;
     }
@@ -396,7 +398,7 @@ static void printUsage(const char *argv0) {
   printf("process at runtime, so every dimension below is just a flag.\n\n");
   printf("Options:\n");
   printf("  --units <target>   ane | gpu | cpu | all (default: ane)\n");
-  printf("  --precision <mode> fp16 (default) or int8 (W8A8 simulated QDQ)\n");
+  printf("  --precision <mode> fp16 (default), int8 (W8A8 QDQ), or fp8 (Float8E4M3 QDQ)\n");
   printf("  --batch <B>        batch dimension (default: 1)\n");
   printf("  --size <H>         spatial height and width (default: 256)\n");
   printf("  --channels <C>     input and output channels (default: 128)\n");
@@ -642,6 +644,20 @@ static BOOL runBenchmark(BenchConfig cfg) {
                 error.localizedDescription.UTF8String);
         return NO;
       }
+      if (cfg.verbose) {
+        printf("Spec: %.1f KB (weights inline)\n", specData.length / 1024.0);
+      }
+      if (cfg.savePath) {
+        if (![specData writeToFile:cfg.savePath options:0 error:&error]) {
+          fprintf(stderr, "error: failed to write %s: %s\n",
+                  cfg.savePath.UTF8String, error.localizedDescription.UTF8String);
+          return NO;
+        }
+        printf("Wrote %s\n", cfg.savePath.UTF8String);
+      }
+      if (cfg.iterations == 0 && !cfg.showPlan) {
+        return YES;
+      }
       // Always compile from a temporary file rather than handing CoreML the
       // spec in memory via MLModelAsset. Measured on hardware: the in-memory
       // path runs ~28% slower (14.3 vs 18.5 TOPS on the same bytes, same
@@ -667,17 +683,6 @@ static BOOL runBenchmark(BenchConfig cfg) {
         fprintf(stderr, "error: failed to compile generated model: %s\n",
                 error.localizedDescription.UTF8String);
         return NO;
-      }
-      if (cfg.verbose) {
-        printf("Spec: %.1f KB (weights inline)\n", specData.length / 1024.0);
-      }
-      if (cfg.savePath && ![specData writeToFile:cfg.savePath options:0
-                                           error:&error]) {
-        fprintf(stderr, "error: failed to write %s: %s\n",
-                cfg.savePath.UTF8String, error.localizedDescription.UTF8String);
-        return NO;
-      } else if (cfg.savePath) {
-        printf("Wrote %s\n", cfg.savePath.UTF8String);
       }
     }
 
@@ -706,6 +711,9 @@ static BOOL runBenchmark(BenchConfig cfg) {
     if (!model) {
       fprintf(stderr, "error: failed to load model: %s\n",
               error.localizedDescription.UTF8String);
+      if (cfg.precision == MILPrecisionFP8) {
+        fprintf(stderr, "note: FP8 execution requires ANE hardware with FP8 support (e.g. H18 / iPhone 17 Pro, H19 / iPhone 18 Pro). On host without FP8 ANE (e.g. M4), use --save <path> to export the .mlmodel or compile to .mlmodelc for device benchmarking.\n");
+      }
       return NO;
     }
 
@@ -952,8 +960,10 @@ int main(int argc, char *argv[]) {
         cfg.precision = MILPrecisionFP16;
       } else if ([v isEqualToString:@"int8"]) {
         cfg.precision = MILPrecisionINT8;
+      } else if ([v isEqualToString:@"fp8"]) {
+        cfg.precision = MILPrecisionFP8;
       } else {
-        fprintf(stderr, "error: unknown --precision value '%s' (expected fp16 or int8)\n", v.UTF8String);
+        fprintf(stderr, "error: unknown --precision value '%s' (expected fp16, int8, or fp8)\n", v.UTF8String);
         return 1;
       }
     } else if ([arg isEqualToString:@"--batch"] && i + 1 < argc) {
@@ -1021,7 +1031,7 @@ int main(int argc, char *argv[]) {
     }
   }
 
-  if (cfg.iterations == 0) {
+  if (cfg.iterations == 0 && !cfg.savePath && !cfg.showMIL) {
     fprintf(stderr, "error: --iterations must be at least 1\n");
     return 1;
   }

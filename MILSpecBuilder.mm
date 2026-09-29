@@ -237,6 +237,32 @@ static std::string WeightBytesINT8(MILConvChainConfig config) {
   return bytes;
 }
 
+static std::string WeightBytesFP8(MILConvChainConfig config) {
+  size_t count = (size_t)config.channelsOut * config.channelsIn *
+                 config.kernel * config.kernel;
+  std::string bytes(count, '\0');
+  uint8_t *p = (uint8_t *)bytes.data();
+
+  if (config.weightMode == MILWeightModeRepeat) {
+    static const uint8_t pattern[4] = {0x30, 0xB0, 0x38, 0xB8};
+    for (size_t i = 0; i < count; i++) p[i] = pattern[i % 4];
+    return bytes;
+  }
+
+  // Non-cancelling random signs {-0.5, 0.5} in FP8 E4M3:
+  // shift = -1, biased exp = 6, pos = 0x30, neg = 0xB0.
+  // With decoupled scale = 1/16 (0x2C00), the dequantized logical magnitude
+  // is 0.5 * (1/16) = 1/32, which keeps the RMS gain bounded across 20+ layers.
+  uint64_t state = kWeightSeed;
+  for (size_t i = 0; i < count; i++) {
+    state ^= state << 13;
+    state ^= state >> 7;
+    state ^= state << 17;
+    p[i] = (state & 1) ? 0xB0 : 0x30;
+  }
+  return bytes;
+}
+
 #pragma mark - Model description
 
 static void SetArrayFeature(ms::FeatureDescription *desc,
@@ -294,7 +320,12 @@ NSString *MILWeightModeName(MILWeightMode mode) {
 }
 
 NSString *MILPrecisionName(MILPrecision precision) {
-  return precision == MILPrecisionINT8 ? @"INT8" : @"FP16";
+  switch (precision) {
+    case MILPrecisionINT8: return @"INT8";
+    case MILPrecisionFP8:  return @"FP8";
+    case MILPrecisionFP16:
+    default:               return @"FP16";
+  }
 }
 
 static NSError *MILError(NSInteger code, NSString *message) {
@@ -347,8 +378,13 @@ NSData *MILBuildConvChainSpec(MILConvChainConfig config, NSError **error) {
                                              config.height, config.width};
   const std::string outputName = MILConvChainOutputName(config).UTF8String;
 
+  const int32_t specVersion =
+      (config.precision == MILPrecisionFP8) ? 10 : kSpecificationVersion;
+  const char *const opset =
+      (config.precision == MILPrecisionFP8) ? "CoreML9" : kOpset;
+
   ms::Model model;
-  model.set_specificationversion(kSpecificationVersion);
+  model.set_specificationversion(specVersion);
 
   ms::ModelDescription *description = model.mutable_description();
   SetArrayFeature(description->add_input(),
@@ -360,12 +396,12 @@ NSData *MILBuildConvChainSpec(MILConvChainConfig config, NSError **error) {
   program->set_version(1);
 
   mil::Function &function = (*program->mutable_functions())["main"];
-  function.set_opset(kOpset);
+  function.set_opset(opset);
   mil::NamedValueType *functionInput = function.add_inputs();
   functionInput->set_name(MILConvChainInputName().UTF8String);
   SetTensorType(functionInput->mutable_type(), mil::FLOAT16, inputShape);
 
-  mil::Block &block = (*function.mutable_block_specializations())[kOpset];
+  mil::Block &block = (*function.mutable_block_specializations())[opset];
   block.add_outputs(outputName);
 
   if (config.precision == MILPrecisionINT8) {
@@ -379,6 +415,33 @@ NSData *MILBuildConvChainSpec(MILConvChainConfig config, NSError **error) {
     AddConstOp(&block, "act_scale", TensorValueType(mil::FLOAT16, {}),
                Float16ScalarValue(kFP16PlusOneThirtySecond));
     AddConstOp(&block, "dtype_int8", StringScalarType(), StringValue("int8"));
+  } else if (config.precision == MILPrecisionFP8) {
+    // Weights: inline FP8 E4M3 bytes dequantized to FP16
+    mil::Value weights;
+    weights.mutable_immediatevalue()->mutable_tensor()->mutable_bytes()->set_values(
+        WeightBytesFP8(config));
+    AddConstOp(&block, "raw_weights",
+               TensorValueType(mil::FLOAT8E4M3FN,
+                               {config.channelsOut, config.channelsIn,
+                                config.kernel, config.kernel}),
+               std::move(weights));
+
+    // Weight scale const: fp16 1/16 (0x2C00) brings physical 0.5 to logical 1/32
+    AddConstOp(&block, "w_scale", TensorValueType(mil::FLOAT16, {}),
+               Float16ScalarValue(kFP16PlusOneSixteenth));
+
+    AddOp(&block, "dequantize",
+          {{"input", "raw_weights"},
+           {"scale", "w_scale"}},
+          "weights",
+          TensorValueType(mil::FLOAT16,
+                          {config.channelsOut, config.channelsIn,
+                           config.kernel, config.kernel}));
+
+    // Activation scale const: fp16 1/32
+    AddConstOp(&block, "act_scale", TensorValueType(mil::FLOAT16, {}),
+               Float16ScalarValue(kFP16PlusOneThirtySecond));
+    AddConstOp(&block, "dtype_fp8", StringScalarType(), StringValue("fp8e4m3fn"));
   } else {
     // One weight constant shared by every layer, as in the MPSGraph version.
     mil::Value weights;
@@ -406,8 +469,10 @@ NSData *MILBuildConvChainSpec(MILConvChainConfig config, NSError **error) {
 
   const mil::ValueType activationType =
       TensorValueType(mil::FLOAT16, outputShape);
-  const mil::ValueType quantizedType =
+  const mil::ValueType int8QuantizedType =
       TensorValueType(mil::INT8, outputShape);
+  const mil::ValueType fp8QuantizedType =
+      TensorValueType(mil::FLOAT8E4M3FN, outputShape);
   std::string current = MILConvChainInputName().UTF8String;
   for (NSUInteger i = 0; i < config.layers; i++) {
     std::string convInput = current;
@@ -417,7 +482,21 @@ NSData *MILBuildConvChainSpec(MILConvChainConfig config, NSError **error) {
             {{"input", current},
              {"scale", "act_scale"},
              {"output_dtype", "dtype_int8"}},
-            qName, quantizedType);
+            qName, int8QuantizedType);
+
+      std::string dqName = "dequant_" + std::to_string(i);
+      AddOp(&block, "dequantize",
+            {{"input", qName},
+             {"scale", "act_scale"}},
+            dqName, activationType);
+      convInput = std::move(dqName);
+    } else if (config.precision == MILPrecisionFP8) {
+      std::string qName = "quant_" + std::to_string(i);
+      AddOp(&block, "quantize",
+            {{"input", current},
+             {"scale", "act_scale"},
+             {"output_dtype", "dtype_fp8"}},
+            qName, fp8QuantizedType);
 
       std::string dqName = "dequant_" + std::to_string(i);
       AddOp(&block, "dequantize",
@@ -449,8 +528,10 @@ NSData *MILBuildConvChainSpec(MILConvChainConfig config, NSError **error) {
 }
 
 NSString *MILConvChainText(MILConvChainConfig config) {
+  const char *const opset =
+      (config.precision == MILPrecisionFP8) ? "CoreML9" : kOpset;
   NSMutableString *text = [NSMutableString string];
-  [text appendFormat:@"function main (opset %s):\n", kOpset];
+  [text appendFormat:@"function main (opset %s):\n", opset];
   [text appendFormat:@"  x: fp16[%lu, %lu, %lu, %lu]\n",
                      (unsigned long)config.batch,
                      (unsigned long)config.channelsIn,
@@ -465,6 +546,16 @@ NSString *MILConvChainText(MILConvChainConfig config) {
                        (unsigned long)(config.channelsOut * config.channelsIn *
                                        config.kernel * config.kernel)];
     [text appendFormat:@"  weights = dequantize(input=weights_int8, scale=1/32, zero_point=0)\n"];
+  } else if (config.precision == MILPrecisionFP8) {
+    [text appendFormat:@"  raw_weights = const(fp8e4m3fn[%lu, %lu, %lu, %lu])  // %@, "
+                       @"%lu bytes inline\n",
+                       (unsigned long)config.channelsOut,
+                       (unsigned long)config.channelsIn,
+                       (unsigned long)config.kernel, (unsigned long)config.kernel,
+                       MILWeightModeName(config.weightMode),
+                       (unsigned long)(config.channelsOut * config.channelsIn *
+                                       config.kernel * config.kernel)];
+    [text appendFormat:@"  weights = dequantize(input=raw_weights, scale=1/16, zero_point=0)\n"];
   } else {
     [text appendFormat:@"  weights = const(fp16[%lu, %lu, %lu, %lu])  // %@, "
                        @"%lu bytes inline\n",
@@ -482,6 +573,17 @@ NSString *MILConvChainText(MILConvChainConfig config) {
       NSString *qName = [NSString stringWithFormat:@"quant_%lu", (unsigned long)i];
       NSString *dqName = [NSString stringWithFormat:@"dequant_%lu", (unsigned long)i];
       [text appendFormat:@"  %@ = quantize(input=%@, scale=1/32, zero_point=0, output_dtype=\"int8\")\n",
+                         qName, current];
+      [text appendFormat:@"  %@ = dequantize(input=%@, scale=1/32, zero_point=0)\n",
+                         dqName, qName];
+      [text appendFormat:@"  %@ = conv(x=%@, weight=weights, strides=[1, 1], "
+                         @"pad_type=same, pad=[0, 0, 0, 0], dilations=[1, 1], "
+                         @"groups=1)\n",
+                         convName, dqName];
+    } else if (config.precision == MILPrecisionFP8) {
+      NSString *qName = [NSString stringWithFormat:@"quant_%lu", (unsigned long)i];
+      NSString *dqName = [NSString stringWithFormat:@"dequant_%lu", (unsigned long)i];
+      [text appendFormat:@"  %@ = quantize(input=%@, scale=1/32, zero_point=0, output_dtype=\"fp8e4m3fn\")\n",
                          qName, current];
       [text appendFormat:@"  %@ = dequantize(input=%@, scale=1/32, zero_point=0)\n",
                          dqName, qName];
