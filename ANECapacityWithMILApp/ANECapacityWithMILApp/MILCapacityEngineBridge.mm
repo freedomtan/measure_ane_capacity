@@ -135,10 +135,6 @@ static void fillDenseFloat16(void *buffer, size_t count) {
 
     res.compileTimeMs = (nowSeconds() - startCompile) * 1000.0;
 
-    if (usePMU) {
-        return [self evaluateViaANEClientAtURL:compiledURL batch:B channels:C height:H width:W kernel:K layers:L precision:precision iterations:iterations warmup:warmup progressHandler:progress];
-    }
-
     return [self evaluateModelAtURL:compiledURL batch:B channels:C height:H width:W kernel:K layers:L precision:precision computeUnits:units iterations:iterations warmup:warmup usePMU:usePMU progressHandler:progress];
 }
 

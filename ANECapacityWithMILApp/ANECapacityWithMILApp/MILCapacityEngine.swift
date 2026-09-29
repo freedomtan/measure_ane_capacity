@@ -66,7 +66,7 @@ final class MILCapacityEngine {
                     computeUnits: target.mlComputeUnits,
                     iterations: UInt(iterations),
                     warmup: 3,
-                    usePMU: (target == .ane),
+                    usePMU: false,
                     progressHandler: { msg in
                         logHandler(msg)
                     }
