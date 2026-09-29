@@ -1,0 +1,508 @@
+import SwiftUI
+
+struct BenchmarkView: View {
+    @ObservedObject var viewModel: BenchmarkViewModel
+    
+    @State private var isCustomMode: Bool = false
+    @State private var showConsole: Bool = true
+    
+    var body: some View {
+        NavigationView {
+            ScrollViewReader { proxy in
+                ScrollView {
+                    VStack(spacing: 20) {
+                        // Hardware status banner
+                        hardwareStatusBanner
+                        
+                        // Workload Operation Type Selector (Conv2D vs MatMul)
+                        VStack(alignment: .leading, spacing: 6) {
+                            Text("Workload Operation")
+                                .font(.caption)
+                                .fontWeight(.semibold)
+                                .foregroundColor(.secondary)
+                            
+                            Picker("Operation", selection: $viewModel.selectedOperation) {
+                                ForEach(OperationType.allCases) { op in
+                                    Label(op.rawValue, systemImage: op.icon).tag(op)
+                                }
+                            }
+                            .pickerStyle(.segmented)
+                        }
+                        
+                        // Mode Selector: Presets vs Custom
+                        Picker("Run Mode", selection: $isCustomMode) {
+                            Text("Capacity Sweeps").tag(false)
+                            Text("Custom Size").tag(true)
+                        }
+                        .pickerStyle(.segmented)
+                        
+                        if isCustomMode {
+                            customDimensionsCard
+                        } else {
+                            presetSweepsCard
+                        }
+                        
+                        // Precision and Target Card
+                        executionSettingsCard
+                        
+                        // Action Button & Progress
+                        actionAndProgressCard
+                        
+                        // Console Log
+                        if showConsole {
+                            consoleCard(proxy: proxy)
+                        }
+                    }
+                    .padding()
+                }
+            }
+            .navigationTitle("CoreML / MIL Capacity")
+            .toolbar {
+                ToolbarItem(placement: .navigationBarTrailing) {
+                    Button(action: { showConsole.toggle() }) {
+                        Image(systemName: showConsole ? "terminal.fill" : "terminal")
+                    }
+                }
+            }
+        }
+    }
+    
+    // MARK: - Hardware Status Banner
+    private var hardwareStatusBanner: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 12) {
+                Image(systemName: viewModel.hasANE ? "cpu.fill" : "exclamationmark.triangle.fill")
+                    .font(.title2)
+                    .foregroundColor(viewModel.hasANE ? .green : .orange)
+                
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(viewModel.hasANE ? "CoreML & Neural Engine Ready" : "iOS Simulator Mode")
+                        .font(.subheadline)
+                        .fontWeight(.bold)
+                    Text("Backend: \(viewModel.hardwareDeviceName)")
+                        .font(.caption2)
+                        .foregroundColor(.secondary)
+                }
+                
+                Spacer()
+                
+                if viewModel.hasANE {
+                    Text("ANE Ready")
+                        .font(.caption2)
+                        .fontWeight(.semibold)
+                        .foregroundColor(.green)
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 4)
+                        .background(Color.green.opacity(0.15))
+                        .cornerRadius(8)
+                } else {
+                    Text("Simulator")
+                        .font(.caption2)
+                        .fontWeight(.semibold)
+                        .foregroundColor(.orange)
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 4)
+                        .background(Color.orange.opacity(0.15))
+                        .cornerRadius(8)
+                }
+            }
+            
+            #if targetEnvironment(simulator)
+            HStack(alignment: .top, spacing: 8) {
+                Image(systemName: "info.circle.fill")
+                    .foregroundColor(.secondary)
+                    .font(.caption)
+                Text("Physical ANE hardware execution and PMU counters require running on a physical iPhone or iPad (e.g. iPhone 17/18 Pro for FP8). Simulator runs in emulation mode.")
+                    .font(.caption2)
+                    .foregroundColor(.secondary)
+                Spacer()
+            }
+            .padding(.top, 2)
+            #endif
+        }
+        .padding()
+        .background(Color(.secondarySystemBackground))
+        .cornerRadius(14)
+    }
+    
+    // MARK: - Preset Sweeps Card
+    private var availableSweepsForCurrentOp: [SweepType] {
+        if viewModel.selectedOperation == .matmul {
+            return [.matmulDimensions, .matmulDepth, .matmulAsymmetric]
+        } else {
+            return [.channels, .sramResident, .spatial, .depth, .pointwiseDepth, .kernels, .fullCapacity]
+        }
+    }
+    
+    private var presetSweepsCard: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Text("Select Capacity Sweep")
+                .font(.headline)
+            
+            ForEach(availableSweepsForCurrentOp, id: \.self) { sweep in
+                Button(action: { viewModel.selectedSweep = sweep }) {
+                    HStack {
+                        VStack(alignment: .leading, spacing: 3) {
+                            Text(sweep.rawValue)
+                                .font(.subheadline)
+                                .fontWeight(.semibold)
+                                .foregroundColor(.primary)
+                            Text(sweepDescription(sweep))
+                                .font(.caption2)
+                                .foregroundColor(.secondary)
+                        }
+                        Spacer()
+                        if viewModel.selectedSweep == sweep {
+                            Image(systemName: "checkmark.circle.fill")
+                                .foregroundColor(.accentColor)
+                        } else {
+                            Image(systemName: "circle")
+                                .foregroundColor(.secondary)
+                        }
+                    }
+                    .padding(12)
+                    .background(viewModel.selectedSweep == sweep ? Color.accentColor.opacity(0.1) : Color(.tertiarySystemBackground))
+                    .cornerRadius(10)
+                }
+                .buttonStyle(.plain)
+            }
+        }
+        .padding()
+        .background(Color(.secondarySystemBackground))
+        .cornerRadius(16)
+    }
+    
+    private func sweepDescription(_ s: SweepType) -> String {
+        switch s {
+        case .none: return "Run single test"
+        case .channels: return "Sweeps C = 32, 64, 128, 256, 384, 512 (Tests matrix array saturation)"
+        case .sramResident: return "Fixed H=W=64, sweeps C = 32..512 (Activations stay 100% inside ANE L2 SRAM)"
+        case .spatial: return "Sweeps H=W = 64, 128, 256, 384, 512, 768 (Tests bandwidth scaling)"
+        case .depth: return "Sweeps L = 1, 5, 10, 20, 40, 60, 80, 100 (Measures dispatch latency amortization)"
+        case .pointwiseDepth: return "Fixed K=1, H=W=64, C=512, sweeps L=1..100 (Bypasses spatial reduction, tests pure FP8/INT8 MAC throughput)"
+        case .kernels: return "Tests K=1x1 (GEMM) vs K=3x3 vs K=5x5 (2D Spatial Conv)"
+        case .fullCapacity: return "Evaluates FP16, INT8, and FP8 across all major tensor footprints"
+        case .matmulDimensions: return "Sweeps M=K=N = 128, 256, 512, 1024, 2048, 4096 (Tests dense GEMM array scaling)"
+        case .matmulDepth: return "Sweeps L = 1, 5, 10, 20, 40, 60, 80, 100 (Measures GEMM pipeline latency amortization)"
+        case .matmulAsymmetric: return "Fixed K=N=1024, sweeps M=512..8192 (High arithmetic intensity, fits 100% in L2 SRAM)"
+        }
+    }
+    
+    // MARK: - Custom Dimensions Card
+    private var customDimensionsCard: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack {
+                Text(viewModel.selectedOperation == .matmul ? "Custom GEMM Dimensions" : "Custom Dimensions")
+                    .font(.headline)
+                Spacer()
+                Text("\(String(format: "%.1f", viewModel.dimensions.gflops)) GFLOPs/iter")
+                    .font(.caption)
+                    .fontWeight(.semibold)
+                    .foregroundColor(.accentColor)
+            }
+            
+            if viewModel.selectedOperation == .matmul {
+                // MatMul Controls: M, K, N, Layers
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack {
+                        Text("Matrix Row Dimension (M):")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                        Spacer()
+                        Text("\(viewModel.dimensions.m)")
+                            .font(.caption)
+                            .fontWeight(.bold)
+                    }
+                    Picker("M", selection: $viewModel.dimensions.m) {
+                        ForEach([128, 256, 512, 1024, 2048, 4096, 8192], id: \.self) { val in
+                            Text("\(val)").tag(val)
+                        }
+                    }
+                    .pickerStyle(.segmented)
+                }
+                
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack {
+                        Text("Contracting Dimension (K):")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                        Spacer()
+                        Text("\(viewModel.dimensions.k)")
+                            .font(.caption)
+                            .fontWeight(.bold)
+                    }
+                    Picker("K", selection: $viewModel.dimensions.k) {
+                        ForEach([128, 256, 512, 1024, 2048, 4096], id: \.self) { val in
+                            Text("\(val)").tag(val)
+                        }
+                    }
+                    .pickerStyle(.segmented)
+                }
+                
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack {
+                        Text("Column Dimension (N):")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                        Spacer()
+                        Text("\(viewModel.dimensions.n)")
+                            .font(.caption)
+                            .fontWeight(.bold)
+                    }
+                    Picker("N", selection: $viewModel.dimensions.n) {
+                        ForEach([128, 256, 512, 1024, 2048, 4096], id: \.self) { val in
+                            Text("\(val)").tag(val)
+                        }
+                    }
+                    .pickerStyle(.segmented)
+                }
+                
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack {
+                        Text("Chained Layers (L):")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                        Spacer()
+                        Text("\(viewModel.dimensions.layers) layers")
+                            .font(.caption)
+                            .fontWeight(.bold)
+                    }
+                    Picker("Layers", selection: $viewModel.dimensions.layers) {
+                        ForEach([1, 5, 10, 20, 40, 60, 80, 100], id: \.self) { l in
+                            Text("\(l)").tag(l)
+                        }
+                    }
+                    .pickerStyle(.segmented)
+                }
+            } else {
+                // Conv2D Controls
+                // Channels
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack {
+                        Text("Input / Output Channels:")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                        Spacer()
+                        Text("\(viewModel.dimensions.inChannels) c")
+                            .font(.caption)
+                            .fontWeight(.bold)
+                    }
+                    Picker("Channels", selection: $viewModel.dimensions.inChannels) {
+                        ForEach([16, 32, 64, 128, 256, 384, 512], id: \.self) { c in
+                            Text("\(c)").tag(c)
+                        }
+                    }
+                    .pickerStyle(.segmented)
+                    .onChange(of: viewModel.dimensions.inChannels) { newC in
+                        viewModel.dimensions.outChannels = newC
+                    }
+                }
+                
+                // Spatial Dimensions (H x W)
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack {
+                        Text("Spatial Resolution (H = W):")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                        Spacer()
+                        Text("\(viewModel.dimensions.height) x \(viewModel.dimensions.width)")
+                            .font(.caption)
+                            .fontWeight(.bold)
+                    }
+                    Picker("Resolution", selection: $viewModel.dimensions.height) {
+                        ForEach([64, 128, 256, 512, 768, 1024], id: \.self) { res in
+                            Text("\(res)").tag(res)
+                        }
+                    }
+                    .pickerStyle(.segmented)
+                    .onChange(of: viewModel.dimensions.height) { newH in
+                        viewModel.dimensions.width = newH
+                    }
+                }
+                
+                // Chained Layers (L)
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack {
+                        Text("Chained Layers (L):")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                        Spacer()
+                        Text("\(viewModel.dimensions.layers) layers")
+                            .font(.caption)
+                            .fontWeight(.bold)
+                    }
+                    Picker("Layers", selection: $viewModel.dimensions.layers) {
+                        ForEach([1, 5, 10, 20, 40, 60, 80, 100], id: \.self) { l in
+                            Text("\(l)").tag(l)
+                        }
+                    }
+                    .pickerStyle(.segmented)
+                }
+                
+                // Kernel Size
+                HStack {
+                    Text("Kernel Size (KxK):")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                    Spacer()
+                    Picker("Kernel", selection: $viewModel.dimensions.kernelSize) {
+                        Text("1x1").tag(1)
+                        Text("3x3").tag(3)
+                        Text("5x5").tag(5)
+                    }
+                    .pickerStyle(.segmented)
+                    .frame(width: 180)
+                }
+            }
+        }
+        .padding()
+        .background(Color(.secondarySystemBackground))
+        .cornerRadius(16)
+        .onAppear {
+            viewModel.selectedSweep = .none
+        }
+    }
+    
+    // MARK: - Execution Settings Card
+    private var executionSettingsCard: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Text("Execution Settings")
+                .font(.headline)
+            
+            // Precision
+            VStack(alignment: .leading, spacing: 6) {
+                Text("Data Type / Precision")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 8) {
+                        ForEach(PrecisionMode.allCases) { p in
+                            Button(action: {
+                                viewModel.selectedPrecision = p
+                            }) {
+                                Text(p.rawValue)
+                                    .font(.caption)
+                                    .fontWeight(viewModel.selectedPrecision == p ? .bold : .medium)
+                                    .padding(.horizontal, 10)
+                                    .padding(.vertical, 6)
+                                    .background(viewModel.selectedPrecision == p ? p.themeColor : Color(.tertiarySystemBackground))
+                                    .foregroundColor(viewModel.selectedPrecision == p ? .white : .primary)
+                                    .cornerRadius(8)
+                            }
+                        }
+                    }
+                }
+            }
+            
+            // Target Compute Units
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Compute Units")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                Picker("Target", selection: $viewModel.selectedTarget) {
+                    ForEach(DeviceTarget.allCases) { t in
+                        Text(t.rawValue).tag(t)
+                    }
+                }
+                .pickerStyle(.segmented)
+            }
+            
+            // Iterations
+            HStack {
+                Text("Benchmark Iterations:")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                Spacer()
+                Stepper("\(viewModel.iterations) runs", value: $viewModel.iterations, in: 5...100, step: 5)
+                    .font(.subheadline)
+            }
+        }
+        .padding()
+        .background(Color(.secondarySystemBackground))
+        .cornerRadius(16)
+    }
+    
+    // MARK: - Action and Progress Card
+    private var actionAndProgressCard: some View {
+        VStack(spacing: 12) {
+            if viewModel.isRunning {
+                VStack(spacing: 8) {
+                    HStack {
+                        Text(viewModel.statusMessage)
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                            .lineLimit(1)
+                        Spacer()
+                        Text("\(Int(viewModel.progress * 100))%")
+                            .font(.caption)
+                            .fontWeight(.bold)
+                    }
+                    
+                    ProgressView(value: viewModel.progress)
+                        .progressViewStyle(LinearProgressViewStyle())
+                    
+                    Button(role: .destructive, action: { viewModel.cancelBenchmark() }) {
+                        Label("Stop Benchmark", systemImage: "stop.fill")
+                            .font(.headline)
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 14)
+                            .background(Color.red.opacity(0.15))
+                            .foregroundColor(.red)
+                            .cornerRadius(12)
+                    }
+                }
+            } else {
+                Button(action: { viewModel.startBenchmark() }) {
+                    Label(isCustomMode ? "Run Single Benchmark" : "Start Capacity Sweep", systemImage: "play.fill")
+                        .font(.headline)
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 14)
+                        .background(Color.accentColor)
+                        .foregroundColor(.white)
+                        .cornerRadius(12)
+                }
+            }
+        }
+    }
+    
+    // MARK: - Console Log Card
+    private func consoleCard(proxy: ScrollViewProxy) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Label("Live Execution Console", systemImage: "terminal")
+                    .font(.caption)
+                    .fontWeight(.bold)
+                Spacer()
+                Button(action: { viewModel.clearLogs() }) {
+                    Text("Clear")
+                        .font(.caption2)
+                        .foregroundColor(.secondary)
+                }
+            }
+            
+            ScrollView {
+                VStack(alignment: .leading, spacing: 4) {
+                    ForEach(Array(viewModel.consoleLogs.enumerated()), id: \.offset) { idx, log in
+                        Text(log)
+                            .font(.system(size: 11, design: .monospaced))
+                            .foregroundColor(.green)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .id(idx)
+                    }
+                }
+            }
+            .frame(height: 140)
+            .padding(10)
+            .background(Color.black.opacity(0.9))
+            .cornerRadius(10)
+            .onChange(of: viewModel.consoleLogs.count) { _ in
+                if let last = viewModel.consoleLogs.indices.last {
+                    proxy.scrollTo(last, anchor: .bottom)
+                }
+            }
+        }
+        .padding()
+        .background(Color(.secondarySystemBackground))
+        .cornerRadius(16)
+    }
+}
