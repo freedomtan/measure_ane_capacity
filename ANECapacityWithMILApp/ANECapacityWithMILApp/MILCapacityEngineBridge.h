@@ -74,6 +74,20 @@ NS_ASSUME_NONNULL_BEGIN
                                                      usePMU:(BOOL)usePMU
                                             progressHandler:(nullable void (^)(NSString *log))progress;
 
+/// Dynamically builds, compiles, and evaluates a CoreML MIL convolution model with zero bundle dependencies.
++ (MILBenchmarkExecutionResult *)evaluateDynamicModelWithBatch:(NSUInteger)B
+                                                      channels:(NSUInteger)C
+                                                        height:(NSUInteger)H
+                                                         width:(NSUInteger)W
+                                                        kernel:(NSUInteger)K
+                                                        layers:(NSUInteger)L
+                                                     precision:(NSString *)precision
+                                                  computeUnits:(MLComputeUnits)units
+                                                    iterations:(NSUInteger)iterations
+                                                        warmup:(NSUInteger)warmup
+                                                        usePMU:(BOOL)usePMU
+                                               progressHandler:(nullable void (^)(NSString *log))progress;
+
 @end
 
 NS_ASSUME_NONNULL_END

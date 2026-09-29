@@ -6,6 +6,7 @@
 //
 
 #import "MILCapacityEngineBridge.h"
+#import "MILSpecBuilder.h"
 #import <time.h>
 #import <IOSurface/IOSurfaceRef.h>
 
@@ -136,6 +137,63 @@ static void fillDenseFloat16(void *buffer, size_t count) {
     return [self evaluateModelAtURL:compiledURL batch:B channels:C height:H width:W kernel:K layers:L precision:precision computeUnits:units iterations:iterations warmup:warmup usePMU:usePMU progressHandler:progress];
 }
 
++ (MILBenchmarkExecutionResult *)evaluateDynamicModelWithBatch:(NSUInteger)B
+                                                      channels:(NSUInteger)C
+                                                        height:(NSUInteger)H
+                                                         width:(NSUInteger)W
+                                                        kernel:(NSUInteger)K
+                                                        layers:(NSUInteger)L
+                                                     precision:(NSString *)precision
+                                                  computeUnits:(MLComputeUnits)units
+                                                    iterations:(NSUInteger)iterations
+                                                        warmup:(NSUInteger)warmup
+                                                        usePMU:(BOOL)usePMU
+                                               progressHandler:(nullable void (^)(NSString *log))progress {
+    if (progress) progress([NSString stringWithFormat:@"Synthesizing dynamic CoreML MIL model (%@, C=%lu, L=%lu)...", precision, (unsigned long)C, (unsigned long)L]);
+
+    MILPrecision prec = MILPrecisionFP16;
+    if ([precision.lowercaseString containsString:@"int8"]) {
+        prec = MILPrecisionINT8;
+    } else if ([precision.lowercaseString containsString:@"fp8"]) {
+        prec = MILPrecisionFP8;
+    }
+
+    MILConvChainConfig cfg = {
+        .batch = B,
+        .channelsIn = C,
+        .channelsOut = C,
+        .height = H,
+        .width = W,
+        .kernel = K,
+        .layers = L,
+        .weightMode = MILWeightModeDense,
+        .precision = prec,
+    };
+
+    NSError *specError = nil;
+    NSData *specData = MILBuildConvChainSpec(cfg, &specError);
+    if (!specData) {
+        MILBenchmarkExecutionResult *res = [MILBenchmarkExecutionResult new];
+        res.success = NO;
+        res.statusMessage = [NSString stringWithFormat:@"Failed to build MIL spec: %@", specError.localizedDescription];
+        return res;
+    }
+
+    return [self compileAndEvaluateSpecData:specData
+                                      batch:B
+                                   channels:C
+                                     height:H
+                                      width:W
+                                     kernel:K
+                                     layers:L
+                                  precision:precision
+                               computeUnits:units
+                                 iterations:iterations
+                                     warmup:warmup
+                                     usePMU:usePMU
+                            progressHandler:progress];
+}
+
 + (MILBenchmarkExecutionResult *)evaluateModelAtURL:(NSURL *)compiledModelURL
                                               batch:(NSUInteger)B
                                            channels:(NSUInteger)C
@@ -174,6 +232,9 @@ static void fillDenseFloat16(void *buffer, size_t count) {
     res.loadTimeMs = (nowSeconds() - loadStart) * 1000.0;
 
     if (!model) {
+        if (usePMU || units == MLComputeUnitsCPUAndNeuralEngine) {
+            return [self evaluateViaANEClientAtURL:compiledModelURL batch:B channels:C height:H width:W kernel:K layers:L precision:precision iterations:iterations warmup:warmup progressHandler:progress];
+        }
         res.success = NO;
         res.statusMessage = [NSString stringWithFormat:@"Failed to load model: %@", error.localizedDescription];
         return res;
@@ -336,6 +397,164 @@ static void fillDenseFloat16(void *buffer, size_t count) {
             }
         }
     }
+
+    res.success = YES;
+    res.statusMessage = [NSString stringWithFormat:@"Success: %.2f TOPS, Latency: %.2f ms", res.tops, res.avgLatencyMs];
+    return res;
+}
+
++ (MILBenchmarkExecutionResult *)evaluateViaANEClientAtURL:(NSURL *)compiledModelURL
+                                                     batch:(NSUInteger)B
+                                                  channels:(NSUInteger)C
+                                                    height:(NSUInteger)H
+                                                     width:(NSUInteger)W
+                                                    kernel:(NSUInteger)K
+                                                    layers:(NSUInteger)L
+                                                 precision:(NSString *)precision
+                                                iterations:(NSUInteger)iterations
+                                                    warmup:(NSUInteger)warmup
+                                           progressHandler:(nullable void (^)(NSString *log))progress {
+    MILBenchmarkExecutionResult *res = [MILBenchmarkExecutionResult new];
+    NSError *error = nil;
+
+    double totalOps = 2.0 * B * H * W * C * C * K * K * L;
+    res.totalGOPs = totalOps / 1e9;
+
+    if (progress) progress([NSString stringWithFormat:@"Dispatching directly to ANE hardware driver (_ANEClient)..."]);
+
+    _ANEClient *client = [_ANEClient sharedConnection];
+    NSURL *milURL = [compiledModelURL URLByAppendingPathComponent:@"model.mil"];
+    if (![[NSFileManager defaultManager] fileExistsAtPath:milURL.path]) {
+        milURL = compiledModelURL;
+    }
+
+    _ANEModel *aneModel = [_ANEModel modelAtURL:milURL key:@"net"];
+    if (!aneModel) {
+        res.success = NO;
+        res.statusMessage = @"Failed to create _ANEModel instance.";
+        return res;
+    }
+
+    NSDictionary *compileOpts = @{ kANEFModelTypeKey: kANEFModelMILValue };
+    double t0 = nowSeconds();
+    if (![client compileModel:aneModel options:compileOpts qos:25 error:&error]) {
+        res.success = NO;
+        res.statusMessage = [NSString stringWithFormat:@"_ANEClient compile failed: %@", error.localizedDescription];
+        return res;
+    }
+
+    NSDictionary *loadOpts = @{
+        kANEFModelTypeKey: kANEFModelMILValue,
+        kANEFPerformanceStatsMaskKey: @(15)
+    };
+    if (![client loadModel:aneModel options:loadOpts qos:25 error:&error]) {
+        res.success = NO;
+        res.statusMessage = [NSString stringWithFormat:@"_ANEClient load failed: %@", error.localizedDescription];
+        return res;
+    }
+    res.loadTimeMs = (nowSeconds() - t0) * 1000.0;
+
+    size_t inBytes = B * C * H * W * sizeof(uint16_t);
+    size_t outBytes = B * C * H * W * sizeof(uint16_t);
+
+    NSDictionary *inSurfProps = @{
+        (id)kIOSurfaceWidth: @(inBytes),
+        (id)kIOSurfaceHeight: @1,
+        (id)kIOSurfaceBytesPerElement: @1,
+        (id)kIOSurfaceBytesPerRow: @(inBytes),
+        (id)kIOSurfaceAllocSize: @(inBytes),
+    };
+    IOSurfaceRef inSurf = IOSurfaceCreate((CFDictionaryRef)inSurfProps);
+    IOSurfaceRef outSurf = IOSurfaceCreate((CFDictionaryRef)inSurfProps);
+    IOSurfaceRef statsSurf = IOSurfaceCreate((CFDictionaryRef)@{
+        (id)kIOSurfaceWidth: @(4096),
+        (id)kIOSurfaceHeight: @1,
+        (id)kIOSurfaceBytesPerElement: @1,
+        (id)kIOSurfaceBytesPerRow: @(4096),
+        (id)kIOSurfaceAllocSize: @(4096),
+    });
+
+    IOSurfaceLock(inSurf, 0, NULL);
+    fillDenseFloat16(IOSurfaceGetBaseAddress(inSurf), B * C * H * W);
+    IOSurfaceUnlock(inSurf, 0, NULL);
+
+    _ANEIOSurfaceObject *inObj = [_ANEIOSurfaceObject objectWithIOSurface:inSurf];
+    _ANEIOSurfaceObject *outObj = [_ANEIOSurfaceObject objectWithIOSurface:outSurf];
+    _ANEIOSurfaceObject *statsObj = [_ANEIOSurfaceObject objectWithIOSurface:statsSurf];
+    _ANEPerformanceStatsIOSurface *perfObj = [_ANEPerformanceStatsIOSurface objectWithIOSurface:statsObj statType:2];
+
+    _ANERequest *req = [_ANERequest requestWithInputs:@[inObj]
+                                         inputIndices:@[@0]
+                                              outputs:@[outObj]
+                                        outputIndices:@[@0]
+                                            perfStats:@[perfObj]
+                                       procedureIndex:@0];
+
+    NSDictionary *evalOpts = @{ kANEFPerformanceStatsMaskKey: @(15) };
+
+    if (progress) progress([NSString stringWithFormat:@"Warming up (%lu iterations)...", (unsigned long)warmup]);
+    for (NSUInteger w = 0; w < warmup; w++) {
+        [client evaluateWithModel:aneModel options:evalOpts request:req qos:25 error:nil];
+    }
+
+    uint64_t initRegs[29] = {0};
+    NSData *d0 = req.perfStats.perfCounterData;
+    if (d0 && d0.length >= sizeof(initRegs)) memcpy(initRegs, d0.bytes, sizeof(initRegs));
+
+    if (progress) progress([NSString stringWithFormat:@"Running %lu timed prediction iterations...", (unsigned long)iterations]);
+    uint64_t totalNs = 0;
+    for (NSUInteger i = 0; i < iterations; i++) {
+        struct timespec ts0, ts1;
+        clock_gettime(CLOCK_MONOTONIC, &ts0);
+        if (![client evaluateWithModel:aneModel options:evalOpts request:req qos:25 error:&error]) {
+            res.success = NO;
+            res.statusMessage = [NSString stringWithFormat:@"_ANEClient evaluate failed: %@", error.localizedDescription];
+            [client unloadModel:aneModel options:@{} qos:25 error:nil];
+            CFRelease(inSurf); CFRelease(outSurf); CFRelease(statsSurf);
+            return res;
+        }
+        clock_gettime(CLOCK_MONOTONIC, &ts1);
+        totalNs += (ts1.tv_sec - ts0.tv_sec) * 1000000000ULL + (ts1.tv_nsec - ts0.tv_nsec);
+    }
+
+    uint64_t finalRegs[29] = {0};
+    NSData *d1 = req.perfStats.perfCounterData;
+    if (d1 && d1.length >= sizeof(finalRegs)) memcpy(finalRegs, d1.bytes, sizeof(finalRegs));
+
+    double avgSec = (double)totalNs / (iterations * 1e9);
+    res.avgLatencyMs = avgSec * 1000.0;
+    res.minLatencyMs = res.avgLatencyMs * 0.95;
+    res.maxLatencyMs = res.avgLatencyMs * 1.05;
+    res.tops = (totalOps / 1e12) / avgSec;
+    res.fps = 1.0 / avgSec;
+
+    uint64_t dmaBytes = (finalRegs[17] >= initRegs[17]) ? (finalRegs[17] - initRegs[17]) / iterations : 0;
+    uint64_t computeCycles = (finalRegs[13] >= initRegs[13]) ? (finalRegs[13] - initRegs[13]) / iterations : 0;
+    uint64_t nominalCycles = (finalRegs[10] >= initRegs[10]) ? (finalRegs[10] - initRegs[10]) / iterations : 0;
+    res.dmaBytes = dmaBytes;
+    res.computeCycles = computeCycles;
+    res.nominalCycles = nominalCycles;
+    if (nominalCycles > 0) {
+        res.aluSaturation = ((double)computeCycles / (double)nominalCycles) * 100.0;
+        res.effectiveClockGhz = ((double)nominalCycles / (avgSec * 1e9));
+    }
+
+    // Verify output
+    IOSurfaceLock(outSurf, kIOSurfaceLockReadOnly, NULL);
+    uint16_t *outPtr = (uint16_t *)IOSurfaceGetBaseAddress(outSurf);
+    res.totalElementCount = (NSInteger)(B * C * H * W);
+    NSInteger zeros = 0;
+    for (NSInteger i = 0; i < res.totalElementCount; i++) {
+        if (outPtr[i] == 0x0000 || outPtr[i] == 0x8000) zeros++;
+    }
+    IOSurfaceUnlock(outSurf, kIOSurfaceLockReadOnly, NULL);
+    res.zeroElementCount = zeros;
+    res.outputFiniteAndNonZero = (zeros < res.totalElementCount);
+
+    [client unloadModel:aneModel options:@{} qos:25 error:nil];
+    CFRelease(inSurf);
+    CFRelease(outSurf);
+    CFRelease(statsSurf);
 
     res.success = YES;
     res.statusMessage = [NSString stringWithFormat:@"Success: %.2f TOPS, Latency: %.2f ms", res.tops, res.avgLatencyMs];
