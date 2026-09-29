@@ -134,6 +134,11 @@ static void fillDenseFloat16(void *buffer, size_t count) {
     }
 
     res.compileTimeMs = (nowSeconds() - startCompile) * 1000.0;
+
+    if (usePMU || units == MLComputeUnitsCPUAndNeuralEngine) {
+        return [self evaluateViaANEClientAtURL:compiledURL batch:B channels:C height:H width:W kernel:K layers:L precision:precision iterations:iterations warmup:warmup progressHandler:progress];
+    }
+
     return [self evaluateModelAtURL:compiledURL batch:B channels:C height:H width:W kernel:K layers:L precision:precision computeUnits:units iterations:iterations warmup:warmup usePMU:usePMU progressHandler:progress];
 }
 
@@ -424,11 +429,16 @@ static void fillDenseFloat16(void *buffer, size_t count) {
 
     _ANEClient *client = [_ANEClient sharedConnection];
     NSURL *milURL = [compiledModelURL URLByAppendingPathComponent:@"model.mil"];
-    if (![[NSFileManager defaultManager] fileExistsAtPath:milURL.path]) {
-        milURL = compiledModelURL;
+    _ANEModel *aneModel = nil;
+    if ([[NSFileManager defaultManager] fileExistsAtPath:milURL.path]) {
+        aneModel = [_ANEModel modelAtURL:milURL key:nil];
     }
-
-    _ANEModel *aneModel = [_ANEModel modelAtURL:milURL key:@"net"];
+    if (!aneModel) {
+        aneModel = [_ANEModel modelAtURL:compiledModelURL key:@"model.mil"];
+    }
+    if (!aneModel) {
+        aneModel = [_ANEModel modelAtURL:compiledModelURL key:nil];
+    }
     if (!aneModel) {
         res.success = NO;
         res.statusMessage = @"Failed to create _ANEModel instance.";
@@ -437,20 +447,24 @@ static void fillDenseFloat16(void *buffer, size_t count) {
 
     NSDictionary *compileOpts = @{ kANEFModelTypeKey: kANEFModelMILValue };
     double t0 = nowSeconds();
-    if (![client compileModel:aneModel options:compileOpts qos:25 error:&error]) {
-        res.success = NO;
-        res.statusMessage = [NSString stringWithFormat:@"_ANEClient compile failed: %@", error.localizedDescription];
-        return res;
+    if (![client compileModel:aneModel options:compileOpts qos:0 error:&error]) {
+        if (![client compileModel:aneModel options:compileOpts qos:25 error:&error]) {
+            res.success = NO;
+            res.statusMessage = [NSString stringWithFormat:@"_ANEClient compile failed: %@", error.localizedDescription];
+            return res;
+        }
     }
 
     NSDictionary *loadOpts = @{
         kANEFModelTypeKey: kANEFModelMILValue,
         kANEFPerformanceStatsMaskKey: @(15)
     };
-    if (![client loadModel:aneModel options:loadOpts qos:25 error:&error]) {
-        res.success = NO;
-        res.statusMessage = [NSString stringWithFormat:@"_ANEClient load failed: %@", error.localizedDescription];
-        return res;
+    if (![client loadModel:aneModel options:loadOpts qos:0 error:&error]) {
+        if (![client loadModel:aneModel options:loadOpts qos:25 error:&error]) {
+            res.success = NO;
+            res.statusMessage = [NSString stringWithFormat:@"_ANEClient load failed: %@", error.localizedDescription];
+            return res;
+        }
     }
     res.loadTimeMs = (nowSeconds() - t0) * 1000.0;
 

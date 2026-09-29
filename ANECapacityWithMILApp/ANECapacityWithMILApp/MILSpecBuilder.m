@@ -399,8 +399,8 @@ NSData *MILBuildConvChainSpec(MILConvChainConfig config, NSError **error) {
         ProtoWriter *fp16WeightsType = makeTensorType(kMIL_FLOAT16, wShape);
         [block writeMessageField:3 message:makeNonConstOp(@"dequantize", @"weights", fp16WeightsType, @{@"input": @"raw_weights", @"scale": @"w_scale"})];
 
-        // act_scale: scalar fp16 1/32 (0x2800)
-        [block writeMessageField:3 message:makeConstOp(@"act_scale", makeTensorType(kMIL_FLOAT16, @[]), makeFloat16ScalarValue(kFP16PlusOneThirtySecond))];
+        // act_scale: scalar fp16 1/16 (0x2C00) - decoupled scale matching w_scale to avoid underflow
+        [block writeMessageField:3 message:makeConstOp(@"act_scale", makeTensorType(kMIL_FLOAT16, @[]), makeFloat16ScalarValue(kFP16PlusOneSixteenth))];
         [block writeMessageField:3 message:makeConstOp(@"dtype_fp8", makeStringScalarType(), makeStringValue(@"fp8e4m3fn"))];
     } else {
         NSData *wData = generateWeightsFP16(config);

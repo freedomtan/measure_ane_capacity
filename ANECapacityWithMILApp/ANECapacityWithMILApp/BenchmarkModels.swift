@@ -36,28 +36,15 @@ enum PrecisionMode: String, CaseIterable, Identifiable, Codable {
 // MARK: - Target Device / Compute Units
 enum DeviceTarget: String, CaseIterable, Identifiable, Codable {
     case ane = "ANE (Neural Engine)"
-    case gpu = "GPU (Metal)"
-    case cpu = "CPU Only"
-    case all = "All Compute Units"
     
     var id: String { rawValue }
     
     var shortName: String {
-        switch self {
-        case .ane: return "ANE"
-        case .gpu: return "GPU"
-        case .cpu: return "CPU"
-        case .all: return "All"
-        }
+        return "ANE"
     }
     
     var mlComputeUnits: MLComputeUnits {
-        switch self {
-        case .ane: return .cpuAndNeuralEngine
-        case .gpu: return .cpuAndGPU
-        case .cpu: return .cpuOnly
-        case .all: return .all
-        }
+        return .cpuAndNeuralEngine
     }
 }
 

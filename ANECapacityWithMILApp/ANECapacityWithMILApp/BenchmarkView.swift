@@ -394,17 +394,24 @@ struct BenchmarkView: View {
                 }
             }
             
-            // Target Compute Units
-            VStack(alignment: .leading, spacing: 4) {
-                Text("Compute Units")
+            // Target Compute Units: Dedicated ANE
+            HStack {
+                Text("Compute Target:")
                     .font(.caption)
                     .foregroundColor(.secondary)
-                Picker("Target", selection: $viewModel.selectedTarget) {
-                    ForEach(DeviceTarget.allCases) { t in
-                        Text(t.rawValue).tag(t)
-                    }
+                Spacer()
+                HStack(spacing: 4) {
+                    Image(systemName: "cpu")
+                        .font(.caption)
+                        .foregroundColor(.green)
+                    Text("Apple Neural Engine (ANE)")
+                        .font(.caption)
+                        .bold()
                 }
-                .pickerStyle(.segmented)
+                .padding(.horizontal, 8)
+                .padding(.vertical, 4)
+                .background(Color.green.opacity(0.12))
+                .cornerRadius(8)
             }
             
             // Iterations
