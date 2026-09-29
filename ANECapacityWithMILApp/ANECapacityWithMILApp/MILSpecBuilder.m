@@ -15,12 +15,49 @@ static const uint32_t kMIL_STRING = 2;
 static const uint32_t kMIL_FLOAT16 = 10;
 static const uint32_t kMIL_INT8 = 21;
 static const uint32_t kMIL_INT32 = 23;
+static const uint32_t kMIL_UINT8 = 31;
 static const uint32_t kMIL_FLOAT8E4M3FN = 40;
 
 static const uint16_t kFP16PlusOneThirtySecond  = 0x2800; // 1/32
 static const uint16_t kFP16MinusOneThirtySecond = 0xA800; // -1/32
 static const uint16_t kFP16PlusOneSixteenth     = 0x2C00; // 1/16
 static const uint16_t kFP16MinusOneSixteenth    = 0xAC00; // -1/16
+
+// Exact IEEE Float8_e4m3fn -> Float16 lookup table, pre-scaled by 0.0625 (2^-4)
+static const uint16_t kFP8E4M3ScaledToFP16LUT[256] = {
+    0x0000, 0x0800, 0x0C00, 0x0E00, 0x1000, 0x1100, 0x1200, 0x1300,
+    0x1400, 0x1480, 0x1500, 0x1580, 0x1600, 0x1680, 0x1700, 0x1780,
+    0x1800, 0x1880, 0x1900, 0x1980, 0x1A00, 0x1A80, 0x1B00, 0x1B80,
+    0x1C00, 0x1C80, 0x1D00, 0x1D80, 0x1E00, 0x1E80, 0x1F00, 0x1F80,
+    0x2000, 0x2080, 0x2100, 0x2180, 0x2200, 0x2280, 0x2300, 0x2380,
+    0x2400, 0x2480, 0x2500, 0x2580, 0x2600, 0x2680, 0x2700, 0x2780,
+    0x2800, 0x2880, 0x2900, 0x2980, 0x2A00, 0x2A80, 0x2B00, 0x2B80,
+    0x2C00, 0x2C80, 0x2D00, 0x2D80, 0x2E00, 0x2E80, 0x2F00, 0x2F80,
+    0x3000, 0x3080, 0x3100, 0x3180, 0x3200, 0x3280, 0x3300, 0x3380,
+    0x3400, 0x3480, 0x3500, 0x3580, 0x3600, 0x3680, 0x3700, 0x3780,
+    0x3800, 0x3880, 0x3900, 0x3980, 0x3A00, 0x3A80, 0x3B00, 0x3B80,
+    0x3C00, 0x3C80, 0x3D00, 0x3D80, 0x3E00, 0x3E80, 0x3F00, 0x3F80,
+    0x4000, 0x4080, 0x4100, 0x4180, 0x4200, 0x4280, 0x4300, 0x4380,
+    0x4400, 0x4480, 0x4500, 0x4580, 0x4600, 0x4680, 0x4700, 0x4780,
+    0x4800, 0x4880, 0x4900, 0x4980, 0x4A00, 0x4A80, 0x4B00, 0x4B80,
+    0x4C00, 0x4C80, 0x4D00, 0x4D80, 0x4E00, 0x4E80, 0x4F00, 0x0000,
+    0x8000, 0x8800, 0x8C00, 0x8E00, 0x9000, 0x9100, 0x9200, 0x9300,
+    0x9400, 0x9480, 0x9500, 0x9580, 0x9600, 0x9680, 0x9700, 0x9780,
+    0x9800, 0x9880, 0x9900, 0x9980, 0x9A00, 0x9A80, 0x9B00, 0x9B80,
+    0x9C00, 0x9C80, 0x9D00, 0x9D80, 0x9E00, 0x9E80, 0x9F00, 0x9F80,
+    0xA000, 0xA080, 0xA100, 0xA180, 0xA200, 0xA280, 0xA300, 0xA380,
+    0xA400, 0xA480, 0xA500, 0xA580, 0xA600, 0xA680, 0xA700, 0xA780,
+    0xA800, 0xA880, 0xA900, 0xA980, 0xAA00, 0xAA80, 0xAB00, 0xAB80,
+    0xAC00, 0xAC80, 0xAD00, 0xAD80, 0xAE00, 0xAE80, 0xAF00, 0xAF80,
+    0xB000, 0xB080, 0xB100, 0xB180, 0xB200, 0xB280, 0xB300, 0xB380,
+    0xB400, 0xB480, 0xB500, 0xB580, 0xB600, 0xB680, 0xB700, 0xB780,
+    0xB800, 0xB880, 0xB900, 0xB980, 0xBA00, 0xBA80, 0xBB00, 0xBB80,
+    0xBC00, 0xBC80, 0xBD00, 0xBD80, 0xBE00, 0xBE80, 0xBF00, 0xBF80,
+    0xC000, 0xC080, 0xC100, 0xC180, 0xC200, 0xC280, 0xC300, 0xC380,
+    0xC400, 0xC480, 0xC500, 0xC580, 0xC600, 0xC680, 0xC700, 0xC780,
+    0xC800, 0xC880, 0xC900, 0xC980, 0xCA00, 0xCA80, 0xCB00, 0xCB80,
+    0xCC00, 0xCC80, 0xCD00, 0xCD80, 0xCE00, 0xCE80, 0xCF00, 0x0000,
+};
 
 static const uint64_t kWeightSeed = 0x5EED5EED5EED5EEDULL;
 
@@ -258,6 +295,51 @@ static ProtoWriter *makeConstexprShiftScaleOp(NSString *outputName, NSArray<NSNu
     return op;
 }
 
+static ProtoWriter *makeConstexprLUTToDenseOp(NSString *outputName, NSArray<NSNumber *> *shape, NSData *uint8Indices, NSData *lutFP16Data) {
+    ProtoWriter *op = [[ProtoWriter alloc] init];
+    [op writeStringField:1 string:@"constexpr_lut_to_dense"];
+
+    // input "indices"
+    {
+        ProtoWriter *val = makeBytesTensorValue(kMIL_UINT8, shape, uint8Indices);
+        ProtoWriter *binding = [[ProtoWriter alloc] init];
+        [binding writeMessageField:2 message:val];
+
+        ProtoWriter *arg = [[ProtoWriter alloc] init];
+        [arg writeMessageField:1 message:binding];
+
+        ProtoWriter *mapEntry = [[ProtoWriter alloc] init];
+        [mapEntry writeStringField:1 string:@"indices"];
+        [mapEntry writeMessageField:2 message:arg];
+        [op writeMessageField:2 message:mapEntry];
+    }
+
+    // input "lut" of shape [1, 1, 1, 1, 256, 1]
+    {
+        NSArray *lutShape = @[@1, @1, @1, @1, @256, @1];
+        ProtoWriter *val = makeBytesTensorValue(kMIL_FLOAT16, lutShape, lutFP16Data);
+        ProtoWriter *binding = [[ProtoWriter alloc] init];
+        [binding writeMessageField:2 message:val];
+
+        ProtoWriter *arg = [[ProtoWriter alloc] init];
+        [arg writeMessageField:1 message:binding];
+
+        ProtoWriter *mapEntry = [[ProtoWriter alloc] init];
+        [mapEntry writeStringField:1 string:@"lut"];
+        [mapEntry writeMessageField:2 message:arg];
+        [op writeMessageField:2 message:mapEntry];
+    }
+
+    ProtoWriter *outType = makeTensorType(kMIL_FLOAT16, shape);
+    [op writeMessageField:3 message:makeNamedValueType(outputName, outType)];
+
+    ProtoWriter *attrName = [[ProtoWriter alloc] init];
+    [attrName writeStringField:1 string:@"name"];
+    [attrName writeMessageField:2 message:makeStringValue(outputName)];
+    [op writeMessageField:5 message:attrName];
+    return op;
+}
+
 static ProtoWriter *makeNonConstOp(NSString *type, NSString *outputName, ProtoWriter *outputType, NSDictionary<NSString *, NSString *> *inputs) {
     ProtoWriter *op = [[ProtoWriter alloc] init];
     [op writeStringField:1 string:type];
@@ -371,8 +453,8 @@ NSData *MILBuildConvChainSpec(MILConvChainConfig config, NSError **error) {
         return nil;
     }
 
-    NSString *opset = (config.precision == MILPrecisionFP8) ? @"CoreML9" : @"CoreML8";
-    int32_t specVersion = (config.precision == MILPrecisionFP8) ? 10 : 9;
+    NSString *opset = @"CoreML8";
+    int32_t specVersion = 9;
 
     NSString *finalOut = MILConvChainOutputName(config);
     NSArray *wShape = @[@(config.channelsOut), @(config.channelsIn), @(config.kernel), @(config.kernel)];
@@ -390,14 +472,8 @@ NSData *MILBuildConvChainSpec(MILConvChainConfig config, NSError **error) {
         [block writeMessageField:3 message:makeConstOp(@"dtype_int8", makeStringScalarType(), makeStringValue(@"int8"))];
     } else if (config.precision == MILPrecisionFP8) {
         NSData *wData = generateWeightsFP8(config);
-        ProtoWriter *wVal = makeBytesTensorValue(kMIL_FLOAT8E4M3FN, wShape, wData);
-        [block writeMessageField:3 message:makeConstOp(@"raw_weights", makeTensorType(kMIL_FLOAT8E4M3FN, wShape), wVal)];
-
-        // w_scale: scalar fp16 1/16 (0x2C00)
-        [block writeMessageField:3 message:makeConstOp(@"w_scale", makeTensorType(kMIL_FLOAT16, @[]), makeFloat16ScalarValue(kFP16PlusOneSixteenth))];
-
-        ProtoWriter *fp16WeightsType = makeTensorType(kMIL_FLOAT16, wShape);
-        [block writeMessageField:3 message:makeNonConstOp(@"dequantize", @"weights", fp16WeightsType, @{@"input": @"raw_weights", @"scale": @"w_scale"})];
+        NSData *lutData = [NSData dataWithBytes:kFP8E4M3ScaledToFP16LUT length:sizeof(kFP8E4M3ScaledToFP16LUT)];
+        [block writeMessageField:3 message:makeConstexprLUTToDenseOp(@"weights", wShape, wData, lutData)];
     } else {
         NSData *wData = generateWeightsFP16(config);
         ProtoWriter *wVal = makeBytesTensorValue(kMIL_FLOAT16, wShape, wData);

@@ -53,6 +53,20 @@ final class BenchmarkViewModel: ObservableObject {
     }
     
     init() {
+        let args = ProcessInfo.processInfo.arguments
+        if args.contains("--autorun") || ProcessInfo.processInfo.environment["AUTORUN"] == "1" {
+            if args.contains("--fp8") {
+                selectedPrecision = .fp8
+            } else if args.contains("--int8") {
+                selectedPrecision = .int8
+            } else if args.contains("--fp16") {
+                selectedPrecision = .fp16
+            }
+            Task { @MainActor in
+                try? await Task.sleep(nanoseconds: 500_000_000)
+                self.startBenchmark()
+            }
+        }
         #if targetEnvironment(simulator)
         loadSampleResults()
         #endif
