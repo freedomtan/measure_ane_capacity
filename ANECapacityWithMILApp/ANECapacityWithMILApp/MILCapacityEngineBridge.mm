@@ -135,7 +135,7 @@ static void fillDenseFloat16(void *buffer, size_t count) {
 
     res.compileTimeMs = (nowSeconds() - startCompile) * 1000.0;
 
-    if (usePMU || units == MLComputeUnitsCPUAndNeuralEngine) {
+    if (usePMU) {
         return [self evaluateViaANEClientAtURL:compiledURL batch:B channels:C height:H width:W kernel:K layers:L precision:precision iterations:iterations warmup:warmup progressHandler:progress];
     }
 
@@ -237,9 +237,6 @@ static void fillDenseFloat16(void *buffer, size_t count) {
     res.loadTimeMs = (nowSeconds() - loadStart) * 1000.0;
 
     if (!model) {
-        if (usePMU || units == MLComputeUnitsCPUAndNeuralEngine) {
-            return [self evaluateViaANEClientAtURL:compiledModelURL batch:B channels:C height:H width:W kernel:K layers:L precision:precision iterations:iterations warmup:warmup progressHandler:progress];
-        }
         res.success = NO;
         res.statusMessage = [NSString stringWithFormat:@"Failed to load model: %@", error.localizedDescription];
         return res;
@@ -428,13 +425,12 @@ static void fillDenseFloat16(void *buffer, size_t count) {
     if (progress) progress([NSString stringWithFormat:@"Dispatching directly to ANE hardware driver (_ANEClient)..."]);
 
     _ANEClient *client = [_ANEClient sharedConnection];
-    NSURL *milURL = [compiledModelURL URLByAppendingPathComponent:@"model.mil"];
-    _ANEModel *aneModel = nil;
-    if ([[NSFileManager defaultManager] fileExistsAtPath:milURL.path]) {
-        aneModel = [_ANEModel modelAtURL:milURL key:nil];
-    }
+    _ANEModel *aneModel = [_ANEModel modelAtURL:compiledModelURL key:@"net"];
     if (!aneModel) {
-        aneModel = [_ANEModel modelAtURL:compiledModelURL key:@"model.mil"];
+        NSURL *milURL = [compiledModelURL URLByAppendingPathComponent:@"model.mil"];
+        if ([[NSFileManager defaultManager] fileExistsAtPath:milURL.path]) {
+            aneModel = [_ANEModel modelAtURL:milURL key:nil];
+        }
     }
     if (!aneModel) {
         aneModel = [_ANEModel modelAtURL:compiledModelURL key:nil];

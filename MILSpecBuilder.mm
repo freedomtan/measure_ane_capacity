@@ -437,11 +437,6 @@ NSData *MILBuildConvChainSpec(MILConvChainConfig config, NSError **error) {
           TensorValueType(mil::FLOAT16,
                           {config.channelsOut, config.channelsIn,
                            config.kernel, config.kernel}));
-
-    // Activation scale const: fp16 1/32
-    AddConstOp(&block, "act_scale", TensorValueType(mil::FLOAT16, {}),
-               Float16ScalarValue(kFP16PlusOneThirtySecond));
-    AddConstOp(&block, "dtype_fp8", StringScalarType(), StringValue("fp8e4m3fn"));
   } else {
     // One weight constant shared by every layer, as in the MPSGraph version.
     mil::Value weights;
@@ -483,20 +478,6 @@ NSData *MILBuildConvChainSpec(MILConvChainConfig config, NSError **error) {
              {"scale", "act_scale"},
              {"output_dtype", "dtype_int8"}},
             qName, int8QuantizedType);
-
-      std::string dqName = "dequant_" + std::to_string(i);
-      AddOp(&block, "dequantize",
-            {{"input", qName},
-             {"scale", "act_scale"}},
-            dqName, activationType);
-      convInput = std::move(dqName);
-    } else if (config.precision == MILPrecisionFP8) {
-      std::string qName = "quant_" + std::to_string(i);
-      AddOp(&block, "quantize",
-            {{"input", current},
-             {"scale", "act_scale"},
-             {"output_dtype", "dtype_fp8"}},
-            qName, fp8QuantizedType);
 
       std::string dqName = "dequant_" + std::to_string(i);
       AddOp(&block, "dequantize",
@@ -573,17 +554,6 @@ NSString *MILConvChainText(MILConvChainConfig config) {
       NSString *qName = [NSString stringWithFormat:@"quant_%lu", (unsigned long)i];
       NSString *dqName = [NSString stringWithFormat:@"dequant_%lu", (unsigned long)i];
       [text appendFormat:@"  %@ = quantize(input=%@, scale=1/32, zero_point=0, output_dtype=\"int8\")\n",
-                         qName, current];
-      [text appendFormat:@"  %@ = dequantize(input=%@, scale=1/32, zero_point=0)\n",
-                         dqName, qName];
-      [text appendFormat:@"  %@ = conv(x=%@, weight=weights, strides=[1, 1], "
-                         @"pad_type=same, pad=[0, 0, 0, 0], dilations=[1, 1], "
-                         @"groups=1)\n",
-                         convName, dqName];
-    } else if (config.precision == MILPrecisionFP8) {
-      NSString *qName = [NSString stringWithFormat:@"quant_%lu", (unsigned long)i];
-      NSString *dqName = [NSString stringWithFormat:@"dequant_%lu", (unsigned long)i];
-      [text appendFormat:@"  %@ = quantize(input=%@, scale=1/32, zero_point=0, output_dtype=\"fp8e4m3fn\")\n",
                          qName, current];
       [text appendFormat:@"  %@ = dequantize(input=%@, scale=1/32, zero_point=0)\n",
                          dqName, qName];

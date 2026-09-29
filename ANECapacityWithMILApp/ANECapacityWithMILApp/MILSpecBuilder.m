@@ -398,10 +398,6 @@ NSData *MILBuildConvChainSpec(MILConvChainConfig config, NSError **error) {
 
         ProtoWriter *fp16WeightsType = makeTensorType(kMIL_FLOAT16, wShape);
         [block writeMessageField:3 message:makeNonConstOp(@"dequantize", @"weights", fp16WeightsType, @{@"input": @"raw_weights", @"scale": @"w_scale"})];
-
-        // act_scale: scalar fp16 1/16 (0x2C00) - decoupled scale matching w_scale to avoid underflow
-        [block writeMessageField:3 message:makeConstOp(@"act_scale", makeTensorType(kMIL_FLOAT16, @[]), makeFloat16ScalarValue(kFP16PlusOneSixteenth))];
-        [block writeMessageField:3 message:makeConstOp(@"dtype_fp8", makeStringScalarType(), makeStringValue(@"fp8e4m3fn"))];
     } else {
         NSData *wData = generateWeightsFP16(config);
         ProtoWriter *wVal = makeBytesTensorValue(kMIL_FLOAT16, wShape, wData);
@@ -417,7 +413,6 @@ NSData *MILBuildConvChainSpec(MILConvChainConfig config, NSError **error) {
 
     ProtoWriter *actType = makeTensorType(kMIL_FLOAT16, actShape);
     ProtoWriter *int8ActType = makeTensorType(kMIL_INT8, actShape);
-    ProtoWriter *fp8ActType = makeTensorType(kMIL_FLOAT8E4M3FN, actShape);
 
     NSString *curr = MILConvChainInputName();
     for (NSUInteger i = 0; i < config.layers; i++) {
@@ -425,12 +420,6 @@ NSData *MILBuildConvChainSpec(MILConvChainConfig config, NSError **error) {
         if (config.precision == MILPrecisionINT8) {
             NSString *qName = [NSString stringWithFormat:@"quant_%lu", (unsigned long)i];
             [block writeMessageField:3 message:makeNonConstOp(@"quantize", qName, int8ActType, @{@"input": curr, @"scale": @"act_scale", @"output_dtype": @"dtype_int8"})];
-            NSString *dqName = [NSString stringWithFormat:@"dequant_%lu", (unsigned long)i];
-            [block writeMessageField:3 message:makeNonConstOp(@"dequantize", dqName, actType, @{@"input": qName, @"scale": @"act_scale"})];
-            convIn = dqName;
-        } else if (config.precision == MILPrecisionFP8) {
-            NSString *qName = [NSString stringWithFormat:@"quant_%lu", (unsigned long)i];
-            [block writeMessageField:3 message:makeNonConstOp(@"quantize", qName, fp8ActType, @{@"input": curr, @"scale": @"act_scale", @"output_dtype": @"dtype_fp8"})];
             NSString *dqName = [NSString stringWithFormat:@"dequant_%lu", (unsigned long)i];
             [block writeMessageField:3 message:makeNonConstOp(@"dequantize", dqName, actType, @{@"input": qName, @"scale": @"act_scale"})];
             convIn = dqName;
