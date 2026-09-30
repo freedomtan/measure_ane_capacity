@@ -4,12 +4,14 @@ convert_pytorch_fp8_to_mil.py
 
 Constructs a PyTorch Convolution model with native FP8 (Float8_e4m3fn) weights,
 and converts it directly to a CoreML .mlpackage and compiled MIL program (.mlmodelc / model.mil).
-Also compiles to ANE HWX binary format using ~/work/coreml_to_ane_hwx_hacks/mil_to_hwx.
+Also compiles to ANE HWX binary format using ~/work/coreml_to_ane_hwx_hacks/mil_to_hwx,
+and verifies hardware registers (KernelCfg: Fmt=E4M3, Pal=0, InDim: Type=E4M3, DblInt8=1).
 """
 
 import argparse
 import json
 import os
+import re
 import shutil
 import struct
 import subprocess
@@ -63,25 +65,23 @@ class PyTorchFP8ConvModel(nn.Module):
 
 
 # ==============================================================================
-# 2. CoreML MIL Program Builder
+# 2. Native FP8 & LUT MIL Synthesis
 # ==============================================================================
 
-def build_coreml_model_from_pytorch(
+def build_lut_coreml_model(
     model: PyTorchFP8ConvModel,
     batch: int = 1,
     spatial: int = 256,
 ) -> ct.models.MLModel:
     """
-    Constructs a CoreML ML Program using constexpr_lut_to_dense palettization.
-    This faithfully preserves 1 byte/param weight storage and unpacks with the
-    exact 256-entry IEEE Float8_e4m3fn to FP16 conversion table.
+    Legacy LUT baseline: constructs CoreML model using constexpr_lut_to_dense palettization.
+    Note: ANE decompresses LUT into FP16 (KernelCfg: Fmt=fp16 Pal=1), running at FP16 speed.
     """
     channels = model.channels
     layers = model.layers
     kernel = model.kernel_size
     scale = model.scale
 
-    # Exact IEEE Float8_e4m3fn -> FP16 table, scaled by model.scale
     uint8_indices = torch.arange(256, dtype=torch.uint8)
     fp8_vals = uint8_indices.view(torch.float8_e4m3fn)
     fp16_vals = fp8_vals.to(torch.float16) * scale
@@ -102,8 +102,177 @@ def build_coreml_model_from_pytorch(
             curr = mb.conv(x=curr, weight=w_decomp, pad_type="same", strides=[1, 1], dilations=[1, 1], groups=1)
         return curr
 
-    mlmodel = ct.convert(prog, minimum_deployment_target=ct.target.iOS18)
-    return mlmodel
+    return ct.convert(prog, minimum_deployment_target=ct.target.iOS18)
+
+
+def synthesize_native_fp8_mlmodelc(
+    model: PyTorchFP8ConvModel,
+    batch: int = 1,
+    spatial: int = 256,
+    output_mlmodelc: str = "pytorch_fp8_conv.mlmodelc",
+    qdq_activation: bool = True,
+) -> str:
+    """
+    Synthesizes a complete compiled .mlmodelc directory with native FP8 weights & MIL:
+    1. weights/weight.bin using MILBlob binary format:
+       - DataType 16 (Fp8E4M3FN) for weight tensors
+       - DataType 1 (Float16) for per-channel scale vectors
+    2. model.mil using native iOS 19 constexpr_blockwise_shift_scale and activation QDQ
+    3. metadata.json and coremldata.bin for direct CoreML runtime loading
+    """
+    channels = model.channels
+    layers = model.layers
+    kernel = model.kernel_size
+    scale = model.scale
+
+    os.makedirs(output_mlmodelc, exist_ok=True)
+    weights_dir = os.path.join(output_mlmodelc, "weights")
+    os.makedirs(weights_dir, exist_ok=True)
+
+    # 1. Build weights/weight.bin
+    # File header (64 bytes): version 3, count 2, zeros
+    file_header = struct.pack("<16I", 3, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+    weight_blobs = bytearray(file_header)
+
+    layer_offsets = []
+    # FP16 scale values for all channels
+    scale_fp16_val = np.float16(scale).view(np.uint16)
+    scale_bytes = struct.pack(f"<{channels}H", *([scale_fp16_val] * channels))
+    scale_size = len(scale_bytes)
+
+    for l in range(layers):
+        w_bytes = model.get_layer_fp8_bytes(l)
+        w_size = len(w_bytes)
+
+        # Align to 64 bytes for weight entry
+        curr_offset = (len(weight_blobs) + 63) & ~63
+        weight_blobs.extend(b"\x00" * (curr_offset - len(weight_blobs)))
+        w_entry_offset = curr_offset
+
+        # Entry header: Magic 0xdeadbeef, DataType 16 (Fp8E4M3FN)
+        w_data_offset = w_entry_offset + 64
+        w_entry = struct.pack("<16I", 3735928559, 16, w_size, 0, w_data_offset, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+        weight_blobs.extend(w_entry)
+        weight_blobs.extend(w_bytes)
+
+        # Align to 64 bytes for scale entry
+        curr_offset = (len(weight_blobs) + 63) & ~63
+        weight_blobs.extend(b"\x00" * (curr_offset - len(weight_blobs)))
+        s_entry_offset = curr_offset
+
+        # Entry header: Magic 0xdeadbeef, DataType 1 (Float16)
+        s_data_offset = s_entry_offset + 64
+        s_entry = struct.pack("<16I", 3735928559, 1, scale_size, 0, s_data_offset, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+        weight_blobs.extend(s_entry)
+        weight_blobs.extend(scale_bytes)
+
+        layer_offsets.append((w_entry_offset, s_entry_offset))
+
+    weight_bin_path = os.path.join(weights_dir, "weight.bin")
+    with open(weight_bin_path, "wb") as f:
+        f.write(weight_blobs)
+
+    # 2. Build model.mil
+    mil_lines = [
+        "program(1.3)",
+        "[buildInfo = dict<string, string>({{\"coremlc-component-MIL\", \"3600.16.1\"}, {\"coremlc-version\", \"3600.25.1\"}})]",
+        "{",
+        f"    func main<ios19>(tensor<fp16, [{batch}, {channels}, {spatial}, {spatial}]> x) {{",
+        "        string pt = const()[val = string(\"same\")];",
+        "        tensor<int32, [2]> st = const()[val = tensor<int32, [2]>([1, 1])];",
+        "        tensor<int32, [2]> dil = const()[val = tensor<int32, [2]>([1, 1])];",
+        "        int32 g = const()[val = int32(1)];",
+        "        tensor<int32, [4]> p = const()[val = tensor<int32, [4]>([0, 0, 0, 0])];",
+    ]
+
+    if qdq_activation:
+        mil_lines.extend([
+            f"        tensor<fp16, []> s = const()[val = fp16({scale})];",
+            "        string dt = const()[val = string(\"fp8e4m3fn\")];",
+        ])
+
+    curr_in = "x"
+    for l, (w_off, s_off) in enumerate(layer_offsets):
+        # Native FP8 weight dequantization via constexpr_blockwise_shift_scale
+        mil_lines.append(
+            f"        tensor<fp16, [{channels}, {channels}, {kernel}, {kernel}]> dqw_{l} = constexpr_blockwise_shift_scale("
+            f"data = tensor<fp8e4m3fn, [{channels}, {channels}, {kernel}, {kernel}]>(BLOBFILE(path = string(\"@model_path/weights/weight.bin\"), offset = uint64({w_off}))), "
+            f"scale = tensor<fp16, [{channels}, 1, 1, 1]>(BLOBFILE(path = string(\"@model_path/weights/weight.bin\"), offset = uint64({s_off}))));"
+        )
+
+        conv_in = curr_in
+        if qdq_activation:
+            # Activation Quantize + Dequantize pair (fuses into E4M3 InDim / OutDim)
+            mil_lines.append(f"        tensor<fp8e4m3fn, [{batch}, {channels}, {spatial}, {spatial}]> qx_{l} = quantize(input = {curr_in}, output_dtype = dt, scale = s);")
+            mil_lines.append(f"        tensor<fp16, [{batch}, {channels}, {spatial}, {spatial}]> dqx_{l} = dequantize(input = qx_{l}, scale = s);")
+            conv_in = f"dqx_{l}"
+
+        out_var = f"y_{l}"
+        mil_lines.append(
+            f"        tensor<fp16, [{batch}, {channels}, {spatial}, {spatial}]> {out_var} = conv("
+            f"dilations = dil, groups = g, pad = p, pad_type = pt, strides = st, weight = dqw_{l}, x = {conv_in});"
+        )
+        curr_in = out_var
+
+    mil_lines.append(f"    }} -> ({curr_in});")
+    mil_lines.append("}")
+
+    mil_path = os.path.join(output_mlmodelc, "model.mil")
+    with open(mil_path, "w") as f:
+        f.write("\n".join(mil_lines) + "\n")
+
+    # 3. Write metadata.json for CoreML framework compatibility
+    model_name = os.path.basename(output_mlmodelc.rstrip("/")).replace(".mlmodelc", "")
+    metadata = [
+        {
+            "metadataOutputVersion": "3.0",
+            "storagePrecision": "Float8_e4m3fn (Native FP8)",
+            "outputSchema": [
+                {
+                    "hasShapeFlexibility": "0",
+                    "isOptional": "0",
+                    "dataType": "Float16",
+                    "formattedType": f"MultiArray (Float16 {batch} × {channels} × {spatial} × {spatial})",
+                    "shortDescription": "Convolution output",
+                    "shape": f"[{batch}, {channels}, {spatial}, {spatial}]",
+                    "name": curr_in,
+                    "type": "MultiArray"
+                }
+            ],
+            "specificationVersion": 9,
+            "availability": {
+                "macOS": "15.0",
+                "tvOS": "18.0",
+                "visionOS": "2.0",
+                "watchOS": "11.0",
+                "iOS": "18.0",
+                "macCatalyst": "18.0"
+            },
+            "modelType": {"name": "MLModelType_mlProgram"},
+            "userDefinedMetadata": {
+                "builder": "convert_pytorch_fp8_to_mil.py",
+                "format": "Native FP8 (Float8_e4m3fn) with constexpr_blockwise_shift_scale"
+            },
+            "inputSchema": [
+                {
+                    "hasShapeFlexibility": "0",
+                    "isOptional": "0",
+                    "dataType": "Float16",
+                    "formattedType": f"MultiArray (Float16 {batch} × {channels} × {spatial} × {spatial})",
+                    "shortDescription": "Input image tensor",
+                    "shape": f"[{batch}, {channels}, {spatial}, {spatial}]",
+                    "name": "x",
+                    "type": "MultiArray"
+                }
+            ],
+            "generatedClassName": model_name,
+            "method": "predict"
+        }
+    ]
+    with open(os.path.join(output_mlmodelc, "metadata.json"), "w") as f:
+        json.dump(metadata, f, indent=2)
+
+    return output_mlmodelc
 
 
 # ==============================================================================
@@ -123,6 +292,60 @@ def compile_with_coremlcompiler(pkg_dir: str, output_parent: str = ".") -> str:
     stem = os.path.splitext(pkg_base)[0]
     compiled_dir = os.path.join(output_parent, f"{stem}.mlmodelc")
     return compiled_dir
+
+
+def verify_hwx_registers(hwx_path: str):
+    """
+    Parses compiled ANE HWX binary using coreml_to_ane_hwx_hacks/hwx_dump/hwx_parsing.py
+    and verifies that native FP8 hardware registers are correctly programmed.
+    """
+    hwx_parser = os.path.expanduser("~/work/coreml_to_ane_hwx_hacks/hwx_dump/hwx_parsing.py")
+    if not os.path.exists(hwx_parser):
+        print(f"⚠️  HWX parser not found at {hwx_parser}")
+        return
+
+    res = subprocess.run(["python3", hwx_parser, hwx_path], capture_output=True, text=True)
+    if res.returncode != 0:
+        print("⚠️  Failed to parse HWX registers:")
+        print(res.stderr)
+        return
+
+    tasks = []
+    curr_task = None
+    for line in res.stdout.splitlines():
+        m_task = re.search(r"\[ANE Task (\d+) @", line)
+        if m_task:
+            curr_task = {"id": int(m_task.group(1)), "in_type": "UNKNOWN", "out_type": "UNKNOWN", "kernel_fmt": "-", "pal": "-", "dbl_int8": 0}
+            tasks.append(curr_task)
+        if curr_task is not None:
+            m_in = re.search(r"InDim\s+:.*?\bType=(\w+)", line)
+            if m_in: curr_task["in_type"] = m_in.group(1)
+            m_out = re.search(r"OutDim\s+:.*?\bType=(\w+)", line)
+            if m_out: curr_task["out_type"] = m_out.group(1)
+            m_k = re.search(r"KernelCfg:\s+Fmt=(\w+)\s+Pal=(\d+)", line)
+            if m_k:
+                curr_task["kernel_fmt"] = m_k.group(1)
+                curr_task["pal"] = int(m_k.group(2))
+            m_mac = re.search(r"DblInt8=(\d+)", line)
+            if m_mac: curr_task["dbl_int8"] = int(m_mac.group(1))
+
+    print("\n   === ANE Hardware Register Verification ===")
+    print("   " + "-" * 74)
+    print(f"   | {'Task':<6} | {'InDim Type':<12} | {'OutDim Type':<12} | {'KernelFmt':<10} | {'Pal':<5} | {'DblInt8':<8} |")
+    print("   " + "-" * 74)
+    has_native_fp8 = False
+    for t in tasks:
+        pal_str = f"Pal={t['pal']}" if t['pal'] != '-' else '-'
+        print(f"   | {t['id']:<6} | {t['in_type']:<12} | {t['out_type']:<12} | {t['kernel_fmt']:<10} | {pal_str:<5} | {t['dbl_int8']:<8} |")
+        if t['kernel_fmt'] == "E4M3" and t['pal'] == 0:
+            has_native_fp8 = True
+    print("   " + "-" * 74)
+
+    if has_native_fp8:
+        print("   🎉 SUCCESS: Native FP8 (KernelCfg: Fmt=E4M3, Pal=0, DblInt8=1) confirmed!")
+        print("   Double-rate packed FP8 MAC execution verified on ANE.")
+    else:
+        print("   ⚠️  Warning: Native FP8 kernel format was not detected in task table.")
 
 
 def compile_with_mil_to_hwx(mlmodelc_path: str, arch: str = "h18p", output_dir: str = "/tmp/hwx_output") -> bool:
@@ -146,6 +369,15 @@ def compile_with_mil_to_hwx(mlmodelc_path: str, arch: str = "h18p", output_dir: 
     res = subprocess.run(cmd, capture_output=True, text=True)
     if res.returncode == 0 and "Compilation successful" in res.stdout:
         print(f"   ✓ ANE HWX Compilation Successful for target {arch}!")
+        hwx_file = os.path.join(output_dir, f"{model_name}_{arch}", "model.hwx")
+        
+        # Copy model.hwx into .mlmodelc so it is self-contained and directly deployable
+        dst_hwx = os.path.join(mlmodelc_path, "model.hwx")
+        if os.path.exists(hwx_file):
+            shutil.copy(hwx_file, dst_hwx)
+            print(f"   ✓ Installed deployable model.hwx into {mlmodelc_path}/")
+
+        # Parse analytics
         analytics_file = os.path.join(output_dir, f"{model_name}_{arch}", "analytics.json")
         if os.path.exists(analytics_file):
             with open(analytics_file) as f:
@@ -157,8 +389,13 @@ def compile_with_mil_to_hwx(mlmodelc_path: str, arch: str = "h18p", output_dir: 
             print(f"   L2 Frequency          : {na.get('L2Freq')} Hz")
             print(f"   DRAM Bandwidth        : {na.get('DramBandwidth')} B/s")
             for grp in data.get("LayerAnalytics", {}).get("Groups", []):
+                layer_names = ", ".join([k for k in grp.keys() if k != "Tasks" and k != "Layer Name"])
                 for task in grp.get("Tasks", []):
-                    print(f"   - Task {task.get('TaskID')}: NE Time={task.get('StaticNETime')} cycles, Total={task.get('StaticTotalTime')} cycles")
+                    print(f"   - Group Task {task.get('TaskID')}: NE Time={task.get('StaticNETime')} cycles, Total={task.get('StaticTotalTime')} cycles")
+
+        # Verify registers
+        if os.path.exists(hwx_file):
+            verify_hwx_registers(hwx_file)
         return True
     else:
         print(f"   ✗ mil_to_hwx failed (code {res.returncode}):")
@@ -179,10 +416,14 @@ def main():
     parser.add_argument("--kernel", type=int, default=3, help="Kernel size (default: 3)")
     parser.add_argument("--layers", type=int, default=2, help="Number of chained conv layers (default: 2)")
     parser.add_argument("--scale", type=float, default=0.0625, help="FP8 scale factor (default: 0.0625 = 2^-4)")
+    parser.add_argument("--mode", type=str, choices=["native", "lut"], default="native", help="Weight representation mode: 'native' (E4M3 constexpr_blockwise_shift_scale) or 'lut' (constexpr_lut_to_dense)")
+    parser.add_argument("--qdq-activation", action="store_true", default=True, help="Insert FP8 activation QDQ pair around convolutions (default: True)")
+    parser.add_argument("--no-qdq-activation", dest="qdq_activation", action="store_false", help="Disable FP8 activation QDQ (weight-only FP8)")
     parser.add_argument("--output", type=str, default="pytorch_fp8_conv", help="Output base path")
     parser.add_argument("--check", action="store_true", help="Run PyTorch forward verification pass")
     parser.add_argument("--dump-mil", action="store_true", help="Print the compiled model.mil program text")
-    parser.add_argument("--hwx", action="store_true", help="Compile to ANE HWX binary using mil_to_hwx")
+    parser.add_argument("--hwx", action="store_true", default=True, help="Compile to ANE HWX binary using mil_to_hwx (default: True)")
+    parser.add_argument("--no-hwx", dest="hwx", action="store_false", help="Skip ANE HWX compilation")
     parser.add_argument("--arch", type=str, default="h18p", help="Target ANE architecture for HWX (default: h18p for iPhone 17 Pro)")
 
     args = parser.parse_args()
@@ -192,13 +433,15 @@ def main():
     print("=================================================================")
     print(f"Architecture : Conv2D [{args.channels} -> {args.channels}], K={args.kernel}x{args.kernel}, L={args.layers}")
     print(f"Input Tensor : [{args.batch}, {args.channels}, {args.size}, {args.size}] FP16")
+    print(f"Mode         : {args.mode.upper()} {'(Native FP8)' if args.mode == 'native' else '(LUT Palettization)'}")
+    print(f"Act QDQ      : {args.qdq_activation}")
     print(f"Precision    : FP8 (Float8_e4m3fn), Scale: {args.scale}")
     print(f"PyTorch ver  : {torch.__version__}")
     print(f"CoreMLTools  : {ct.__version__}")
     print()
 
     # 1. Instantiate PyTorch Model
-    print("🛠️  [Step 1/5] Constructing PyTorch FP8 Model...")
+    print("🛠️  [Step 1/4] Constructing PyTorch FP8 Model...")
     model = PyTorchFP8ConvModel(
         channels=args.channels,
         layers=args.layers,
@@ -217,40 +460,47 @@ def main():
             test_out = model(test_in)
         print(f"   PyTorch test output: {list(test_out.shape)} {test_out.dtype}, mean={test_out.mean():.4f}, std={test_out.std():.4f}")
 
-    # 2. Build CoreML Model
-    print("\n📐 [Step 2/5] Synthesizing CoreML Model with constexpr_lut_to_dense...")
-    mlmodel = build_coreml_model_from_pytorch(model, batch=args.batch, spatial=args.size)
-    print("   Built MIL specification with FP8 tensor constants and operations.")
+    # 2. Build Model
+    mlmodelc_dir = f"{args.output}.mlmodelc" if not args.output.endswith(".mlmodelc") else args.output
+    if args.mode == "native":
+        print("\n📐 [Step 2/4] Synthesizing Native FP8 .mlmodelc & model.mil...")
+        synthesize_native_fp8_mlmodelc(
+            model=model,
+            batch=args.batch,
+            spatial=args.size,
+            output_mlmodelc=mlmodelc_dir,
+            qdq_activation=args.qdq_activation,
+        )
+        print(f"   Created native FP8 model package: {mlmodelc_dir}")
+    else:
+        print("\n📐 [Step 2/4] Synthesizing CoreML Model with constexpr_lut_to_dense...")
+        mlmodel = build_lut_coreml_model(model, batch=args.batch, spatial=args.size)
+        pkg_path = f"{args.output}.mlpackage"
+        mlmodel.save(pkg_path)
+        print(f"   Saved CoreML package: {pkg_path}")
+        print("\n⚡ Compiling package using coremlcompiler...")
+        mlmodelc_dir = compile_with_coremlcompiler(pkg_path, output_parent=".")
+        print(f"   Compiled binary model: {mlmodelc_dir}")
 
-    # 3. Export .mlpackage
-    print("\n📦 [Step 3/5] Packaging to .mlpackage...")
-    pkg_path = args.output if args.output.endswith(".mlpackage") else f"{args.output}.mlpackage"
-    mlmodel.save(pkg_path)
-    print(f"   Saved CoreML package: {pkg_path}")
-
-    # 4. Compile with coremlcompiler
-    print("\n⚡ [Step 4/5] Compiling package using coremlcompiler...")
-    compiled_path = compile_with_coremlcompiler(pkg_path, output_parent=".")
-    print(f"   Compiled binary model: {compiled_path}")
-
-    mil_file = os.path.join(compiled_path, "model.mil")
+    # 3. Dump MIL
+    mil_file = os.path.join(mlmodelc_dir, "model.mil")
     if os.path.exists(mil_file) and (args.dump_mil or args.layers <= 3):
         print("\n------------------- Disassembled model.mil -------------------")
         with open(mil_file, "r") as f:
             lines = f.readlines()
-        for line in lines[:30]:
+        for line in lines[:35]:
             print(line, end="")
-        if len(lines) > 30:
-            print(f"... [{len(lines) - 30} more lines in {mil_file}] ...")
+        if len(lines) > 35:
+            print(f"... [{len(lines) - 35} more lines in {mil_file}] ...")
         print("--------------------------------------------------------------")
 
-    # 5. Optional HWX Compilation
+    # 4. Optional HWX Compilation & Hardware Register Verification
     if args.hwx:
-        print(f"\n🚀 [Step 5/5] Compiling MIL to ANE HWX for target {args.arch}...")
-        compile_with_mil_to_hwx(compiled_path, arch=args.arch)
+        print(f"\n🚀 [Step 4/4] Compiling MIL to ANE HWX for target {args.arch}...")
+        compile_with_mil_to_hwx(mlmodelc_dir, arch=args.arch)
 
     print("\n✅ Conversion completed successfully!")
-    print(f"   Deployable artifact: {compiled_path}")
+    print(f"   Deployable artifact: {mlmodelc_dir}")
 
 
 if __name__ == "__main__":

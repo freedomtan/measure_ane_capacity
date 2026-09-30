@@ -21,3 +21,5 @@ hwx_output/
 xcuserdata/
 *.xcuserstate
 build/
+*.mlpackage/
+*.mlmodelc/
