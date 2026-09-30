@@ -224,6 +224,58 @@ struct ChartsView: View {
         }
     }
     
+    private let seriesColorScale: KeyValuePairs<String, Color> = [
+        "ANE FP16": Color.blue,
+        "ANE INT8": Color.orange,
+        "ANE FP8 (E4M3)": Color.mint,
+        "GPU FP16": Color.purple,
+        "GPU INT8": Color.indigo,
+        "GPU FP8 (E4M3)": Color.cyan,
+        "[MPS] ANE FP16": Color.blue,
+        "[MPS] ANE INT8": Color.orange,
+        "[MPS] ANE FP8 (E4M3)": Color.mint,
+        "[MPS] GPU FP16": Color.purple,
+        "[MPS] GPU INT8": Color.indigo,
+        "[MPS] GPU FP8 (E4M3)": Color.cyan,
+        "[MIL] ANE FP16": Color.teal,
+        "[MIL] ANE INT8": Color.pink,
+        "[MIL] ANE FP8 (E4M3)": Color.green,
+        "[MIL] GPU FP16": Color.brown,
+        "[MIL] GPU INT8": Color.red,
+        "[MIL] GPU FP8 (E4M3)": Color.yellow
+    ]
+    
+    @ViewBuilder
+    private func chartOverlayView(proxy: ChartProxy) -> some View {
+        GeometryReader { geo in
+            Rectangle().fill(.clear).contentShape(Rectangle())
+                .gesture(
+                    DragGesture(minimumDistance: 0)
+                        .onChanged { val in
+                            let plotOrigin = geo[proxy.plotAreaFrame].origin
+                            let xLoc = val.location.x - plotOrigin.x
+                            let yLoc = val.location.y - plotOrigin.y
+                            
+                            guard let xVal: Double = proxy.value(atX: xLoc) else { return }
+                            
+                            guard let closestStep = filteredResults.min(by: { abs($0.sweepValue - xVal) < abs($1.sweepValue - xVal) })?.sweepValue else { return }
+                            
+                            let stepCandidates = filteredResults.filter { $0.sweepValue == closestStep }
+                            
+                            if stepCandidates.count > 1, let touchY: Double = proxy.value(atY: yLoc) {
+                                selectedPoint = stepCandidates.min(by: {
+                                    let y0 = valueForMetric($0)
+                                    let y1 = valueForMetric($1)
+                                    return abs(y0 - touchY) < abs(y1 - touchY)
+                                })
+                            } else {
+                                selectedPoint = stepCandidates.first
+                            }
+                        }
+                )
+        }
+    }
+    
     // MARK: - Main Chart Card
     private var chartCard: some View {
         VStack(alignment: .leading, spacing: 14) {
@@ -301,35 +353,16 @@ struct ChartsView: View {
                         }
                 }
             }
-            .chartForegroundStyleScale([
-                "ANE FP16": Color.blue,
-                "ANE INT8": Color.orange,
-                "ANE FP8 (E4M3)": Color.mint,
-                "GPU FP16": Color.purple,
-                "GPU INT8": Color.indigo,
-                "GPU FP8 (E4M3)": Color.cyan,
-                "[MPS] ANE FP16": Color.blue,
-                "[MPS] ANE INT8": Color.orange,
-                "[MPS] ANE FP8 (E4M3)": Color.mint,
-                "[MPS] GPU FP16": Color.purple,
-                "[MPS] GPU INT8": Color.indigo,
-                "[MPS] GPU FP8 (E4M3)": Color.cyan,
-                "[MIL] ANE FP16": Color.teal,
-                "[MIL] ANE INT8": Color.pink,
-                "[MIL] ANE FP8 (E4M3)": Color.green,
-                "[MIL] GPU FP16": Color.brown,
-                "[MIL] GPU INT8": Color.red,
-                "[MIL] GPU FP8 (E4M3)": Color.yellow
-            ])
+            .chartForegroundStyleScale(seriesColorScale)
             .chartXAxis {
-                AxisMarks(values: .automatic) { value in
+                AxisMarks(values: .automatic) { _ in
                     AxisGridLine()
                     AxisTick()
                     AxisValueLabel()
                 }
             }
             .chartYAxis {
-                AxisMarks(values: .automatic) { value in
+                AxisMarks(values: .automatic) { _ in
                     AxisGridLine()
                     AxisTick()
                     AxisValueLabel()
@@ -337,35 +370,7 @@ struct ChartsView: View {
             }
             .frame(height: 280)
             .chartOverlay { proxy in
-                GeometryReader { geo in
-                    Rectangle().fill(.clear).contentShape(Rectangle())
-                        .gesture(
-                            DragGesture(minimumDistance: 0)
-                                .onChanged { val in
-                                    let plotOrigin = geo[proxy.plotAreaFrame].origin
-                                    let xLoc = val.location.x - plotOrigin.x
-                                    let yLoc = val.location.y - plotOrigin.y
-                                    
-                                    guard let xVal: Double = proxy.value(atX: xLoc) else { return }
-                                    
-                                    // Find closest sweep step
-                                    guard let closestStep = filteredResults.min(by: { abs($0.sweepValue - xVal) < abs($1.sweepValue - xVal) })?.sweepValue else { return }
-                                    
-                                    let stepCandidates = filteredResults.filter { $0.sweepValue == closestStep }
-                                    
-                                    // If multiple points at this step (e.g. FP16 and INT8), pick closest along Y to user's touch
-                                    if stepCandidates.count > 1, let touchY: Double = proxy.value(atY: yLoc) {
-                                        selectedPoint = stepCandidates.min(by: {
-                                            let y0 = valueForMetric($0)
-                                            let y1 = valueForMetric($1)
-                                            return abs(y0 - touchY) < abs(y1 - touchY)
-                                        })
-                                    } else {
-                                        selectedPoint = stepCandidates.first
-                                    }
-                                }
-                        )
-                }
+                chartOverlayView(proxy: proxy)
             }
         }
         .padding()

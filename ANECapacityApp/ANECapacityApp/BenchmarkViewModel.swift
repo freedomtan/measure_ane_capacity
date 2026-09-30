@@ -461,7 +461,6 @@ final class BenchmarkViewModel: ObservableObject {
     
     // MARK: - Sweep Benchmark Flow
     private func runSweepBenchmarkFlow() async {
-        let precisions = precisionsToRun
         let backends = backendsToRun
         
         // Define sweep points
@@ -528,7 +527,7 @@ final class BenchmarkViewModel: ObservableObject {
         case .fullCapacity:
             // Comprehensive sweep across channels with fixed H=256, W=256, K=3, L=20
             for ch in [32, 64, 128, 256, 384, 512] {
-                var d = ConvDimensions(opType: .conv2d, batch: 1, height: 256, width: 256, inChannels: ch, outChannels: ch, kernelSize: 3, layers: 20)
+                let d = ConvDimensions(opType: .conv2d, batch: 1, height: 256, width: 256, inChannels: ch, outChannels: ch, kernelSize: 3, layers: 20)
                 points.append(SweepPoint(dims: d, value: Double(ch), label: "\(ch)c"))
             }
         case .matmulDimensions:

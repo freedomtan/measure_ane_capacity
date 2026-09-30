@@ -488,7 +488,7 @@ final class ANECapacityEngine {
         let avgMs = avgSec * 1000.0
         
         // Calculate TOPS: totalOps / (avgSec * 1e12)
-        var tops = dims.totalOperations / (avgSec * 1e12)
+        let tops = dims.totalOperations / (avgSec * 1e12)
 
         // A degenerate all-zero result reads as a plausible, even fast,
         // number here -- wall-clock latency alone can't tell real work from

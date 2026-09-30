@@ -67,6 +67,7 @@ final class MILCapacityEngine {
             width = UInt(dims.width)
             kernel = UInt(dims.kernelSize)
         }
+        _ = chOut
         
         // Call Objective-C Bridge to build, compile, and evaluate dynamically on-device
         let res = await withCheckedContinuation { continuation in
