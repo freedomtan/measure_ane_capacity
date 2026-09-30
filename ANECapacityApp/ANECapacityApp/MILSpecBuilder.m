@@ -373,8 +373,19 @@ static NSData *generateWeightsFP16(MILConvChainConfig config) {
     NSMutableData *data = [NSMutableData dataWithLength:count * sizeof(uint16_t)];
     uint16_t *p = (uint16_t *)data.mutableBytes;
 
+    size_t reductionLen = config.channelsIn * config.kernel * config.kernel;
+    double weightMag = 0.96 / sqrt((double)(reductionLen > 0 ? reductionLen : 1));
+
     if (config.weightMode == MILWeightModeRepeat) {
-        static const uint16_t pattern[4] = {kFP16PlusOneSixteenth, kFP16MinusOneSixteenth, kFP16PlusOneThirtySecond, kFP16MinusOneThirtySecond};
+        _Float16 p0 = (_Float16)(weightMag * 0.85);
+        _Float16 p1 = (_Float16)(-weightMag * 0.95);
+        _Float16 p2 = (_Float16)(weightMag * 1.05);
+        _Float16 p3 = (_Float16)(-weightMag * 1.15);
+        uint16_t pattern[4];
+        memcpy(&pattern[0], &p0, sizeof(uint16_t));
+        memcpy(&pattern[1], &p1, sizeof(uint16_t));
+        memcpy(&pattern[2], &p2, sizeof(uint16_t));
+        memcpy(&pattern[3], &p3, sizeof(uint16_t));
         for (size_t i = 0; i < count; i++) p[i] = pattern[i % 4];
     } else {
         uint64_t state = kWeightSeed;
@@ -382,7 +393,13 @@ static NSData *generateWeightsFP16(MILConvChainConfig config) {
             state ^= state << 13;
             state ^= state >> 7;
             state ^= state << 17;
-            p[i] = (state & 1) ? kFP16MinusOneThirtySecond : kFP16PlusOneThirtySecond;
+            float tier = (float)((state >> 1) & 3);
+            float mag = (float)(weightMag * (0.85 + tier * 0.10));
+            _Float16 val = (_Float16)mag;
+            uint16_t posBits = 0;
+            memcpy(&posBits, &val, sizeof(uint16_t));
+            uint16_t negBits = posBits | 0x8000;
+            p[i] = (state & 1) ? negBits : posBits;
         }
     }
     return data;

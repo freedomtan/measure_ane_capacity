@@ -588,8 +588,10 @@ final class ANECapacityEngine {
         }
         
         let resultMsg = String(
-            format: "[%@ %@] Avg: %.2f ms, Throughput: %.4f TOPS (%.1f GFLOPs/iter)",
-            target.shortName, precision.rawValue, avgMs, tops, dims.gflops
+            format: "[%@ %@] Avg: %.2f ms, Throughput: %.4f TOPS (%.1f GFLOPs/iter), Zeros: %ld/%ld (%.1f%%)",
+            target.shortName, precision.rawValue, avgMs, tops, dims.gflops,
+            zeroCount, outputElementCount,
+            outputElementCount > 0 ? Double(zeroCount) * 100.0 / Double(outputElementCount) : 0.0
         )
         logHandler(resultMsg)
         

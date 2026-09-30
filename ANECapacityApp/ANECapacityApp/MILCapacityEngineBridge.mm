@@ -74,8 +74,13 @@ static void fillDenseFloat16(void *buffer, size_t count) {
         state ^= state << 13;
         state ^= state >> 7;
         state ^= state << 17;
-        // Non-canceling +/- 1.0 (0x3C00 / 0xBC00)
-        p[i] = (state & 1) ? 0xBC00 : 0x3C00;
+        float tier = (float)((state >> 1) & 3);
+        float mag = 0.85f + tier * 0.10f; // 0.85, 0.95, 1.05, 1.15
+        _Float16 val = (_Float16)mag;
+        uint16_t posBits = 0;
+        memcpy(&posBits, &val, sizeof(uint16_t));
+        uint16_t negBits = posBits | 0x8000;
+        p[i] = (state & 1) ? negBits : posBits;
     }
 }
 
