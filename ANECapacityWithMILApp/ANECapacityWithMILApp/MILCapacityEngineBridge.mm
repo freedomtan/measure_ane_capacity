@@ -74,8 +74,8 @@ static void fillDenseFloat16(void *buffer, size_t count) {
         state ^= state << 13;
         state ^= state >> 7;
         state ^= state << 17;
-        // Non-canceling +/- 0.03125 (0x2800 / 0xA800)
-        p[i] = (state & 1) ? 0xA800 : 0x2800;
+        // Non-canceling +/- 1.0 (0x3C00 / 0xBC00)
+        p[i] = (state & 1) ? 0xBC00 : 0x3C00;
     }
 }
 
@@ -297,7 +297,8 @@ static void fillDenseFloat16(void *buffer, size_t count) {
     if (progress) progress([NSString stringWithFormat:@"Running %lu timed prediction iterations...", (unsigned long)iterations]);
     NSMutableArray<NSNumber *> *latencies = [NSMutableArray arrayWithCapacity:iterations];
     double totalSec = 0.0;
-    id<MLFeatureProvider> lastResult = nil;
+    MLMultiArray *savedOutArray = nil;
+    NSSet<NSString *> *featureNamesFound = nil;
 
     for (NSUInteger iter = 0; iter < iterations; iter++) {
         @autoreleasepool {
@@ -307,7 +308,14 @@ static void fillDenseFloat16(void *buffer, size_t count) {
             if (pred) {
                 [latencies addObject:@(dt)];
                 totalSec += (dt / 1000.0);
-                lastResult = pred;
+                if (iter == iterations - 1) {
+                    featureNamesFound = [NSSet setWithArray:pred.featureNames.allObjects];
+                    MLMultiArray *arr = [pred featureValueForName:outName].multiArrayValue;
+                    if (!arr && pred.featureNames.count > 0) {
+                        arr = [pred featureValueForName:pred.featureNames.allObjects.firstObject].multiArrayValue;
+                    }
+                    savedOutArray = arr;
+                }
             } else {
                 res.success = NO;
                 res.statusMessage = [NSString stringWithFormat:@"Prediction failed on iter %lu: %@", (unsigned long)iter, error.localizedDescription];
@@ -331,22 +339,40 @@ static void fillDenseFloat16(void *buffer, size_t count) {
     res.maxLatencyMs = maxMs;
 
     // Output Verification
-    MLMultiArray *outArray = [lastResult featureValueForName:outName].multiArrayValue;
-    if (!outArray && lastResult.featureNames.count > 0) {
-        NSString *firstKey = lastResult.featureNames.allObjects.firstObject;
-        outArray = [lastResult featureValueForName:firstKey].multiArrayValue;
-    }
+    MLMultiArray *outArray = savedOutArray;
     if (outArray) {
         res.totalElementCount = (NSInteger)(B * C * H * W);
         NSInteger zeros = 0;
+        NSInteger nans = 0;
+        float minF = INFINITY, maxF = -INFINITY;
         uint16_t *ptr = (uint16_t *)outArray.dataPointer;
         for (NSInteger i = 0; i < res.totalElementCount; i++) {
-            if (ptr[i] == 0x0000 || ptr[i] == 0x8000) {
+            uint16_t raw = ptr[i];
+            if (raw == 0x0000 || raw == 0x8000) {
                 zeros++;
+            } else if ((raw & 0x7C00) == 0x7C00 && (raw & 0x03FF) != 0) {
+                nans++;
+            } else {
+                _Float16 f16;
+                memcpy(&f16, &raw, sizeof(uint16_t));
+                float f = (float)f16;
+                if (f < minF) minF = f;
+                if (f > maxF) maxF = f;
             }
         }
         res.zeroElementCount = zeros;
-        res.outputFiniteAndNonZero = (zeros < res.totalElementCount);
+        res.outputFiniteAndNonZero = (zeros < res.totalElementCount && nans == 0);
+        if (progress) {
+            progress([NSString stringWithFormat:@"[Output Check] Names=%@ Shape=%@ Zeros: %ld/%ld (%.2f%%), NaNs: %ld, Range: [%.4f, %.4f], Sample[0..3]: 0x%04X 0x%04X 0x%04X 0x%04X",
+                      featureNamesFound ? [featureNamesFound.allObjects componentsJoinedByString:@","] : @"none",
+                      outArray.shape,
+                      (long)zeros, (long)res.totalElementCount, (double)zeros * 100.0 / (double)res.totalElementCount, (long)nans,
+                      minF == INFINITY ? 0.0 : minF, maxF == -INFINITY ? 0.0 : maxF,
+                      res.totalElementCount > 0 ? ptr[0] : 0,
+                      res.totalElementCount > 1 ? ptr[1] : 0,
+                      res.totalElementCount > 2 ? ptr[2] : 0,
+                      res.totalElementCount > 3 ? ptr[3] : 0]);
+        }
     }
 
     // Optional PMU Telemetry via _ANEClient

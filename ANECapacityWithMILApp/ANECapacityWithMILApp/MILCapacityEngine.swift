@@ -66,7 +66,7 @@ final class MILCapacityEngine {
                     computeUnits: target.mlComputeUnits,
                     iterations: UInt(iterations),
                     warmup: 3,
-                    usePMU: false,
+                    usePMU: true,
                     progressHandler: { msg in
                         logHandler(msg)
                     }
@@ -87,8 +87,10 @@ final class MILCapacityEngine {
         pmuCounters["kANE_DMA_READWRITE_BYTES"] = res.dmaBytes
         
         let resultMsg = String(
-            format: "[%@ %@] Avg: %.2f ms, Throughput: %.4f TOPS (%.1f GFLOPs/iter)",
-            target.shortName, precision.rawValue, res.avgLatencyMs, res.tops, dims.gflops
+            format: "[%@ %@] Avg: %.2f ms, Throughput: %.4f TOPS (%.1f GFLOPs/iter), Zeros: %ld/%ld (%.1f%%)",
+            target.shortName, precision.rawValue, res.avgLatencyMs, res.tops, dims.gflops,
+            res.zeroElementCount, res.totalElementCount,
+            res.totalElementCount > 0 ? Double(res.zeroElementCount) * 100.0 / Double(res.totalElementCount) : 0.0
         )
         logHandler(resultMsg)
         

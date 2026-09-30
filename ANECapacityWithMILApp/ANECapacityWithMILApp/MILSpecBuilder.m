@@ -618,9 +618,15 @@ BOOL MILBuildNativeFP8ModelPackage(MILConvChainConfig config, NSURL *outputDirec
     fileHdr[0] = 3; // version
     fileHdr[1] = 2; // entry count
 
-    struct OffsetPair { uint64_t w; uint64_t s; };
+    struct OffsetTuple { uint64_t w; uint64_t s; uint64_t b; };
     NSMutableArray<NSValue *> *layerOffsets = [NSMutableArray arrayWithCapacity:config.layers];
-    uint16_t scaleFP16Val = kFP16PlusOneSixteenth; // 0.0625
+    
+    // Normalized Xavier scale: 1.0 / (kernel * sqrt(Cin)) to preserve activation variance across 20 layers
+    double xavierScale = 1.0 / ((double)config.kernel * sqrt((double)config.channelsIn));
+    _Float16 f16Scale = (_Float16)xavierScale;
+    uint16_t scaleFP16Val = 0;
+    memcpy(&scaleFP16Val, &f16Scale, sizeof(uint16_t));
+
     size_t scaleSize = config.channelsOut * sizeof(uint16_t);
     NSMutableData *scaleBytes = [NSMutableData dataWithLength:scaleSize];
     uint16_t *scalePtr = (uint16_t *)scaleBytes.mutableBytes;
@@ -628,10 +634,31 @@ BOOL MILBuildNativeFP8ModelPackage(MILConvChainConfig config, NSURL *outputDirec
         scalePtr[c] = scaleFP16Val;
     }
 
+    // Zero-overhead fused hardware bias: alternating ±0.05 to maintain signal vitality without extra cycles
+    size_t biasSize = config.channelsOut * sizeof(uint16_t);
+    NSMutableData *biasBytes = [NSMutableData dataWithLength:biasSize];
+    uint16_t *biasPtr = (uint16_t *)biasBytes.mutableBytes;
+    _Float16 posB = 0.05f, negB = -0.05f;
+    uint16_t posB16 = 0, negB16 = 0;
+    memcpy(&posB16, &posB, sizeof(uint16_t));
+    memcpy(&negB16, &negB, sizeof(uint16_t));
+    for (NSUInteger c = 0; c < config.channelsOut; c++) {
+        biasPtr[c] = (c & 1) ? negB16 : posB16;
+    }
+
     size_t wSize = config.channelsOut * config.channelsIn * config.kernel * config.kernel;
-    NSData *rawWData = generateWeightsFP8(config);
 
     for (NSUInteger l = 0; l < config.layers; l++) {
+        NSMutableData *layerWData = [NSMutableData dataWithLength:wSize];
+        uint8_t *wPtr = (uint8_t *)layerWData.mutableBytes;
+        uint64_t state = kWeightSeed ^ ((uint64_t)(l + 1) * 0x9E3779B97F4A7C15ULL);
+        for (size_t i = 0; i < wSize; i++) {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            wPtr[i] = (state & 1) ? 0xB8 : 0x38; // ±1.0 in FP8 E4M3
+        }
+
         size_t padW = (64 - (weightBlobs.length % 64)) % 64;
         if (padW > 0) [weightBlobs appendBytes:"\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0" length:padW];
         uint64_t wOffset = weightBlobs.length;
@@ -642,7 +669,7 @@ BOOL MILBuildNativeFP8ModelPackage(MILConvChainConfig config, NSURL *outputDirec
         wEntry[2] = (uint32_t)wSize;
         wEntry[4] = (uint32_t)(wOffset + 64);
         [weightBlobs appendBytes:wEntry length:sizeof(wEntry)];
-        [weightBlobs appendData:rawWData];
+        [weightBlobs appendData:layerWData];
 
         size_t padS = (64 - (weightBlobs.length % 64)) % 64;
         if (padS > 0) [weightBlobs appendBytes:"\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0" length:padS];
@@ -656,8 +683,20 @@ BOOL MILBuildNativeFP8ModelPackage(MILConvChainConfig config, NSURL *outputDirec
         [weightBlobs appendBytes:sEntry length:sizeof(sEntry)];
         [weightBlobs appendData:scaleBytes];
 
-        struct OffsetPair p = { wOffset, sOffset };
-        [layerOffsets addObject:[NSValue valueWithBytes:&p objCType:@encode(struct OffsetPair)]];
+        size_t padB = (64 - (weightBlobs.length % 64)) % 64;
+        if (padB > 0) [weightBlobs appendBytes:"\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0" length:padB];
+        uint64_t bOffset = weightBlobs.length;
+
+        uint32_t bEntry[16] = {0};
+        bEntry[0] = 3735928559U;
+        bEntry[1] = 1;           // Float16
+        bEntry[2] = (uint32_t)biasSize;
+        bEntry[4] = (uint32_t)(bOffset + 64);
+        [weightBlobs appendBytes:bEntry length:sizeof(bEntry)];
+        [weightBlobs appendData:biasBytes];
+
+        struct OffsetTuple t = { wOffset, sOffset, bOffset };
+        [layerOffsets addObject:[NSValue valueWithBytes:&t objCType:@encode(struct OffsetTuple)]];
     }
 
     NSString *weightBinPath = [weightsDir stringByAppendingPathComponent:@"weight.bin"];
@@ -665,7 +704,7 @@ BOOL MILBuildNativeFP8ModelPackage(MILConvChainConfig config, NSURL *outputDirec
         return NO;
     }
 
-    // 2. Generate model.mil with constexpr_blockwise_shift_scale & QDQ activations
+    // 2. Generate model.mil with constexpr_blockwise_shift_scale, bias & QDQ activations
     NSMutableString *mil = [NSMutableString string];
     [mil appendString:@"program(1.3)\n"];
     [mil appendString:@"[buildInfo = dict<string, string>({{\"coremlc-component-MIL\", \"3600.16.1\"}, {\"coremlc-version\", \"3600.25.1\"}})]\n"];
@@ -683,15 +722,20 @@ BOOL MILBuildNativeFP8ModelPackage(MILConvChainConfig config, NSURL *outputDirec
 
     NSString *curr = @"x";
     for (NSUInteger l = 0; l < config.layers; l++) {
-        struct OffsetPair p;
-        [layerOffsets[l] getValue:&p];
+        struct OffsetTuple t;
+        [layerOffsets[l] getValue:&t];
         [mil appendFormat:@"        tensor<fp16, [%lu, %lu, %lu, %lu]> dqw_%lu = constexpr_blockwise_shift_scale(data = tensor<fp8e4m3fn, [%lu, %lu, %lu, %lu]>(BLOBFILE(path = string(\"@model_path/weights/weight.bin\"), offset = uint64(%llu))), scale = tensor<fp16, [%lu, 1, 1, 1]>(BLOBFILE(path = string(\"@model_path/weights/weight.bin\"), offset = uint64(%llu))));\n",
             (unsigned long)config.channelsOut, (unsigned long)config.channelsIn, (unsigned long)config.kernel, (unsigned long)config.kernel,
             (unsigned long)l,
             (unsigned long)config.channelsOut, (unsigned long)config.channelsIn, (unsigned long)config.kernel, (unsigned long)config.kernel,
-            p.w,
+            t.w,
             (unsigned long)config.channelsOut,
-            p.s];
+            t.s];
+        [mil appendFormat:@"        tensor<fp16, [%lu]> b_%lu = const()[val = tensor<fp16, [%lu]>(BLOBFILE(path = string(\"@model_path/weights/weight.bin\"), offset = uint64(%llu)))];\n",
+            (unsigned long)config.channelsOut,
+            (unsigned long)l,
+            (unsigned long)config.channelsOut,
+            t.b];
         [mil appendFormat:@"        tensor<fp8e4m3fn, [%lu, %lu, %lu, %lu]> qx_%lu = quantize(input = %@, output_dtype = dt, scale = s);\n",
             (unsigned long)config.batch, (unsigned long)config.channelsIn, (unsigned long)config.height, (unsigned long)config.width,
             (unsigned long)l, curr];
@@ -699,9 +743,9 @@ BOOL MILBuildNativeFP8ModelPackage(MILConvChainConfig config, NSURL *outputDirec
             (unsigned long)config.batch, (unsigned long)config.channelsIn, (unsigned long)config.height, (unsigned long)config.width,
             (unsigned long)l, (unsigned long)l];
         NSString *outVar = [NSString stringWithFormat:@"conv_%lu", (unsigned long)l];
-        [mil appendFormat:@"        tensor<fp16, [%lu, %lu, %lu, %lu]> %@ = conv(dilations = dil, groups = g, pad = p, pad_type = pt, strides = st, weight = dqw_%lu, x = dqx_%lu);\n",
+        [mil appendFormat:@"        tensor<fp16, [%lu, %lu, %lu, %lu]> %@ = conv(bias = b_%lu, dilations = dil, groups = g, pad = p, pad_type = pt, strides = st, weight = dqw_%lu, x = dqx_%lu);\n",
             (unsigned long)config.batch, (unsigned long)config.channelsOut, (unsigned long)config.height, (unsigned long)config.width,
-            outVar, (unsigned long)l, (unsigned long)l];
+            outVar, (unsigned long)l, (unsigned long)l, (unsigned long)l];
         curr = outVar;
     }
     [mil appendFormat:@"    } -> (%@);\n", curr];

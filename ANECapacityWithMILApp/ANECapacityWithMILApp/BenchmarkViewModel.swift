@@ -62,6 +62,22 @@ final class BenchmarkViewModel: ObservableObject {
             } else if args.contains("--fp16") {
                 selectedPrecision = .fp16
             }
+            if args.contains("--sram") {
+                selectedSweep = .sramResident
+            }
+            if let lIdx = args.firstIndex(of: "--layers"), lIdx + 1 < args.count, let l = Int(args[lIdx + 1]) {
+                dimensions.layers = l
+            }
+            if let dIdx = args.firstIndex(of: "--dim"), dIdx + 1 < args.count, let d = Int(args[dIdx + 1]) {
+                dimensions.height = d
+                dimensions.width = d
+            }
+            if let cIdx = args.firstIndex(of: "--channels"), cIdx + 1 < args.count {
+                let parts = args[cIdx + 1].split(separator: ",").compactMap { Int($0.trimmingCharacters(in: .whitespaces)) }
+                if !parts.isEmpty {
+                    customChannelSteps = parts
+                }
+            }
             Task { @MainActor in
                 try? await Task.sleep(nanoseconds: 500_000_000)
                 self.startBenchmark()
