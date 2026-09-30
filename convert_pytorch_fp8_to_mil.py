@@ -2,10 +2,11 @@
 """
 convert_pytorch_fp8_to_mil.py
 
-Constructs a PyTorch Convolution model with native FP8 (Float8_e4m3fn) weights,
-and converts it directly to a CoreML .mlpackage and compiled MIL program (.mlmodelc / model.mil).
-Also compiles to ANE HWX binary format using ~/work/coreml_to_ane_hwx_hacks/mil_to_hwx,
-and verifies hardware registers (KernelCfg: Fmt=E4M3, Pal=0, InDim: Type=E4M3, DblInt8=1).
+# Constructs a PyTorch Convolution model with native FP8 (Float8_e4m3fn) weights,
+# and converts it directly to a CoreML .mlpackage and compiled MIL program (.mlmodelc / model.mil).
+# Also compiles to ANE HWX binary format using mil_to_hwx (https://github.com/freedomtan/coreml_to_ane_hwx),
+# and verifies hardware registers (KernelCfg: Fmt=e4m3, Pal=0, InDim: Type=e4m3, DblInt8=1).
+
 """
 
 import argparse
@@ -117,7 +118,7 @@ def synthesize_native_fp8_mlmodelc(
     1. weights/weight.bin using MILBlob binary format:
        - DataType 16 (Fp8E4M3FN) for weight tensors
        - DataType 1 (Float16) for per-channel scale vectors
-    2. model.mil using native iOS 19 constexpr_blockwise_shift_scale and activation QDQ
+    2. model.mil using native CoreML9 / iOS 26 constexpr_blockwise_shift_scale and activation QDQ
     3. metadata.json and coremldata.bin for direct CoreML runtime loading
     """
     channels = model.channels
@@ -294,17 +295,37 @@ def compile_with_coremlcompiler(pkg_dir: str, output_parent: str = ".") -> str:
     return compiled_dir
 
 
+def find_hwx_tool(tool_name: str) -> str:
+    """Finds hwx tools from env or search paths (https://github.com/freedomtan/coreml_to_ane_hwx)."""
+    env_var = f"{tool_name.upper().replace('.', '_')}_PATH"
+    if env_var in os.environ and os.path.exists(os.environ[env_var]):
+        return os.environ[env_var]
+    candidates = [
+        os.path.expanduser(f"~/work/coreml_to_ane_hwx/{tool_name}"),
+        os.path.expanduser(f"~/work/coreml_to_ane_hwx_hacks/{tool_name}"),
+        shutil.which(os.path.basename(tool_name)) or "",
+    ]
+    for c in candidates:
+        if c and os.path.exists(c):
+            return c
+    return ""
+
+
 def verify_hwx_registers(hwx_path: str):
     """
-    Parses compiled ANE HWX binary using coreml_to_ane_hwx_hacks/hwx_dump/hwx_parsing.py
+    Parses compiled ANE HWX binary using hwx_dump/hwx_parsing.py or hwx_parsing
+    from https://github.com/freedomtan/coreml_to_ane_hwx
     and verifies that native FP8 hardware registers are correctly programmed.
     """
-    hwx_parser = os.path.expanduser("~/work/coreml_to_ane_hwx_hacks/hwx_dump/hwx_parsing.py")
-    if not os.path.exists(hwx_parser):
-        print(f"⚠️  HWX parser not found at {hwx_parser}")
+    hwx_parser = find_hwx_tool("hwx_dump/hwx_parsing.py")
+    if not hwx_parser:
+        hwx_parser = find_hwx_tool("hwx_dump/hwx_parsing")
+    if not hwx_parser:
+        print("⚠️  HWX parser not found. Clone tool from https://github.com/freedomtan/coreml_to_ane_hwx")
         return
 
-    res = subprocess.run(["python3", hwx_parser, hwx_path], capture_output=True, text=True)
+    cmd = ["python3", hwx_parser, hwx_path] if hwx_parser.endswith(".py") else [hwx_parser, hwx_path]
+    res = subprocess.run(cmd, capture_output=True, text=True)
     if res.returncode != 0:
         print("⚠️  Failed to parse HWX registers:")
         print(res.stderr)
@@ -337,25 +358,27 @@ def verify_hwx_registers(hwx_path: str):
     for t in tasks:
         pal_str = f"Pal={t['pal']}" if t['pal'] != '-' else '-'
         print(f"   | {t['id']:<6} | {t['in_type']:<12} | {t['out_type']:<12} | {t['kernel_fmt']:<10} | {pal_str:<5} | {t['dbl_int8']:<8} |")
-        if t['kernel_fmt'] == "E4M3" and t['pal'] == 0:
+        if t['kernel_fmt'].lower() == "e4m3" and t['pal'] == 0:
             has_native_fp8 = True
     print("   " + "-" * 74)
 
     if has_native_fp8:
-        print("   🎉 SUCCESS: Native FP8 (KernelCfg: Fmt=E4M3, Pal=0, DblInt8=1) confirmed!")
-        print("   Double-rate packed FP8 MAC execution verified on ANE.")
+        print("   🎉 SUCCESS: Native FP8 (KernelCfg: Fmt=e4m3, Pal=0, InDim: Type=e4m3) confirmed!")
+        print("   Hardware E4M3 arithmetic execution verified on ANE.")
     else:
         print("   ⚠️  Warning: Native FP8 kernel format was not detected in task table.")
 
 
-def compile_with_mil_to_hwx(mlmodelc_path: str, arch: str = "h18p", output_dir: str = "/tmp/hwx_output") -> bool:
-    mil_to_hwx_path = os.path.expanduser("~/work/coreml_to_ane_hwx_hacks/mil_to_hwx")
-    if not os.path.exists(mil_to_hwx_path):
-        print(f"⚠️  mil_to_hwx tool not found at {mil_to_hwx_path}")
+
+def compile_with_mil_to_hwx(mlmodelc_path: str, arch: str = "h18", output_dir: str = "/tmp/hwx_output") -> bool:
+    mil_to_hwx_path = find_hwx_tool("mil_to_hwx")
+    if not mil_to_hwx_path:
+        print("⚠️  mil_to_hwx tool not found. Clone tool from https://github.com/freedomtan/coreml_to_ane_hwx")
         return False
 
     model_name = os.path.basename(mlmodelc_path.rstrip("/")).replace(".mlmodelc", "")
     os.makedirs(output_dir, exist_ok=True)
+
 
     cmd = [
         mil_to_hwx_path,
@@ -424,7 +447,7 @@ def main():
     parser.add_argument("--dump-mil", action="store_true", help="Print the compiled model.mil program text")
     parser.add_argument("--hwx", action="store_true", default=True, help="Compile to ANE HWX binary using mil_to_hwx (default: True)")
     parser.add_argument("--no-hwx", dest="hwx", action="store_false", help="Skip ANE HWX compilation")
-    parser.add_argument("--arch", type=str, default="h18p", help="Target ANE architecture for HWX (default: h18p for iPhone 17 Pro)")
+    parser.add_argument("--arch", type=str, default="h18", help="Target ANE architecture for HWX (default: h18 for A19 / M5)")
 
     args = parser.parse_args()
 
