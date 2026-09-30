@@ -7,6 +7,7 @@
 //
 
 #import "MILSpecBuilder.h"
+#import <CoreML/CoreML.h>
 
 NSString *const MILSpecBuilderErrorDomain = @"MILSpecBuilder";
 
@@ -594,4 +595,184 @@ NSData *MILBuildConvChainSpec(MILConvChainConfig config, NSError **error) {
     [model writeMessageField:502 message:program];
 
     return model.data;
+}
+
+BOOL MILBuildNativeFP8ModelPackage(MILConvChainConfig config, NSURL *outputDirectoryURL, NSError **error) {
+    if (config.batch == 0 || config.channelsIn == 0 || config.channelsOut == 0 ||
+        config.height == 0 || config.width == 0 || config.kernel == 0 || config.layers == 0) {
+        if (error) {
+            *error = [NSError errorWithDomain:MILSpecBuilderErrorDomain code:1 userInfo:@{NSLocalizedDescriptionKey: @"Dimensions must be greater than zero."}];
+        }
+        return NO;
+    }
+
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSString *baseDir = outputDirectoryURL.path;
+    [fm createDirectoryAtPath:baseDir withIntermediateDirectories:YES attributes:nil error:nil];
+    NSString *weightsDir = [baseDir stringByAppendingPathComponent:@"weights"];
+    [fm createDirectoryAtPath:weightsDir withIntermediateDirectories:YES attributes:nil error:nil];
+
+    // 1. Generate weights/weight.bin with MILBlob format (DataType 16 for FP8 weights, DataType 1 for FP16 scale)
+    NSMutableData *weightBlobs = [NSMutableData dataWithLength:64];
+    uint32_t *fileHdr = (uint32_t *)weightBlobs.mutableBytes;
+    fileHdr[0] = 3; // version
+    fileHdr[1] = 2; // entry count
+
+    struct OffsetPair { uint64_t w; uint64_t s; };
+    NSMutableArray<NSValue *> *layerOffsets = [NSMutableArray arrayWithCapacity:config.layers];
+    uint16_t scaleFP16Val = kFP16PlusOneSixteenth; // 0.0625
+    size_t scaleSize = config.channelsOut * sizeof(uint16_t);
+    NSMutableData *scaleBytes = [NSMutableData dataWithLength:scaleSize];
+    uint16_t *scalePtr = (uint16_t *)scaleBytes.mutableBytes;
+    for (NSUInteger c = 0; c < config.channelsOut; c++) {
+        scalePtr[c] = scaleFP16Val;
+    }
+
+    size_t wSize = config.channelsOut * config.channelsIn * config.kernel * config.kernel;
+    NSData *rawWData = generateWeightsFP8(config);
+
+    for (NSUInteger l = 0; l < config.layers; l++) {
+        size_t padW = (64 - (weightBlobs.length % 64)) % 64;
+        if (padW > 0) [weightBlobs appendBytes:"\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0" length:padW];
+        uint64_t wOffset = weightBlobs.length;
+
+        uint32_t wEntry[16] = {0};
+        wEntry[0] = 3735928559U; // 0xdeadbeef
+        wEntry[1] = 16;          // Fp8E4M3FN
+        wEntry[2] = (uint32_t)wSize;
+        wEntry[4] = (uint32_t)(wOffset + 64);
+        [weightBlobs appendBytes:wEntry length:sizeof(wEntry)];
+        [weightBlobs appendData:rawWData];
+
+        size_t padS = (64 - (weightBlobs.length % 64)) % 64;
+        if (padS > 0) [weightBlobs appendBytes:"\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0" length:padS];
+        uint64_t sOffset = weightBlobs.length;
+
+        uint32_t sEntry[16] = {0};
+        sEntry[0] = 3735928559U;
+        sEntry[1] = 1;           // Float16
+        sEntry[2] = (uint32_t)scaleSize;
+        sEntry[4] = (uint32_t)(sOffset + 64);
+        [weightBlobs appendBytes:sEntry length:sizeof(sEntry)];
+        [weightBlobs appendData:scaleBytes];
+
+        struct OffsetPair p = { wOffset, sOffset };
+        [layerOffsets addObject:[NSValue valueWithBytes:&p objCType:@encode(struct OffsetPair)]];
+    }
+
+    NSString *weightBinPath = [weightsDir stringByAppendingPathComponent:@"weight.bin"];
+    if (![weightBlobs writeToFile:weightBinPath options:NSDataWritingAtomic error:error]) {
+        return NO;
+    }
+
+    // 2. Generate model.mil with constexpr_blockwise_shift_scale & QDQ activations
+    NSMutableString *mil = [NSMutableString string];
+    [mil appendString:@"program(1.3)\n"];
+    [mil appendString:@"[buildInfo = dict<string, string>({{\"coremlc-component-MIL\", \"3600.16.1\"}, {\"coremlc-version\", \"3600.25.1\"}})]\n"];
+    [mil appendString:@"{\n"];
+    [mil appendFormat:@"    func main<ios19>(tensor<fp16, [%lu, %lu, %lu, %lu]> x) {\n",
+        (unsigned long)config.batch, (unsigned long)config.channelsIn,
+        (unsigned long)config.height, (unsigned long)config.width];
+    [mil appendString:@"        string pt = const()[val = string(\"same\")];\n"];
+    [mil appendString:@"        tensor<int32, [2]> st = const()[val = tensor<int32, [2]>([1, 1])];\n"];
+    [mil appendString:@"        tensor<int32, [2]> dil = const()[val = tensor<int32, [2]>([1, 1])];\n"];
+    [mil appendString:@"        int32 g = const()[val = int32(1)];\n"];
+    [mil appendString:@"        tensor<int32, [4]> p = const()[val = tensor<int32, [4]>([0, 0, 0, 0])];\n"];
+    [mil appendString:@"        tensor<fp16, []> s = const()[val = fp16(0.0625)];\n"];
+    [mil appendString:@"        string dt = const()[val = string(\"fp8e4m3fn\")];\n"];
+
+    NSString *curr = @"x";
+    for (NSUInteger l = 0; l < config.layers; l++) {
+        struct OffsetPair p;
+        [layerOffsets[l] getValue:&p];
+        [mil appendFormat:@"        tensor<fp16, [%lu, %lu, %lu, %lu]> dqw_%lu = constexpr_blockwise_shift_scale(data = tensor<fp8e4m3fn, [%lu, %lu, %lu, %lu]>(BLOBFILE(path = string(\"@model_path/weights/weight.bin\"), offset = uint64(%llu))), scale = tensor<fp16, [%lu, 1, 1, 1]>(BLOBFILE(path = string(\"@model_path/weights/weight.bin\"), offset = uint64(%llu))));\n",
+            (unsigned long)config.channelsOut, (unsigned long)config.channelsIn, (unsigned long)config.kernel, (unsigned long)config.kernel,
+            (unsigned long)l,
+            (unsigned long)config.channelsOut, (unsigned long)config.channelsIn, (unsigned long)config.kernel, (unsigned long)config.kernel,
+            p.w,
+            (unsigned long)config.channelsOut,
+            p.s];
+        [mil appendFormat:@"        tensor<fp8e4m3fn, [%lu, %lu, %lu, %lu]> qx_%lu = quantize(input = %@, output_dtype = dt, scale = s);\n",
+            (unsigned long)config.batch, (unsigned long)config.channelsIn, (unsigned long)config.height, (unsigned long)config.width,
+            (unsigned long)l, curr];
+        [mil appendFormat:@"        tensor<fp16, [%lu, %lu, %lu, %lu]> dqx_%lu = dequantize(input = qx_%lu, scale = s);\n",
+            (unsigned long)config.batch, (unsigned long)config.channelsIn, (unsigned long)config.height, (unsigned long)config.width,
+            (unsigned long)l, (unsigned long)l];
+        NSString *outVar = [NSString stringWithFormat:@"conv_%lu", (unsigned long)l];
+        [mil appendFormat:@"        tensor<fp16, [%lu, %lu, %lu, %lu]> %@ = conv(dilations = dil, groups = g, pad = p, pad_type = pt, strides = st, weight = dqw_%lu, x = dqx_%lu);\n",
+            (unsigned long)config.batch, (unsigned long)config.channelsOut, (unsigned long)config.height, (unsigned long)config.width,
+            outVar, (unsigned long)l, (unsigned long)l];
+        curr = outVar;
+    }
+    [mil appendFormat:@"    } -> (%@);\n", curr];
+    [mil appendString:@"}\n"];
+
+    NSString *milPath = [baseDir stringByAppendingPathComponent:@"model.mil"];
+    if (![mil writeToFile:milPath atomically:YES encoding:NSUTF8StringEncoding error:error]) {
+        return NO;
+    }
+
+    // 3. Generate metadata.json
+    NSDictionary *metadataEntry = @{
+        @"metadataOutputVersion": @"3.0",
+        @"storagePrecision": @"Float8_e4m3fn (Native FP8)",
+        @"outputSchema": @[
+            @{
+                @"hasShapeFlexibility": @"0",
+                @"isOptional": @"0",
+                @"dataType": @"Float16",
+                @"formattedType": [NSString stringWithFormat:@"MultiArray (Float16 %lu × %lu × %lu × %lu)", (unsigned long)config.batch, (unsigned long)config.channelsOut, (unsigned long)config.height, (unsigned long)config.width],
+                @"shortDescription": @"Convolution output",
+                @"shape": [NSString stringWithFormat:@"[%lu, %lu, %lu, %lu]", (unsigned long)config.batch, (unsigned long)config.channelsOut, (unsigned long)config.height, (unsigned long)config.width],
+                @"name": curr,
+                @"type": @"MultiArray"
+            }
+        ],
+        @"specificationVersion": @9,
+        @"availability": @{
+            @"iOS": @"18.0",
+            @"macOS": @"15.0"
+        },
+        @"modelType": @{@"name": @"MLModelType_mlProgram"},
+        @"userDefinedMetadata": @{
+            @"builder": @"MILSpecBuilder (native FP8 on ANE H18)",
+            @"format": @"Native FP8 (Float8_e4m3fn) with constexpr_blockwise_shift_scale"
+        },
+        @"inputSchema": @[
+            @{
+                @"hasShapeFlexibility": @"0",
+                @"isOptional": @"0",
+                @"dataType": @"Float16",
+                @"formattedType": [NSString stringWithFormat:@"MultiArray (Float16 %lu × %lu × %lu × %lu)", (unsigned long)config.batch, (unsigned long)config.channelsIn, (unsigned long)config.height, (unsigned long)config.width],
+                @"shortDescription": @"Input tensor",
+                @"shape": [NSString stringWithFormat:@"[%lu, %lu, %lu, %lu]", (unsigned long)config.batch, (unsigned long)config.channelsIn, (unsigned long)config.height, (unsigned long)config.width],
+                @"name": @"x",
+                @"type": @"MultiArray"
+            }
+        ]
+    };
+    NSData *metaData = [NSJSONSerialization dataWithJSONObject:@[metadataEntry] options:NSJSONWritingPrettyPrinted error:nil];
+    [metaData writeToFile:[baseDir stringByAppendingPathComponent:@"metadata.json"] atomically:YES];
+
+    // 4. Generate coremldata.bin by compiling a lightweight stub model with identical input/output shapes
+    MILConvChainConfig stubCfg = config;
+    stubCfg.precision = MILPrecisionFP16;
+    stubCfg.kernel = 1;
+    NSData *stubSpecData = MILBuildConvChainSpec(stubCfg, nil);
+    if (stubSpecData) {
+        NSString *tempStubPath = [NSTemporaryDirectory() stringByAppendingPathComponent:[NSString stringWithFormat:@"stub_%d.mlmodel", getpid()]];
+        if ([stubSpecData writeToFile:tempStubPath atomically:YES]) {
+            NSURL *stubCompiledURL = [MLModel compileModelAtURL:[NSURL fileURLWithPath:tempStubPath] error:nil];
+            if (stubCompiledURL) {
+                NSString *stubCoremldata = [stubCompiledURL.path stringByAppendingPathComponent:@"coremldata.bin"];
+                if ([fm fileExistsAtPath:stubCoremldata]) {
+                    [fm copyItemAtPath:stubCoremldata toPath:[baseDir stringByAppendingPathComponent:@"coremldata.bin"] error:nil];
+                }
+                [fm removeItemAtURL:stubCompiledURL error:nil];
+            }
+            [fm removeItemAtPath:tempStubPath error:nil];
+        }
+    }
+
+    return YES;
 }

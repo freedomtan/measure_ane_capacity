@@ -42,4 +42,8 @@ FOUNDATION_EXPORT NSString *MILPrecisionName(MILPrecision precision);
 /// Emits the raw bytes of a CoreML Model specification (.mlmodel) dynamically.
 FOUNDATION_EXPORT NSData *_Nullable MILBuildConvChainSpec(MILConvChainConfig config, NSError **error);
 
+/// Synthesizes a native FP8 model package (.mlmodelc directory) directly on device
+/// with MILBlob DataType 16, constexpr_blockwise_shift_scale, and activation QDQ.
+FOUNDATION_EXPORT BOOL MILBuildNativeFP8ModelPackage(MILConvChainConfig config, NSURL *outputDirectoryURL, NSError **error);
+
 NS_ASSUME_NONNULL_END

@@ -171,6 +171,33 @@ static void fillDenseFloat16(void *buffer, size_t count) {
         .precision = prec,
     };
 
+    if (prec == MILPrecisionFP8) {
+        if (progress) progress([NSString stringWithFormat:@"Synthesizing native FP8 model package with MILBlob DataType 16 & QDQ activations..."]);
+        NSString *dest = [NSTemporaryDirectory() stringByAppendingPathComponent:[NSString stringWithFormat:@"native_fp8_%d.mlmodelc", getpid()]];
+        NSURL *destURL = [NSURL fileURLWithPath:dest];
+        [[NSFileManager defaultManager] removeItemAtURL:destURL error:nil];
+        NSError *pkgError = nil;
+        if (!MILBuildNativeFP8ModelPackage(cfg, destURL, &pkgError)) {
+            MILBenchmarkExecutionResult *res = [MILBenchmarkExecutionResult new];
+            res.success = NO;
+            res.statusMessage = [NSString stringWithFormat:@"Failed to build native FP8 package: %@", pkgError.localizedDescription];
+            return res;
+        }
+        return [self evaluateModelAtURL:destURL
+                                  batch:B
+                               channels:C
+                                 height:H
+                                  width:W
+                                 kernel:K
+                                 layers:L
+                              precision:precision
+                           computeUnits:units
+                             iterations:iterations
+                                 warmup:warmup
+                                 usePMU:usePMU
+                        progressHandler:progress];
+    }
+
     NSError *specError = nil;
     NSData *specData = MILBuildConvChainSpec(cfg, &specError);
     if (!specData) {
@@ -305,6 +332,10 @@ static void fillDenseFloat16(void *buffer, size_t count) {
 
     // Output Verification
     MLMultiArray *outArray = [lastResult featureValueForName:outName].multiArrayValue;
+    if (!outArray && lastResult.featureNames.count > 0) {
+        NSString *firstKey = lastResult.featureNames.allObjects.firstObject;
+        outArray = [lastResult featureValueForName:firstKey].multiArrayValue;
+    }
     if (outArray) {
         res.totalElementCount = (NSInteger)(B * C * H * W);
         NSInteger zeros = 0;
