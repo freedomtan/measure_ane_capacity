@@ -18,6 +18,7 @@ final class BenchmarkViewModel: ObservableObject {
     
     // Current custom dimensions
     @Published var dimensions: ConvDimensions = ConvDimensions()
+    @Published var selectedBackend: BenchmarkBackend = .mpsGraph
     @Published var selectedPrecision: PrecisionMode = .both
     @Published var selectedTarget: DeviceTarget = .ane
     @Published var iterations: Int = 10
@@ -48,13 +49,88 @@ final class BenchmarkViewModel: ObservableObject {
         ANECapacityEngine.shared.metalDeviceName
     }
     
+    var hardwareDeviceName: String {
+        metalDeviceName.isEmpty ? MILCapacityEngine.shared.deviceName : metalDeviceName
+    }
+    
     var hasANE: Bool {
-        ANECapacityEngine.shared.hasANE
+        ANECapacityEngine.shared.hasANE || MILCapacityEngine.shared.hasANE
     }
     
     init() {
-        if !ANECapacityEngine.shared.hasANE {
+        if !ANECapacityEngine.shared.hasANE && !MILCapacityEngine.shared.hasANE {
             self.selectedTarget = .gpu
+        }
+        
+        let args = ProcessInfo.processInfo.arguments
+        if args.contains("--autorun") || ProcessInfo.processInfo.environment["AUTORUN"] == "1" {
+            if args.contains("--mil") || args.contains("--coreml") {
+                selectedBackend = .coreml
+            } else if args.contains("--both-backends") || args.contains("--both") {
+                selectedBackend = .both
+            } else if args.contains("--mps") || args.contains("--mpsgraph") {
+                selectedBackend = .mpsGraph
+            }
+            if let bIdx = args.firstIndex(of: "--backend"), bIdx + 1 < args.count {
+                let bVal = args[bIdx + 1].lowercased()
+                if bVal.contains("mil") || bVal.contains("coreml") {
+                    selectedBackend = .coreml
+                } else if bVal.contains("both") {
+                    selectedBackend = .both
+                } else if bVal.contains("mps") {
+                    selectedBackend = .mpsGraph
+                }
+            }
+            if args.contains("--fp8") {
+                selectedPrecision = .fp8
+            } else if args.contains("--int8") {
+                selectedPrecision = .int8
+            } else if args.contains("--fp16") {
+                selectedPrecision = .fp16
+            } else if args.contains("--all") {
+                selectedPrecision = .all
+            }
+            if args.contains("--sram") {
+                selectedSweep = .sramResident
+            }
+            if let swIdx = args.firstIndex(of: "--sweep"), swIdx + 1 < args.count {
+                let swVal = args[swIdx + 1].lowercased()
+                if swVal == "channels" { selectedSweep = .channels }
+                else if swVal == "spatial" { selectedSweep = .spatial }
+                else if swVal == "depth" { selectedSweep = .depth }
+                else if swVal == "pointwise" || swVal == "pointwisedepth" { selectedSweep = .pointwiseDepth }
+                else if swVal == "kernels" { selectedSweep = .kernels }
+                else if swVal == "sram" || swVal == "sramresident" { selectedSweep = .sramResident }
+                else if swVal == "matmuldimensions" { selectedSweep = .matmulDimensions }
+                else if swVal == "matmuldepth" { selectedSweep = .matmulDepth }
+                else if swVal == "matmulasymmetric" { selectedSweep = .matmulAsymmetric }
+                else if swVal == "none" { selectedSweep = .none }
+            }
+            if let lIdx = args.firstIndex(of: "--layers"), lIdx + 1 < args.count, let l = Int(args[lIdx + 1]) {
+                dimensions.layers = l
+            }
+            if let dIdx = args.firstIndex(of: "--dim"), dIdx + 1 < args.count, let d = Int(args[dIdx + 1]) {
+                dimensions.height = d
+                dimensions.width = d
+            }
+            if let cIdx = args.firstIndex(of: "--channels"), cIdx + 1 < args.count {
+                let parts = args[cIdx + 1].split(separator: ",").compactMap { Int($0.trimmingCharacters(in: .whitespaces)) }
+                if !parts.isEmpty {
+                    customChannelSteps = parts
+                }
+            }
+            if let itIdx = args.firstIndex(of: "--iterations"), itIdx + 1 < args.count, let it = Int(args[itIdx + 1]) {
+                iterations = it
+            }
+            if args.contains("--gpu") {
+                selectedTarget = .gpu
+            } else if args.contains("--ane") {
+                selectedTarget = .ane
+            }
+            Task { @MainActor in
+                try? await Task.sleep(nanoseconds: 500_000_000)
+                self.startBenchmark()
+            }
         }
         #if targetEnvironment(simulator)
         loadSampleResults()
@@ -278,6 +354,17 @@ final class BenchmarkViewModel: ObservableObject {
         log("⚠️ Execution cancelled by user.")
     }
     
+    var backendsToRun: [BenchmarkBackend] {
+        switch selectedBackend {
+        case .mpsGraph:
+            return [.mpsGraph]
+        case .coreml:
+            return [.coreml]
+        case .both:
+            return [.mpsGraph, .coreml]
+        }
+    }
+    
     private var precisionsToRun: [PrecisionMode] {
         switch selectedPrecision {
         case .both:
@@ -289,44 +376,93 @@ final class BenchmarkViewModel: ObservableObject {
         }
     }
     
+    // MARK: - Unified Single Execution Dispatcher
+    private func executeSingle(
+        backend: BenchmarkBackend,
+        dimensions: ConvDimensions,
+        precision: PrecisionMode,
+        target: DeviceTarget,
+        iterations: Int,
+        sweepType: SweepType,
+        sweepValue: Double,
+        sweepLabel: String
+    ) async throws -> BenchmarkResult {
+        switch backend {
+        case .mpsGraph:
+            var res = try await ANECapacityEngine.shared.runSingle(
+                dimensions: dimensions,
+                precision: precision,
+                target: target,
+                iterations: iterations,
+                sweepType: sweepType,
+                sweepValue: sweepValue,
+                sweepLabel: sweepLabel,
+                logHandler: { [weak self] msg in
+                    Task { @MainActor in self?.log("[\(backend.shortName)] \(msg)") }
+                }
+            )
+            res.backend = .mpsGraph
+            return res
+        case .coreml:
+            var res = try await MILCapacityEngine.shared.runSingle(
+                dimensions: dimensions,
+                precision: precision,
+                target: target,
+                iterations: iterations,
+                sweepType: sweepType,
+                sweepValue: sweepValue,
+                sweepLabel: sweepLabel,
+                logHandler: { [weak self] msg in
+                    Task { @MainActor in self?.log("[\(backend.shortName)] \(msg)") }
+                }
+            )
+            res.backend = .coreml
+            return res
+        case .both:
+            fatalError("Unexpected .both backend passed to executeSingle")
+        }
+    }
+    
     // MARK: - Single Run Flow
     private func runSingleBenchmarkFlow() async {
         let precisions = precisionsToRun
-        let totalSteps = Double(precisions.count)
+        let backends = backendsToRun
+        let totalSteps = Double(precisions.count * backends.count)
         var currentStep = 0
         
         log("=== Starting Single Benchmark: \(dimensions.detailedDescription) ===")
         
-        for prec in precisions {
-            if Task.isCancelled { break }
-            statusMessage = "Running \(selectedTarget.shortName) \(prec.rawValue)..."
-            
-            do {
-                let res = try await ANECapacityEngine.shared.runSingle(
-                    dimensions: dimensions,
-                    precision: prec,
-                    target: selectedTarget,
-                    iterations: iterations,
-                    sweepType: .none,
-                    sweepValue: Double(dimensions.inChannels),
-                    sweepLabel: "Channels",
-                    logHandler: { [weak self] msg in
-                        Task { @MainActor in self?.log(msg) }
-                    }
-                )
-                results.append(res)
-            } catch {
-                log("❌ Error: \(error.localizedDescription)")
+        for backend in backends {
+            for prec in precisions {
+                if Task.isCancelled { break }
+                statusMessage = "[\(backend.shortName)] Running \(selectedTarget.shortName) \(prec.rawValue)..."
+                
+                do {
+                    let res = try await executeSingle(
+                        backend: backend,
+                        dimensions: dimensions,
+                        precision: prec,
+                        target: selectedTarget,
+                        iterations: iterations,
+                        sweepType: .none,
+                        sweepValue: Double(dimensions.inChannels),
+                        sweepLabel: "Channels"
+                    )
+                    results.append(res)
+                } catch {
+                    log("❌ [\(backend.shortName)] Error: \(error.localizedDescription)")
+                }
+                
+                currentStep += 1
+                progress = Double(currentStep) / totalSteps
             }
-            
-            currentStep += 1
-            progress = Double(currentStep) / totalSteps
         }
     }
     
     // MARK: - Sweep Benchmark Flow
     private func runSweepBenchmarkFlow() async {
         let precisions = precisionsToRun
+        let backends = backendsToRun
         
         // Define sweep points
         struct SweepPoint {
@@ -424,40 +560,40 @@ final class BenchmarkViewModel: ObservableObject {
             }
         }
         
-        let totalSteps = Double(points.count * precisionsToRun.count)
+        let totalSteps = Double(points.count * precisionsToRun.count * backends.count)
         var currentStep = 0
         
-        log("=== Starting Sweep: \(selectedSweep.rawValue) (\(points.count) steps x \(precisionsToRun.count) types) ===")
+        log("=== Starting Sweep: \(selectedSweep.rawValue) (\(points.count) steps x \(precisionsToRun.count) types x \(backends.count) backends) ===")
         
         for pt in points {
-            for prec in precisionsToRun {
-                if Task.isCancelled { break }
-                
-                statusMessage = "[\(currentStep + 1)/\(Int(totalSteps))] \(selectedTarget.shortName) \(prec.rawValue) | \(pt.label)..."
-                
-                do {
-                    let res = try await ANECapacityEngine.shared.runSingle(
-                        dimensions: pt.dims,
-                        precision: prec,
-                        target: selectedTarget,
-                        iterations: iterations,
-                        sweepType: selectedSweep,
-                        sweepValue: pt.value,
-                        sweepLabel: pt.label,
-                        logHandler: { [weak self] msg in
-                            Task { @MainActor in self?.log(msg) }
-                        }
-                    )
-                    results.append(res)
-                } catch {
-                    log("❌ Error at \(pt.label): \(error.localizedDescription)")
+            for backend in backends {
+                for prec in precisionsToRun {
+                    if Task.isCancelled { break }
+                    
+                    statusMessage = "[\(currentStep + 1)/\(Int(totalSteps))] [\(backend.shortName)] \(selectedTarget.shortName) \(prec.rawValue) | \(pt.label)..."
+                    
+                    do {
+                        let res = try await executeSingle(
+                            backend: backend,
+                            dimensions: pt.dims,
+                            precision: prec,
+                            target: selectedTarget,
+                            iterations: iterations,
+                            sweepType: selectedSweep,
+                            sweepValue: pt.value,
+                            sweepLabel: pt.label
+                        )
+                        results.append(res)
+                    } catch {
+                        log("❌ [\(backend.shortName)] Error at \(pt.label): \(error.localizedDescription)")
+                    }
+                    
+                    currentStep += 1
+                    progress = Double(currentStep) / totalSteps
+                    
+                    // Small pause between configurations to let hardware thermals / driver settle
+                    try? await Task.sleep(nanoseconds: 100_000_000) // 100ms
                 }
-                
-                currentStep += 1
-                progress = Double(currentStep) / totalSteps
-                
-                // Small pause between configurations to let hardware thermals / driver settle
-                try? await Task.sleep(nanoseconds: 100_000_000) // 100ms
             }
         }
     }
@@ -465,7 +601,7 @@ final class BenchmarkViewModel: ObservableObject {
     // Generate CSV string of results
     func exportCSV() -> String {
         var headers = [
-            "Timestamp", "Device", "Precision", "Operation", "Batch", "Height", "Width",
+            "Timestamp", "Backend", "Device", "Precision", "Operation", "Batch", "Height", "Width",
             "InChannels", "OutChannels", "KernelSize", "M", "K", "N", "Layers", "TotalGFLOPs",
             "AvgDurationMs", "TOPS", "ZeroOutputCount", "OutputElementCount", "ZeroOutputPct",
             "HWExecutionTimeNs", "MACsPerCoreCycle",
@@ -484,6 +620,7 @@ final class BenchmarkViewModel: ObservableObject {
         for r in results {
             var row: [String] = [
                 df.string(from: r.timestamp),
+                r.backend.rawValue,
                 r.target.shortName,
                 r.precision.rawValue,
                 r.dimensions.opType.rawValue,

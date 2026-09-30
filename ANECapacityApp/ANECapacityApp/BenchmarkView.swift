@@ -369,6 +369,19 @@ struct BenchmarkView: View {
             Text("Execution Settings")
                 .font(.headline)
             
+            // Framework / Backend Engine
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Execution Engine / Framework")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                Picker("Backend", selection: $viewModel.selectedBackend) {
+                    ForEach(BenchmarkBackend.allCases) { b in
+                        Text(b.rawValue).tag(b)
+                    }
+                }
+                .pickerStyle(.segmented)
+            }
+            
             // Precision
             VStack(alignment: .leading, spacing: 6) {
                 Text("Data Type / Precision")

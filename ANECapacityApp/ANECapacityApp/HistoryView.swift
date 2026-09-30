@@ -3,12 +3,14 @@ import SwiftUI
 struct HistoryView: View {
     @ObservedObject var viewModel: BenchmarkViewModel
     
+    @State private var filterBackend: BenchmarkBackend? = nil
     @State private var filterDevice: DeviceTarget? = nil
     @State private var filterPrecision: PrecisionMode? = nil
     @State private var showClearConfirmation: Bool = false
     
     var filteredResults: [BenchmarkResult] {
         viewModel.results.filter { r in
+            if let be = filterBackend, r.backend != be { return false }
             if let dev = filterDevice, r.target != dev { return false }
             if let prec = filterPrecision, r.precision != prec { return false }
             return true
@@ -77,6 +79,19 @@ struct HistoryView: View {
     private var filtersHeader: some View {
         ScrollView(.horizontal, showsIndicators: false) {
             HStack(spacing: 8) {
+                // Backend filters
+                filterPill(title: "All Engines", isSelected: filterBackend == nil) {
+                    filterBackend = nil
+                }
+                filterPill(title: "MPSGraph", isSelected: filterBackend == .mpsGraph) {
+                    filterBackend = .mpsGraph
+                }
+                filterPill(title: "CoreML", isSelected: filterBackend == .coreml) {
+                    filterBackend = .coreml
+                }
+                
+                Divider().frame(height: 20)
+                
                 // Device filters
                 filterPill(title: "All Devices", isSelected: filterDevice == nil) {
                     filterDevice = nil
@@ -125,6 +140,14 @@ struct HistoryView: View {
     private func resultRow(_ r: BenchmarkResult) -> some View {
         VStack(alignment: .leading, spacing: 6) {
             HStack {
+                Text(r.backend.shortName)
+                    .font(.system(size: 10, weight: .bold))
+                    .padding(.horizontal, 5)
+                    .padding(.vertical, 2)
+                    .background(r.backend == .mpsGraph ? Color.blue.opacity(0.15) : Color.purple.opacity(0.15))
+                    .foregroundColor(r.backend == .mpsGraph ? .blue : .purple)
+                    .cornerRadius(5)
+                
                 Text(r.dimensions.opType.rawValue)
                     .font(.system(size: 10, weight: .bold))
                     .padding(.horizontal, 5)

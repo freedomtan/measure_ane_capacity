@@ -9,9 +9,9 @@ struct DeviceInfoView: View {
             List {
                 Section(header: Text("Neural Engine Hardware")) {
                     infoRow(title: "ANE Device Available", value: viewModel.hasANE ? "Yes (Apple Neural Engine)" : "No (Simulator / Fallback)")
-                    infoRow(title: "Framework", value: "MetalPerformanceShadersGraph")
-                    infoRow(title: "Compilation Optimization", value: "Level 1 (ANE Target)")
-                    infoRow(title: "Supported Precision", value: "FP16 (Half) & INT8 (Simulated QDQ)")
+                    infoRow(title: "Execution Engines", value: "MPSGraph & CoreML / MIL")
+                    infoRow(title: "Compilation Optimization", value: "ANE Level 1 & Native MIL Compiler")
+                    infoRow(title: "Supported Precision", value: "FP16, INT8, Native FP8 (E4M3 fn)")
                 }
                 
                 Section(header: Text("Metal Hardware Device")) {

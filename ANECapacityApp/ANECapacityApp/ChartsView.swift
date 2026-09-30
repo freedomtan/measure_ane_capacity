@@ -307,7 +307,19 @@ struct ChartsView: View {
                 "ANE FP8 (E4M3)": Color.mint,
                 "GPU FP16": Color.purple,
                 "GPU INT8": Color.indigo,
-                "GPU FP8 (E4M3)": Color.cyan
+                "GPU FP8 (E4M3)": Color.cyan,
+                "[MPS] ANE FP16": Color.blue,
+                "[MPS] ANE INT8": Color.orange,
+                "[MPS] ANE FP8 (E4M3)": Color.mint,
+                "[MPS] GPU FP16": Color.purple,
+                "[MPS] GPU INT8": Color.indigo,
+                "[MPS] GPU FP8 (E4M3)": Color.cyan,
+                "[MIL] ANE FP16": Color.teal,
+                "[MIL] ANE INT8": Color.pink,
+                "[MIL] ANE FP8 (E4M3)": Color.green,
+                "[MIL] GPU FP16": Color.brown,
+                "[MIL] GPU INT8": Color.red,
+                "[MIL] GPU FP8 (E4M3)": Color.yellow
             ])
             .chartXAxis {
                 AxisMarks(values: .automatic) { value in

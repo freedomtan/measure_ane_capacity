@@ -1,5 +1,23 @@
 import SwiftUI
 import MetalPerformanceShadersGraph
+import CoreML
+
+// MARK: - Benchmark Engine / Backend
+enum BenchmarkBackend: String, CaseIterable, Identifiable, Codable {
+    case mpsGraph = "MPSGraph"
+    case coreml = "CoreML / MIL"
+    case both = "Both (MPSGraph & CoreML)"
+    
+    var id: String { rawValue }
+    
+    var shortName: String {
+        switch self {
+        case .mpsGraph: return "MPS"
+        case .coreml: return "MIL"
+        case .both: return "Both"
+        }
+    }
+}
 
 // MARK: - Precision Mode
 enum PrecisionMode: String, CaseIterable, Identifiable, Codable {
@@ -57,6 +75,13 @@ enum DeviceTarget: String, CaseIterable, Identifiable, Codable {
         switch self {
         case .ane: return "ANE"
         case .gpu: return "GPU"
+        }
+    }
+    
+    var mlComputeUnits: MLComputeUnits {
+        switch self {
+        case .ane: return .cpuAndNeuralEngine
+        case .gpu: return .cpuAndGPU
         }
     }
 }
@@ -183,6 +208,7 @@ struct BenchmarkResult: Identifiable, Codable {
     var dimensions: ConvDimensions
     var precision: PrecisionMode // fp16 or int8
     var target: DeviceTarget
+    var backend: BenchmarkBackend = .mpsGraph
     var avgDurationMs: Double
     var tops: Double
     var iterations: Int
@@ -247,6 +273,7 @@ struct BenchmarkResult: Identifiable, Codable {
         dimensions: ConvDimensions,
         precision: PrecisionMode,
         target: DeviceTarget,
+        backend: BenchmarkBackend = .mpsGraph,
         avgDurationMs: Double,
         tops: Double,
         iterations: Int,
@@ -273,6 +300,7 @@ struct BenchmarkResult: Identifiable, Codable {
         self.dimensions = dimensions
         self.precision = precision
         self.target = target
+        self.backend = backend
         self.avgDurationMs = avgDurationMs
         self.tops = tops
         self.iterations = iterations
@@ -296,7 +324,7 @@ struct BenchmarkResult: Identifiable, Codable {
     }
     
     var seriesName: String {
-        return "\(target.shortName) \(precision.rawValue)"
+        return "[\(backend.shortName)] \(target.shortName) \(precision.rawValue)"
     }
     
     var formattedDuration: String {

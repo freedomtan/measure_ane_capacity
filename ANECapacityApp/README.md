@@ -8,39 +8,38 @@ Based directly on [`measure_conv_universal.m`](../measure_conv_universal.m) from
 
 ## Key Features
 
-1. **Dual Workload Operations**:
-   - **Conv2D**: 2D spatial convolutions across configurable channel depths, spatial resolutions, kernel sizes, and chained layers.
-   - **MatMul (GEMM)**: Dense Matrix Multiplication using native MPSGraph `matrixMultiplication(primary:secondary:name:)` across matrix dimensions ($M, K, N$) and chained layers ($L$).
+1. **Dual Execution Engines / Frameworks**:
+   - **MetalPerformanceShadersGraph (MPSGraph)**: Direct compiled execution on Metal / ANE with private `_ANEClient` PMU performance counter telemetry.
+   - **CoreML / MIL**: Direct on-device MIL (Model Intermediate Language) protobuf code generation and native FP8 model package synthesis with fused bias (`BiasEn=1`) and hardware zero-skipping elimination.
+   - **Side-by-Side Benchmarking**: Compare MPSGraph vs. CoreML / MIL performance curves concurrently across identical tensor shapes.
 
-2. **Precision Support**:
+2. **Dual Workload Operations**:
+   - **Conv2D**: 2D spatial convolutions across configurable channel depths, spatial resolutions, kernel sizes, and chained layers.
+   - **MatMul (GEMM)**: Dense Matrix Multiplication using native MPSGraph and MIL 1x1 conv mapping across matrix dimensions ($M, K, N$) and chained layers ($L$).
+
+3. **Precision Support**:
    - **FP16 (Half Precision)**: High-throughput floating point convolution and GEMM on the ANE matrix compute array.
    - **INT8 (Simulated QDQ)**: Realistic quantization flow (`Int8` $\rightarrow$ `Dequant FP16` $\rightarrow$ `Compute` $\rightarrow$ `Requant Int8`) matching `measure_conv_universal.m` and `measure_matmul_universal.m`.
-   - **FP8 (Float8E4M3 QDQ)**: 8-bit floating-point Quantize-Dequantize execution with decoupled scaling and dithering protection for H18 and H19 silicon.
-   - **Multi-Precision Comparison**: Runs FP16, INT8, and FP8 back-to-back to directly observe throughput and arithmetic multiplier behaviors.
-   - **Deterministic Non-Canceling Initialization (H17+ Ready)**: Both weight and input tensors are populated using deterministic `xorshift64` pseudo-random signs ($\pm 0.03125$ for FP16, $\pm 1$ for INT8, $\pm 0.03125$ for FP8) to prevent zero-cancellation across layers and eliminate hardware zero-skipping artifacts on H17 (A18 Pro), H18 (A19 Pro), and H19 (A20 Pro).
-
-3. **Configurable Dimensions & Hyperparameters**:
-   - **Conv2D Parameters**: Channels ($C_{in}, C_{out} \in [16 \dots 1024]$), Spatial ($H \times W \in [64 \times 64 \dots 1024 \times 1024]$), Kernels ($1 \times 1, 3 \times 3, 5 \times 5$), Layers ($L \in [1 \dots 100]$).
-   - **MatMul Parameters**: $M, K, N \in [128 \dots 8192]$, Chained Depth ($L \in [1 \dots 40]$).
-   - **Batch Size ($B$)**: Configurable (default $B=1$).
+   - **FP8 (Float8E4M3 QDQ & Native MIL FP8)**: 8-bit floating-point execution with decoupled scaling, dithering protection, and zero-overhead fused hardware bias on H18 and H19 silicon.
+   - **Deterministic Non-Canceling Initialization (H17+ Ready)**: Both weight and input tensors are populated with deterministic pseudo-random signs and alternating fused bias to prevent underflow and eliminate hardware zero-skipping artifacts on H17 (A18 Pro), H18 (A19 Pro), and H19 (A20 Pro).
 
 4. **Automated Capacity Sweeps**:
    - **Conv2D Channel Capacity Sweep**: Holds $H=W=256$, sweeps channels $C \in [32, 64, 128, 256, 512, 1024]$ to find the ANE matrix tile saturation point.
-   - **Conv2D Spatial Dimension Sweep**: Holds $C=128$, sweeps spatial resolutions $H=W \in [64, 128, 256, 384, 512, 768]$.
-   - **Conv2D Chained Depth Sweep**: Sweeps $L \in [1, 5, 10, 20, 40, 80, 100]$ to characterize driver submission latency overhead vs. sustained hardware capacity.
-   - **Conv2D Pointwise Depth Sweep**: Sweeps $L \in [1 \dots 100]$ with $K=1\times 1$ to isolate weight reuse and kernel-memory stall differences between GEMM and $3\times 3$ convolutions.
-   - **Conv2D Kernel Size Sweep**: Compares $K=1\times1$ vs $K=3\times3$ vs $K=5\times5$.
+   - **SRAM-Resident Sweep**: Holds $H=W=64$, keeping working buffers strictly resident in ANE on-chip L2 SRAM cache to eliminate DRAM latency bottlenecks.
+   - **Spatial Dimension Sweep**: Holds $C=128$, sweeps spatial resolutions $H=W \in [64, 128, 256, 384, 512, 768]$.
+   - **Chained Depth Sweep**: Sweeps $L \in [1, 5, 10, 20, 40, 80, 100]$ to characterize driver submission latency overhead vs. sustained hardware capacity.
+   - **Pointwise Depth Sweep**: Sweeps $L \in [1 \dots 100]$ with $K=1\times 1$ to isolate weight reuse and kernel-memory stall differences between GEMM and $3\times 3$ convolutions.
+   - **Kernel Size Sweep**: Compares $K=1\times1$ vs $K=3\times3$ vs $K=5\times5$.
    - **MatMul Dimension Sweep**: Sweeps square dimensions $M=K=N \in [128 \dots 4096]$ to map GEMM tile saturation on ANE.
    - **MatMul Rectangular Sweep**: Sweeps large batch/sequence length $M \in [1024, 2048, 4096, 8192]$ with fixed $K=N=1024$.
-   - **MatMul Depth Sweep**: Sweeps $L \in [1, 5, 10, 20, 30, 40]$ for dense matrix multiplications.
    - **Full Capacity Comparison**: Multi-variant sweeps across FP16, INT8, and FP8.
 
 5. **Interactive Figures & Visualizations (Swift Charts)**:
-   - **Throughput (TOPS) vs. Size**: Line and point chart with smooth interpolation.
+   - **Throughput (TOPS) vs. Size**: Line and point chart with smooth interpolation and distinct backend colors (`[MPS]` vs `[MIL]`).
    - **Latency (ms) vs. Size**: Execution time curve per iteration.
    - **Peak TOPS Rule Mark**: Automatically highlights the maximum detected throughput with a callout banner.
    - **Interactive Scrubbing / Point Inspector**: Drag along the chart to inspect exact parameters ($C, H, W, K, L$ or $M, K, N, L$), latency, and TOPS at any point.
-   - **Data Table & CSV Export**: Built-in iOS Share Sheet support to export results as standard CSV (including Operation type, $M, K, N$ metadata).
+   - **Data Table & CSV Export**: Built-in iOS Share Sheet support to export results as standard CSV (including Backend, Operation type, $M, K, N$ metadata).
 
 6. **Live Execution Console**:
    - Monospaced execution log console showing warmup status, compilation time, iteration progress, and live TOPS calculations.
@@ -62,15 +61,6 @@ $$\text{Throughput (TOPS)} = \frac{\text{Total Operations}}{\text{Average Execut
 
 $$\text{Latency} = \frac{\sum_{i=1}^{N} \text{time}_i}{N} \quad (\text{ms})$$
 
-Where:
-- $B$: Batch size
-- $H, W$: Input feature map height and width
-- $C_{in}, C_{out}$: Input and output channels
-- $K$: Convolution kernel size ($K \times K$)
-- $M, K, N$: Matrix multiplication row, inner, and column dimensions ($[B, M, K] \times [B, K, N] \rightarrow [B, M, N]$)
-- $L$: Number of chained layers
-- $N$: Iterations (timed using `CLOCK_MONOTONIC_RAW` after an initial warmup pass)
-
 ---
 
 ## Building the iOS App
@@ -82,16 +72,11 @@ open ANECapacityApp/ANECapacityApp.xcodeproj
 ```
 Select your connected iPhone or iPad, and press **Run (Cmd+R)**.
 
-### Method 2: Command Line (Makefile)
-From `~/work/measure_ane_capacity/`:
-
-- **Build for Connected iOS Physical Device**:
-  ```bash
-  make app
-  ```
-
-> [!NOTE]
-> Physical Apple Neural Engine (ANE) silicon and PMU performance counters require a physical iPhone or iPad device (not supported in the iOS Simulator).
+### Method 2: Command Line (devicectl)
+```bash
+# Automated headless run via devicectl
+xcrun devicectl device process launch --device <UDID> com.freedom.ANECapacityApp --autorun --mil --fp8 --sram
+```
 
 ---
 
@@ -104,15 +89,21 @@ ANECapacityApp/
 └── ANECapacityApp/
     ├── ANECapacityApp.swift       # @main SwiftUI entry point
     ├── ContentView.swift          # Main TabView layout (Benchmark, Figures, History, Info)
-    ├── BenchmarkView.swift        # Sweep selection, custom parameter sliders, run controls
-    ├── ChartsView.swift           # Interactive Swift Charts for TOPS & Latency
-    ├── HistoryView.swift          # Tabular run logs, filtering, CSV export
+    ├── BenchmarkView.swift        # Sweep selection, backend picker, parameter sliders, controls
+    ├── ChartsView.swift           # Interactive Swift Charts for TOPS & Latency ([MPS] vs [MIL])
+    ├── HistoryView.swift          # Tabular run logs, backend filtering, CSV export
     ├── DeviceInfoView.swift       # Hardware capabilities, Metal specs, formula documentation
-    ├── BenchmarkViewModel.swift   # Async task management, state updates, CSV exporter
+    ├── BenchmarkViewModel.swift   # Async task management, multi-backend dispatcher, CLI parsing
     ├── ANECapacityEngine.swift    # Core MPSGraph convolution engine (ANE/GPU, FP16/INT8/FP8)
+    ├── MILCapacityEngine.swift    # CoreML / MIL capacity engine (ANE/GPU, FP16/INT8/FP8)
+    ├── MILCapacityEngineBridge.h  # ObjC++ bridge for CoreML dynamic model evaluation
+    ├── MILCapacityEngineBridge.mm # CoreML runtime evaluation and PMU performance telemetry
+    ├── MILSpecBuilder.h           # Pure ObjC MIL protobuf specification builder
+    ├── MILSpecBuilder.m           # MIL wire-format encoding & native FP8 package generator
+    ├── ANEClientBridge.h          # Private _ANEClient header
     ├── ANEClientBridge.mm         # Private _ANEClient PMU performance counter interface
-    ├── ANECapacityApp-Bridging-Header.h # Bridging header for private ANE telemetry
-    ├── BenchmarkModels.swift      # Data models, dimensions, presets, results
+    ├── ANECapacityApp-Bridging-Header.h # Bridging header for private ANE and MIL telemetry
+    ├── BenchmarkModels.swift      # Data models, BenchmarkBackend enum, dimensions, presets
     ├── Info.plist                 # iOS app bundle configuration
     └── Assets.xcassets/           # App icon & accent colors
 ```
