@@ -572,9 +572,9 @@ final class ANECapacityEngine {
                     
                     let pmuSummary = String(
                         format: "   └─ PMU: Compute=+%@, Stalls=+%@, DMA=+%@, ALU Saturation=%.1f%%, Clock=%.2f GHz",
-                        formatCompact(computeCycles),
-                        formatCompact(outputStallCycles + inputStallCycles),
-                        formatBytes(dmaRwBytes),
+                        Self.formatCompact(computeCycles),
+                        Self.formatCompact(outputStallCycles + inputStallCycles),
+                        Self.formatBytes(dmaRwBytes),
                         aluSaturation,
                         effectiveClockGhz
                     )
@@ -622,7 +622,7 @@ final class ANECapacityEngine {
         )
     }
     
-    private func formatCompact(_ val: UInt64) -> String {
+    static func formatCompact(_ val: UInt64) -> String {
         if val >= 1_000_000 {
             return String(format: "%.2fM", Double(val) / 1_000_000.0)
         } else if val >= 1_000 {
@@ -631,7 +631,7 @@ final class ANECapacityEngine {
         return "\(val)"
     }
     
-    private func formatBytes(_ bytes: UInt64) -> String {
+    static func formatBytes(_ bytes: UInt64) -> String {
         if bytes >= 1024 * 1024 {
             return String(format: "%.1f MB", Double(bytes) / (1024.0 * 1024.0))
         } else if bytes >= 1024 {

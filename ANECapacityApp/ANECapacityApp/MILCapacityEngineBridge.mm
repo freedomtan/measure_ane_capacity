@@ -7,6 +7,7 @@
 
 #import "MILCapacityEngineBridge.h"
 #import "MILSpecBuilder.h"
+#import "ANEClientBridge.h"
 #import <time.h>
 #import <IOSurface/IOSurfaceRef.h>
 
@@ -176,55 +177,30 @@ static void fillDenseFloat16(void *buffer, size_t count) {
         .precision = prec,
     };
 
-    if (prec == MILPrecisionFP8) {
-        if (progress) progress([NSString stringWithFormat:@"Synthesizing native FP8 model package with MILBlob DataType 16 & QDQ activations..."]);
-        NSString *dest = [NSTemporaryDirectory() stringByAppendingPathComponent:[NSString stringWithFormat:@"native_fp8_%d.mlmodelc", getpid()]];
-        NSURL *destURL = [NSURL fileURLWithPath:dest];
-        [[NSFileManager defaultManager] removeItemAtURL:destURL error:nil];
-        NSError *pkgError = nil;
-        if (!MILBuildNativeFP8ModelPackage(cfg, destURL, &pkgError)) {
-            MILBenchmarkExecutionResult *res = [MILBenchmarkExecutionResult new];
-            res.success = NO;
-            res.statusMessage = [NSString stringWithFormat:@"Failed to build native FP8 package: %@", pkgError.localizedDescription];
-            return res;
-        }
-        return [self evaluateModelAtURL:destURL
-                                  batch:B
-                               channels:C
-                                 height:H
-                                  width:W
-                                 kernel:K
-                                 layers:L
-                              precision:precision
-                           computeUnits:units
-                             iterations:iterations
-                                 warmup:warmup
-                                 usePMU:usePMU
-                        progressHandler:progress];
-    }
-
-    NSError *specError = nil;
-    NSData *specData = MILBuildConvChainSpec(cfg, &specError);
-    if (!specData) {
+    if (progress) progress([NSString stringWithFormat:@"Synthesizing native %@ model package with MILBlob & fused bias...", precision]);
+    NSString *dest = [NSTemporaryDirectory() stringByAppendingPathComponent:[NSString stringWithFormat:@"native_mil_%@_%d.mlmodelc", precision, getpid()]];
+    NSURL *destURL = [NSURL fileURLWithPath:dest];
+    [[NSFileManager defaultManager] removeItemAtURL:destURL error:nil];
+    NSError *pkgError = nil;
+    if (!MILBuildNativeModelPackage(cfg, destURL, &pkgError)) {
         MILBenchmarkExecutionResult *res = [MILBenchmarkExecutionResult new];
         res.success = NO;
-        res.statusMessage = [NSString stringWithFormat:@"Failed to build MIL spec: %@", specError.localizedDescription];
+        res.statusMessage = [NSString stringWithFormat:@"Failed to build native %@ package: %@", precision, pkgError.localizedDescription];
         return res;
     }
-
-    return [self compileAndEvaluateSpecData:specData
-                                      batch:B
-                                   channels:C
-                                     height:H
-                                      width:W
-                                     kernel:K
-                                     layers:L
-                                  precision:precision
-                               computeUnits:units
-                                 iterations:iterations
-                                     warmup:warmup
-                                     usePMU:usePMU
-                            progressHandler:progress];
+    return [self evaluateModelAtURL:destURL
+                              batch:B
+                           channels:C
+                             height:H
+                              width:W
+                             kernel:K
+                             layers:L
+                          precision:precision
+                       computeUnits:units
+                         iterations:iterations
+                             warmup:warmup
+                             usePMU:usePMU
+                    progressHandler:progress];
 }
 
 + (MILBenchmarkExecutionResult *)evaluateModelAtURL:(NSURL *)compiledModelURL
@@ -381,80 +357,25 @@ static void fillDenseFloat16(void *buffer, size_t count) {
     }
 
     // Optional PMU Telemetry via _ANEClient
-    if (usePMU && units == MLComputeUnitsCPUAndNeuralEngine) {
-        if (progress) progress(@"Evaluating hardware PMU performance counters via _ANEClient...");
-        Class aneClientClass = NSClassFromString(@"_ANEClient");
-        Class aneModelClass = NSClassFromString(@"_ANEModel");
-        Class aneRequestClass = NSClassFromString(@"_ANERequest");
-        Class aneIOSurfClass = NSClassFromString(@"_ANEIOSurfaceObject");
-        Class anePerfSurfClass = NSClassFromString(@"_ANEPerformanceStatsIOSurface");
-
-        if (aneClientClass && aneModelClass && aneRequestClass) {
-            _ANEClient *client = [_ANEClient sharedConnection];
-            NSURL *milURL = [compiledModelURL URLByAppendingPathComponent:@"model.mil"];
-            NSDictionary *opts = @{ kANEFModelTypeKey: kANEFModelMILValue };
-            _ANEModel *aneModel = [_ANEModel modelAtURL:milURL key:nil];
-
-            if ([client compileModel:aneModel options:opts qos:0 error:nil] &&
-                [client loadModel:aneModel options:opts qos:0 error:nil]) {
-
-                size_t inBytes = B * C * H * W * sizeof(uint16_t);
-                size_t outBytes = B * C * H * W * sizeof(uint16_t);
-
-                NSDictionary *surfProps = @{
-                    (id)kIOSurfaceWidth: @(inBytes),
-                    (id)kIOSurfaceHeight: @1,
-                    (id)kIOSurfaceBytesPerElement: @1,
-                    (id)kIOSurfaceBytesPerRow: @(inBytes),
-                    (id)kIOSurfaceAllocSize: @(inBytes),
-                };
-                IOSurfaceRef inSurf = IOSurfaceCreate((CFDictionaryRef)surfProps);
-                IOSurfaceRef outSurf = IOSurfaceCreate((CFDictionaryRef)surfProps);
-
-                IOSurfaceLock(inSurf, 0, NULL);
-                fillDenseFloat16(IOSurfaceGetBaseAddress(inSurf), B * C * H * W);
-                IOSurfaceUnlock(inSurf, 0, NULL);
-
-                _ANEIOSurfaceObject *inObj = [_ANEIOSurfaceObject objectWithIOSurface:inSurf];
-                _ANEIOSurfaceObject *outObj = [_ANEIOSurfaceObject objectWithIOSurface:outSurf];
-
-                IOSurfaceRef statsSurf = IOSurfaceCreate((CFDictionaryRef)@{
-                    (id)kIOSurfaceWidth: @(1024),
-                    (id)kIOSurfaceHeight: @1,
-                    (id)kIOSurfaceBytesPerElement: @1,
-                    (id)kIOSurfaceBytesPerRow: @(1024),
-                    (id)kIOSurfaceAllocSize: @(1024),
-                });
-                _ANEIOSurfaceObject *statsObj = [_ANEIOSurfaceObject objectWithIOSurface:statsSurf];
-                _ANEPerformanceStatsIOSurface *perfObj = [_ANEPerformanceStatsIOSurface objectWithIOSurface:statsObj statType:0];
-
-                _ANERequest *req = [_ANERequest requestWithInputs:@[inObj]
-                                                     inputIndices:@[@0]
-                                                          outputs:@[outObj]
-                                                    outputIndices:@[@0]
-                                                        perfStats:@[perfObj]
-                                                   procedureIndex:@0];
-
-                NSDictionary *evalOpts = @{ kANEFPerformanceStatsMaskKey: @((1 << 0) | (1 << 3) | (1 << 5) | (1 << 7)) };
-                if ([client evaluateWithModel:aneModel options:evalOpts request:req qos:0 error:nil]) {
-                    NSData *d = req.perfStats.perfCounterData;
-                    if (d && d.length >= 29 * sizeof(uint64_t)) {
-                        const uint64_t *regs = (const uint64_t *)d.bytes;
-                        res.nominalCycles = regs[10];
-                        res.computeCycles = regs[13];
-                        res.outputStallCycles = regs[15];
-                        res.dmaBytes = regs[17];
-                        if (res.nominalCycles > 0) {
-                            res.aluSaturation = ((double)res.computeCycles / (double)res.nominalCycles) * 100.0;
-                            res.effectiveClockGhz = ((double)res.nominalCycles / (avgSec * 1e9));
-                        }
-                    }
-                }
-                [client unloadModel:aneModel options:opts qos:0 error:nil];
-                CFRelease(inSurf);
-                CFRelease(outSurf);
-                CFRelease(statsSurf);
-            }
+    if (usePMU && (units == MLComputeUnitsCPUAndNeuralEngine || units == MLComputeUnitsAll)) {
+        if (progress) progress(@"Harvesting hardware PMU performance counters via _ANEClient...");
+        ANEVerificationResult *pmuRes = [ANEClientBridge verifyModelAtURL:compiledModelURL
+                                                                      key:@"model.mil"
+                                                                     arch:nil
+                                                                 perfMask:15
+                                                               iterations:1
+                                                                totalMacs:(totalOps / 2.0)];
+        if (pmuRes.success && pmuRes.performanceCounterDeltasPerIter.count > 0) {
+            NSDictionary *deltas = pmuRes.performanceCounterDeltasPerIter;
+            res.nominalCycles = [deltas[@"kANE_NE_NOMINAL_CYCLES"] unsignedLongLongValue];
+            res.computeCycles = [deltas[@"kANE_NE_COMPUTE_CYCLES"] unsignedLongLongValue];
+            res.outputStallCycles = [deltas[@"kANE_NE_OUTPUT_STALL_CYCLES"] unsignedLongLongValue];
+            res.inputStallCycles = [deltas[@"kANE_NE_INPUT_STALL_CYCLES"] unsignedLongLongValue];
+            res.dmaBytes = [deltas[@"kANE_DMA_READWRITE_BYTES"] unsignedLongLongValue] + [deltas[@"kANE_DMA_READ_BYTES"] unsignedLongLongValue];
+            res.aluSaturation = [precision.lowercaseString containsString:@"int8"] ? pmuRes.aluSaturationInt8 : pmuRes.aluSaturationFp16;
+            res.effectiveClockGhz = pmuRes.effectiveCoreClockGhz;
+        } else if (pmuRes.statusMessage) {
+            NSLog(@"[MIL PMU Note] ANEClientBridge: %@", pmuRes.statusMessage);
         }
     }
 

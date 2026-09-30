@@ -399,14 +399,14 @@ struct ChartsView: View {
                 AxisMarks(values: .automatic) { _ in
                     AxisGridLine()
                     AxisTick()
-                    AxisValueLabel()
+                    AxisValueLabel(anchor: .top)
                 }
             }
             .chartYAxis {
                 AxisMarks(values: .automatic) { _ in
                     AxisGridLine()
                     AxisTick()
-                    AxisValueLabel()
+                    AxisValueLabel(anchor: .trailing)
                 }
             }
             .frame(height: 280)

@@ -111,6 +111,18 @@ final class MILCapacityEngine {
         )
         logHandler(resultMsg)
         
+        if res.nominalCycles > 0 || res.computeCycles > 0 {
+            let pmuSummary = String(
+                format: "   └─ PMU: Compute=+%@, Stalls=+%@, DMA=+%@, ALU Saturation=%.1f%%, Clock=%.2f GHz",
+                ANECapacityEngine.formatCompact(res.computeCycles),
+                ANECapacityEngine.formatCompact(res.outputStallCycles + res.inputStallCycles),
+                ANECapacityEngine.formatBytes(res.dmaBytes),
+                res.aluSaturation,
+                res.effectiveClockGhz
+            )
+            logHandler(pmuSummary)
+        }
+        
         return BenchmarkResult(
             dimensions: dims,
             precision: precision,
