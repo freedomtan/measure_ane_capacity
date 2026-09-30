@@ -350,11 +350,16 @@ For in-depth microarchitectural investigations, register breakdowns, theoretical
 | *iPhone 16 Pro (legacy)* | H17 | *ANE* | *INT8* | *7.98 ms* | *48.46\** | *Zero-filled (Zero-skipped)* |
 | *iPhone 16 Pro (legacy)* | H17 | *ANE* | *DQ->FP16->Q* | *6.41 ms* | *60.29\** | *Zero-filled (Zero-skipped)* |
 | **iPhone 17 Pro** | H18 | **GPU** | FP16 | 57.02 ms | **6.78** | Dense |
-| **iPhone 17 Pro** | H18 | **ANE** | FP16 | 15.78 ms | **24.50** | **Dense (Non-Zero)** 🏆 |
-| **iPhone 17 Pro** | H18 | **ANE** | INT8 | 7.49 ms | **51.60** | **Dense (Non-Zero)** 🏆 |
+| **iPhone 17 Pro** | H18 | **ANE** | FP16 | 16.50 ms | **23.43** | **Dense (Non-Zero)** |
+| **iPhone 17 Pro** | H18 | **ANE** | FP8 (E4M3) | 11.96 ms | **32.32** | **Dense (Non-Zero)** |
+| **iPhone 17 Pro** | H18 | **ANE** | INT8 | 8.28 ms | **46.69** | **Dense (Non-Zero)** 🏆 |
 | *iPhone 17 Pro (legacy)* | H18 | *ANE* | *FP16* | *8.70 ms* | *44.41\** | *Zero-filled (Zero-skipped)* |
 | *iPhone 17 Pro (legacy)* | H18 | *ANE* | *INT8* | *7.85 ms* | *49.27\** | *Zero-filled (Zero-skipped)* |
 | *iPhone 17 Pro (legacy)* | H18 | *ANE* | *DQ->FP16->Q* | *6.12 ms* | *63.20\** | *Zero-filled (Zero-skipped)* |
+| **iPhone 18 Pro** | H19 | **ANE** | FP16 | 9.98 ms | **38.74** | **Dense (Non-Zero)** |
+| **iPhone 18 Pro** | H19 | **ANE** | FP8 (E4M3) | 7.66 ms | **50.45** | **Dense (Non-Zero)** |
+| **iPhone 18 Pro** | H19 | **ANE** | INT8 (L=20) | 4.98 ms | **77.66** | **Dense (Non-Zero)** |
+| **iPhone 18 Pro** | H19 | **ANE** | INT8 (L=80) | 9.53 ms | **90.25** | **Dense (Non-Zero, Winograd 1D)** 🏆 |
 
 *\*Note: Historical rows marked with asterisks used all-zero tensor buffers (`0x00`), which triggered hardware zero-skipping and lossless zero-compression on H17/H18 silicon, artificially inflating measured TOPS. The bold non-zero rows reflect true dense silicon throughput.*
 *Note: GPU INT8 convolution is not supported by Metal/MPSGraph on this device/configuration.*
