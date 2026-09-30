@@ -234,7 +234,7 @@ struct ChartsView: View {
         case .fp16: return .fp16
         case .int8: return .int8
         case .fp8: return .fp8
-        case .both, .all: return .all
+        case .all: return .all
         }
     }
     

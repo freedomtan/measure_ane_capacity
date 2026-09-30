@@ -24,7 +24,6 @@ enum PrecisionMode: String, CaseIterable, Identifiable, Codable {
     case fp16 = "FP16"
     case int8 = "INT8"
     case fp8 = "FP8 (E4M3)"
-    case both = "Both (FP16 & INT8)"
     case all = "All Precisions"
     
     var id: String { rawValue }
@@ -33,7 +32,7 @@ enum PrecisionMode: String, CaseIterable, Identifiable, Codable {
         switch self {
         case .fp16: return 2
         case .int8, .fp8: return 1 // True 8-bit activations and weights
-        case .both, .all: return 2
+        case .all: return 2
         }
     }
     
@@ -43,7 +42,7 @@ enum PrecisionMode: String, CaseIterable, Identifiable, Codable {
     
     var mpsDataType: MPSDataType {
         switch self {
-        case .fp16, .both, .all: return .float16
+        case .fp16, .all: return .float16
         case .int8: return .int8
         case .fp8:
             if #available(iOS 27.0, macOS 27.0, *) {
@@ -59,7 +58,6 @@ enum PrecisionMode: String, CaseIterable, Identifiable, Codable {
         case .fp16: return "FP16"
         case .int8: return "INT8"
         case .fp8: return "FP8"
-        case .both: return "Both"
         case .all: return "All"
         }
     }
@@ -69,7 +67,7 @@ enum PrecisionMode: String, CaseIterable, Identifiable, Codable {
         case .fp16: return .blue
         case .int8: return .orange
         case .fp8: return .mint
-        case .both, .all: return .purple
+        case .all: return .purple
         }
     }
 }

@@ -19,7 +19,7 @@ final class BenchmarkViewModel: ObservableObject {
     // Current custom dimensions
     @Published var dimensions: ConvDimensions = ConvDimensions()
     @Published var selectedBackend: BenchmarkBackend = .mpsGraph
-    @Published var selectedPrecision: PrecisionMode = .both
+    @Published var selectedPrecision: PrecisionMode = .all
     @Published var selectedTarget: DeviceTarget = .ane
     @Published var iterations: Int = 10
     
@@ -371,8 +371,6 @@ final class BenchmarkViewModel: ObservableObject {
     
     private var precisionsToRun: [PrecisionMode] {
         switch selectedPrecision {
-        case .both:
-            return [.fp16, .int8]
         case .all:
             return [.fp16, .int8, .fp8]
         case .fp16, .int8, .fp8:
