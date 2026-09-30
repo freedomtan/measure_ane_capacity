@@ -1,6 +1,9 @@
 import Foundation
 import SwiftUI
 import Combine
+#if canImport(UIKit)
+import UIKit
+#endif
 
 @MainActor
 final class BenchmarkViewModel: ObservableObject {
@@ -33,7 +36,13 @@ final class BenchmarkViewModel: ObservableObject {
     @Published var customMatMulSteps: [Int] = [128, 256, 512, 1024, 2048, 4096, 8192]
     
     // Benchmark execution state
-    @Published var isRunning: Bool = false
+    @Published var isRunning: Bool = false {
+        didSet {
+            #if canImport(UIKit)
+            UIApplication.shared.isIdleTimerDisabled = isRunning
+            #endif
+        }
+    }
     @Published var progress: Double = 0.0
     @Published var statusMessage: String = "Ready to benchmark."
     @Published var consoleLogs: [String] = []
