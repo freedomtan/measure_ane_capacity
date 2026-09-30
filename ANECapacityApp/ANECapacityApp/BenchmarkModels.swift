@@ -54,6 +54,16 @@ enum PrecisionMode: String, CaseIterable, Identifiable, Codable {
         }
     }
     
+    var shortName: String {
+        switch self {
+        case .fp16: return "FP16"
+        case .int8: return "INT8"
+        case .fp8: return "FP8"
+        case .both: return "Both"
+        case .all: return "All"
+        }
+    }
+    
     var themeColor: Color {
         switch self {
         case .fp16: return .blue

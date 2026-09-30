@@ -224,26 +224,60 @@ struct ChartsView: View {
         }
     }
     
-    private let seriesColorScale: KeyValuePairs<String, Color> = [
-        "ANE FP16": Color.blue,
-        "ANE INT8": Color.orange,
-        "ANE FP8 (E4M3)": Color.mint,
-        "GPU FP16": Color.purple,
-        "GPU INT8": Color.indigo,
-        "GPU FP8 (E4M3)": Color.cyan,
-        "[MPS] ANE FP16": Color.blue,
-        "[MPS] ANE INT8": Color.orange,
-        "[MPS] ANE FP8 (E4M3)": Color.mint,
-        "[MPS] GPU FP16": Color.purple,
-        "[MPS] GPU INT8": Color.indigo,
-        "[MPS] GPU FP8 (E4M3)": Color.cyan,
-        "[MIL] ANE FP16": Color.teal,
-        "[MIL] ANE INT8": Color.pink,
-        "[MIL] ANE FP8 (E4M3)": Color.green,
-        "[MIL] GPU FP16": Color.brown,
-        "[MIL] GPU INT8": Color.red,
-        "[MIL] GPU FP8 (E4M3)": Color.yellow
+    var availablePrecisionsInSweep: [PrecisionMode] {
+        let present = Set(viewModel.results.filter { $0.sweepType == selectedSweepFilter }.map(\.precision))
+        return [PrecisionMode.fp16, PrecisionMode.int8, PrecisionMode.fp8].filter { present.contains($0) }
+    }
+    
+    private func filterForPrecision(_ prec: PrecisionMode) -> ChartPrecisionFilter {
+        switch prec {
+        case .fp16: return .fp16
+        case .int8: return .int8
+        case .fp8: return .fp8
+        case .both, .all: return .all
+        }
+    }
+    
+    private let seriesColorOrder: [String] = [
+        "[MPS] ANE FP16", "[MPS] ANE INT8", "[MPS] ANE FP8 (E4M3)",
+        "[MPS] GPU FP16", "[MPS] GPU INT8", "[MPS] GPU FP8 (E4M3)",
+        "[MIL] ANE FP16", "[MIL] ANE INT8", "[MIL] ANE FP8 (E4M3)",
+        "[MIL] GPU FP16", "[MIL] GPU INT8", "[MIL] GPU FP8 (E4M3)",
+        "ANE FP16", "ANE INT8", "ANE FP8 (E4M3)",
+        "GPU FP16", "GPU INT8", "GPU FP8 (E4M3)"
     ]
+    
+    private let seriesColorMap: [String: Color] = [
+        "ANE FP16": .blue,
+        "ANE INT8": .orange,
+        "ANE FP8 (E4M3)": .mint,
+        "GPU FP16": .purple,
+        "GPU INT8": .indigo,
+        "GPU FP8 (E4M3)": .cyan,
+        "[MPS] ANE FP16": .blue,
+        "[MPS] ANE INT8": .orange,
+        "[MPS] ANE FP8 (E4M3)": .mint,
+        "[MPS] GPU FP16": .purple,
+        "[MPS] GPU INT8": .indigo,
+        "[MPS] GPU FP8 (E4M3)": .cyan,
+        "[MIL] ANE FP16": .teal,
+        "[MIL] ANE INT8": .pink,
+        "[MIL] ANE FP8 (E4M3)": .green,
+        "[MIL] GPU FP16": .brown,
+        "[MIL] GPU INT8": .red,
+        "[MIL] GPU FP8 (E4M3)": .yellow
+    ]
+    
+    private var activeSeriesNames: [String] {
+        let set = Set(filteredResults.map(\.seriesName))
+        let ordered = seriesColorOrder.filter { set.contains($0) }
+        let res = ordered.isEmpty ? Array(set).sorted() : ordered
+        return res.isEmpty ? ["Series"] : res
+    }
+    
+    private var activeSeriesColors: [Color] {
+        activeSeriesNames.map { seriesColorMap[$0] ?? .accentColor }
+    }
     
     @ViewBuilder
     private func chartOverlayView(proxy: ChartProxy) -> some View {
@@ -289,13 +323,19 @@ struct ChartsView: View {
                 }
                 Spacer()
                 
-                // Interactive Legend Filters
-                ScrollView(.horizontal, showsIndicators: false) {
-                    HStack(spacing: 6) {
-                        legendFilterButton(title: "All", filter: .all, color: .secondary)
-                        legendFilterButton(title: "FP16", filter: .fp16, color: .blue)
-                        legendFilterButton(title: "INT8", filter: .int8, color: .orange)
-                        legendFilterButton(title: "FP8", filter: .fp8, color: .mint)
+                // Interactive Legend Filters: only displayed when multiple precisions exist in data
+                if availablePrecisionsInSweep.count > 1 {
+                    ScrollView(.horizontal, showsIndicators: false) {
+                        HStack(spacing: 6) {
+                            legendFilterButton(title: "All", filter: .all, color: .secondary)
+                            ForEach(availablePrecisionsInSweep, id: \.self) { prec in
+                                legendFilterButton(
+                                    title: prec.shortName,
+                                    filter: filterForPrecision(prec),
+                                    color: prec.themeColor
+                                )
+                            }
+                        }
                     }
                 }
             }
@@ -353,7 +393,8 @@ struct ChartsView: View {
                         }
                 }
             }
-            .chartForegroundStyleScale(seriesColorScale)
+            .chartForegroundStyleScale(domain: activeSeriesNames, range: activeSeriesColors)
+            .chartLegend(position: .bottom, alignment: .center, spacing: 10)
             .chartXAxis {
                 AxisMarks(values: .automatic) { _ in
                     AxisGridLine()
