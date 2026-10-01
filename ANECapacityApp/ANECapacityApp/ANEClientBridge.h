@@ -85,20 +85,20 @@ NS_ASSUME_NONNULL_BEGIN
 /// Inspect model structure and memory footprint via _ANEClient compileModel
 + (ANEModelInfo *)introspectModelAtURL:(NSURL *)url
                                    key:(NSString *)key
-                                  arch:(NSString *)arch
+                                  arch:(nullable NSString *)arch
                                  error:(NSError * _Nullable * _Nullable)error;
 
 /// Execute model on silicon with real-time PMU telemetry via _ANEClient (auto-detects workload MACs)
 + (ANEVerificationResult *)verifyModelAtURL:(NSURL *)url
                                         key:(NSString *)key
-                                       arch:(NSString *)arch
+                                       arch:(nullable NSString *)arch
                                    perfMask:(uint32_t)perfMask
                                  iterations:(NSUInteger)iterations;
 
 /// Execute model on silicon with real-time PMU telemetry and explicit workload MACs count
 + (ANEVerificationResult *)verifyModelAtURL:(NSURL *)url
                                         key:(NSString *)key
-                                       arch:(NSString *)arch
+                                       arch:(nullable NSString *)arch
                                    perfMask:(uint32_t)perfMask
                                  iterations:(NSUInteger)iterations
                                   totalMacs:(double)totalMacs;

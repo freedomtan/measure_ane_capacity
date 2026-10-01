@@ -293,7 +293,7 @@ struct BenchmarkView: View {
                         }
                     }
                     .pickerStyle(.segmented)
-                    .onChange(of: viewModel.dimensions.inChannels) { newC in
+                    .onChange(of: viewModel.dimensions.inChannels) { _, newC in
                         viewModel.dimensions.outChannels = newC
                     }
                 }
@@ -315,7 +315,7 @@ struct BenchmarkView: View {
                         }
                     }
                     .pickerStyle(.segmented)
-                    .onChange(of: viewModel.dimensions.height) { newH in
+                    .onChange(of: viewModel.dimensions.height) { _, newH in
                         viewModel.dimensions.width = newH
                     }
                 }
@@ -508,7 +508,7 @@ struct BenchmarkView: View {
             .padding(10)
             .background(Color.black.opacity(0.9))
             .cornerRadius(10)
-            .onChange(of: viewModel.consoleLogs.count) { _ in
+            .onChange(of: viewModel.consoleLogs.count) {
                 if let last = viewModel.consoleLogs.indices.last {
                     proxy.scrollTo(last, anchor: .bottom)
                 }

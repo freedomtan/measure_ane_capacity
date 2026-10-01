@@ -453,8 +453,15 @@ static void fillDenseFloat16(void *buffer, size_t count) {
         (id)kIOSurfaceBytesPerRow: @(inBytes),
         (id)kIOSurfaceAllocSize: @(inBytes),
     };
+    NSDictionary *outSurfProps = @{
+        (id)kIOSurfaceWidth: @(outBytes),
+        (id)kIOSurfaceHeight: @1,
+        (id)kIOSurfaceBytesPerElement: @1,
+        (id)kIOSurfaceBytesPerRow: @(outBytes),
+        (id)kIOSurfaceAllocSize: @(outBytes),
+    };
     IOSurfaceRef inSurf = IOSurfaceCreate((CFDictionaryRef)inSurfProps);
-    IOSurfaceRef outSurf = IOSurfaceCreate((CFDictionaryRef)inSurfProps);
+    IOSurfaceRef outSurf = IOSurfaceCreate((CFDictionaryRef)outSurfProps);
     IOSurfaceRef statsSurf = IOSurfaceCreate((CFDictionaryRef)@{
         (id)kIOSurfaceWidth: @(4096),
         (id)kIOSurfaceHeight: @1,

@@ -286,7 +286,8 @@ struct ChartsView: View {
                 .gesture(
                     DragGesture(minimumDistance: 0)
                         .onChanged { val in
-                            let plotOrigin = geo[proxy.plotAreaFrame].origin
+                            guard let plotFrame = proxy.plotFrame else { return }
+                            let plotOrigin = geo[plotFrame].origin
                             let xLoc = val.location.x - plotOrigin.x
                             let yLoc = val.location.y - plotOrigin.y
                             

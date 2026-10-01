@@ -17,12 +17,8 @@ static const uint32_t kMIL_FLOAT16 = 10;
 static const uint32_t kMIL_INT8 = 21;
 static const uint32_t kMIL_INT32 = 23;
 static const uint32_t kMIL_UINT8 = 31;
-static const uint32_t kMIL_FLOAT8E4M3FN = 40;
 
 static const uint16_t kFP16PlusOneThirtySecond  = 0x2800; // 1/32
-static const uint16_t kFP16MinusOneThirtySecond = 0xA800; // -1/32
-static const uint16_t kFP16PlusOneSixteenth     = 0x2C00; // 1/16
-static const uint16_t kFP16MinusOneSixteenth    = 0xAC00; // -1/16
 
 // Exact IEEE Float8_e4m3fn -> Float16 lookup table, pre-scaled by 0.0625 (2^-4)
 static const uint16_t kFP8E4M3ScaledToFP16LUT[256] = {

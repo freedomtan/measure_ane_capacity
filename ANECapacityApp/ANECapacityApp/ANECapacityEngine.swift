@@ -398,7 +398,7 @@ final class ANECapacityEngine {
         // 3. Compile Executable with Exception Protection
         var beforeDirs: Set<String> = []
         if target == .ane {
-            beforeDirs = (ANEClientBridge.existingANETempDirectories() as? Set<String>) ?? []
+            beforeDirs = ANEClientBridge.existingANETempDirectories()
         }
         
         logHandler("[\(target.shortName) \(precision.rawValue)] Compiling graph on \(target.shortName)...")

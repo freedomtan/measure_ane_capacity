@@ -93,7 +93,7 @@ final class MILCapacityEngine {
         }
         
         guard res.success else {
-            throw NSError(domain: "MILCapacityEngine", code: -2, userInfo: [NSLocalizedDescriptionKey: res.statusMessage ?? "Benchmark failed."])
+            throw NSError(domain: "MILCapacityEngine", code: -2, userInfo: [NSLocalizedDescriptionKey: res.statusMessage])
         }
         
         var pmuCounters: [String: UInt64] = [:]
