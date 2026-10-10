@@ -808,6 +808,87 @@ list but not disassembled here) are a plausible place for generation-tuned
 numeric parameters to live without a generation-named C++ class. Neither (a)
 nor (b) was disassembled further; this is as far as this investigation went.
 
+## Finding 4j — the one public native-int8 path that exists (`MPSNDArrayQuantizedMatrixMultiplication`) is ~8x *slower* than FP16, on two different chips
+
+Finding 4i established that `MPSNDArrayConvolution2D` — the class that could
+dispatch to the native `conv2d_a18/a20_int32_int8_int8` kernels — has zero
+public header anywhere in the SDK. There is, however, one genuinely public,
+documented, `MPS_CLASS_AVAILABLE_STARTING(ios 18.0/macos 15.0)` native
+quantized primitive: `MPSNDArrayQuantizedMatrixMultiplication`, an int8-affine
+GEMM (backed by `NDArrayQuantizedMatmul_int8Affine` in the same metallib,
+confirmed present in both this Mac's own macOS cache and the iPhone 18 Pro's).
+It is not convolution, but it is a real, legitimate, shippable way to ask
+"does native int8 math actually help on this GPU" without touching anything
+private.
+
+**Method.** A standalone harness (`MPSNDArrayDescriptor`/`MPSNDArray`,
+`MPSNDArrayAffineQuantizationDescriptor(dataType: .int8, hasZeroPoint: true,
+hasMinValue: false)`, `MPSNDArrayQuantizedMatrixMultiplication(device:
+leftQuantizationDescriptor:rightQuantizationDescriptor:)`) ran a 2048×2048×2048
+int8-affine GEMM (`sourceArrays = [LHS, RHS, LHSscale, LHSzero, RHSscale,
+RHSzero]`, scale `1/32`, output dequantized to `Float16` via an explicit
+`destinationArray:`) against a same-shape plain `MPSNDArrayMatrixMultiplication`
+FP16 GEMM baseline. First tried on this Mac directly (`swiftc` compiled a
+~120-line throwaway CLI, no Xcode project needed — the class is fully
+available on macOS 27), then added to `ANECapacityApp` as a `--native-int8-gemm`
+launch-argument probe (`NativeInt8GEMMProbe.swift`) and run on the physical
+iPhone 16 Pro via `devicectl device process launch --console`.
+
+**A methodology scare, resolved by hand-checking a tiny case against a CPU
+reference.** `MPSNDArrayMatrixMultiplication.h` states the matrix lives in
+"the two most major dimensions" of the 4-D `MPSNDArray`, and explicitly calls
+out the *3rd/4th* dimension as the broadcastable batch one — read literally,
+that means shape `[M, K, 1, 1]`, not the `[1, 1, M, K]` (batch-first) shape
+originally used here. Switching to the documented-literal `[M, K, 1, 1]`
+produced a *different*, suspicious result (only one row's worth of output
+nonzero, reproducing identically at `M=N=K=64` and `2048` — not a size
+effect), which cast doubt on the original `~8x slower` numbers entirely.
+Resolution: a hand-built 4×4×4 case with CPU-computed expected output (both
+for the plain FP16 kernel and the int8-affine one) showed **`[1, 1, M, K]`
+(batch-first) matches the CPU reference exactly, element for element, for
+*both* kernels — and `[M, K, 1, 1]` (the literal documented ordering) is
+wrong for *both*, not just the quantized one.** So the header's wording
+doesn't match the shipped implementation's actual axis convention (on this
+macOS 27 / iOS build at least); the original `[1, 1, M, K]` benchmark shape
+was correct all along, now independently verified against ground truth rather
+than merely "ran without crashing."
+
+**Result — consistent across two different chips, with the int8 path badly
+losing both times:**
+
+| Device | GPU | Native INT8-affine GEMM | FP16 GEMM baseline | Ratio |
+|---|---|---|---|---|
+| Mac | M4 Pro | 21.61 ms / 0.80 TOPS | 2.48 ms / 6.92 TOPS | INT8 **~8.7x slower** |
+| iPhone 16 Pro | A18 Pro | 77.13 ms / 0.22 TOPS | 9.43 ms / 1.82 TOPS | INT8 **~8.2x slower** |
+
+Both runs confirmed non-degenerate (99.9% nonzero elements, varied values,
+identical deterministic sample output across the two devices since both use
+the same seeded synthetic input — a useful correctness cross-check in its own
+right, now reinforced by the small-case hand verification above). The FP16
+baseline's ~6.9 TOPS on M4 Pro and ~1.8 TOPS on A18 Pro for a single naive,
+untiled GEMM call are both plausible fractions of each GPU's quoted FP16 peak
+— not the suspiciously-cheap numbers a degenerate dispatch would produce.
+
+**Interpretation.** This is strong, direct, two-device, numerically-verified
+evidence that at least this specific native quantized kernel
+(`NDArrayQuantizedMatmul_int8Affine`) is *not* running through anything
+resembling the tiled, `simdgroup_matrix`-based MXU path from Finding 4d — an
+~8x slowdown relative to FP16 is consistent with a reference/scalar
+dequantize-and-accumulate implementation, not a hardware-accelerated one. It
+does **not** by itself prove `conv2d_a18/a20_int32_int8_int8` (the private,
+convolution-specific kernel family) is equally slow — matmul and convolution
+are different kernel families in this same `.metallib`, and the earlier
+`isMXUDTypeSupported` disassembly (Finding 4i) was specifically about
+convolution eligibility, not matmul. But it does mean: **of the two
+realistic ways to reach a "native int8" dispatch on this hardware — the public
+quantized-matmul primitive, or the private quantized-convolution class — the
+one that's actually safe to ship and was directly, correctness-verified
+measured turned out to be a clear loss, not a win**, for GEMM. Whether the
+private convolution kernel behaves differently remains untested; doing so
+would require the `NSClassFromString`-based private-header-reconstruction
+route for `MPSNDArrayConvolution2D` discussed when this path was first
+identified, which was not attempted.
+
 ## Finding 5 — `MPSNDArraySDPAA18Behavior::EncodeSDPA`, decompiled
 
 Address: `0x190c876d8` (`MPSNDArray.framework`, a sub-framework of
