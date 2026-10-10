@@ -122,6 +122,28 @@ private func createNonZeroData(byteCount: Int, dataType: MPSDataType, magnitude:
     return data
 }
 
+// Same spirit as MILSpecBuilder.m's per-channel conv bias ("Zero-overhead
+// fused hardware bias: alternating +/-0.05 to maintain signal vitality
+// without extra cycles") -- the MPSGraph GPU INT8 QDQ path has no bias at
+// all, which makes 0 an absorbing state once any activation underflows the
+// quantization scale. +/-0.05 (MIL's value) only got MPSGraph's zero rate
+// from 19.6% to 3.3% here; +/-0.3 was needed to reach a MIL-comparable
+// <1% floor -- see docs/MPSGraph_MXU_SDPA_Investigation.md Finding 4e for
+// the full scale+bias tuning trail and the remaining open question of why
+// the magnitude needed differs between the two backends.
+private func createAlternatingBiasData(channels: Int) -> Data {
+    var data = Data(count: channels * 2)
+    let posB16 = Float16(0.3).bitPattern
+    let negB16 = Float16(-0.3).bitPattern
+    data.withUnsafeMutableBytes { rawBuf in
+        guard let ptr = rawBuf.baseAddress?.assumingMemoryBound(to: UInt16.self) else { return }
+        for c in 0..<channels {
+            ptr[c] = (c & 1) != 0 ? negB16 : posB16
+        }
+    }
+    return data
+}
+
 final class ANECapacityEngine {
     static let shared = ANECapacityEngine()
     
@@ -270,10 +292,30 @@ final class ANECapacityEngine {
                 let wLength = dims.n * dims.k * 1 * 1 * 2
                 let wData = createNonZeroData(byteCount: wLength, dataType: .float16, magnitude: weightMag)
                 let w = graph.constant(wData, shape: wShape, dataType: .float16)
+                // Fix for all-zero output: plain cast() has no scale at all (int8
+                // value N <-> float16 value N literally), and even quantize/
+                // dequantize at scale=1.0 rounds any activation magnitude < 0.5
+                // to exactly 0 -- with no bias anywhere in this chain, zero is an
+                // absorbing state and the signal fully decays by L=20. Use a
+                // small fixed scale (activations here run O(1-3) by design, same
+                // as weightMag's unit-variance-per-layer convention) so typical
+                // magnitudes map to a well-resolved, non-degenerate int8 range
+                // instead of rounding to zero. See
+                // docs/MPSGraph_MXU_SDPA_Investigation.md Finding 4e. A small
+                // scale alone (tried 1/8 and 1/32) only got from 100% zero
+                // down to a scale-invariant 19.6% zero -- matching MIL's own
+                // GPU INT8 path (which has always been clean, 0% zero) needed
+                // its other difference too: a per-channel bias, breaking the
+                // "zero is absorbing" cascade entirely rather than just
+                // shrinking its basin.
+                let int8Scale: Double = 1.0 / 32.0
+                let biasData = createAlternatingBiasData(channels: dims.n)
+                let bias = graph.constant(biasData, shape: [1, NSNumber(value: dims.n), 1, 1], dataType: .float16)
                 for _ in 0..<dims.layers {
-                    let lhs = graph.cast(cur, to: .float16, name: "dequant")
-                    let outFP16 = graph.convolution2D(lhs, weights: w, descriptor: d, name: nil)
-                    cur = graph.cast(outFP16, to: .int8, name: "requant")
+                    let lhs = graph.dequantize(cur, scale: int8Scale, zeroPoint: 0.0, dataType: .float16, name: "act_dequant")
+                    let convOut = graph.convolution2D(lhs, weights: w, descriptor: d, name: nil)
+                    let outFP16 = graph.addition(convOut, bias, name: "add_bias")
+                    cur = graph.quantize(outFP16, scale: int8Scale, zeroPoint: 0.0, dataType: mpsType, name: "act_quant")
                 }
             } else {
                 let wLength = dims.n * dims.k * 1 * 1 * elementSize
@@ -357,14 +399,29 @@ final class ANECapacityEngine {
                 // app down. Route through the same QDQ pattern matmul's INT8
                 // path already uses below: dequantize activations to FP16,
                 // convolve in FP16 with FP16 weights, requantize the output.
+                //
+                // Fix for all-zero output: see the matching comment in the
+                // matmul-as-1x1-conv branch above -- plain cast() has no scale,
+                // and scale=1.0 quantize/dequantize rounds sub-0.5-magnitude
+                // activations to exactly 0, which (with no bias anywhere in
+                // this chain) is an absorbing state that fully decays the
+                // signal by L=20. docs/MPSGraph_MXU_SDPA_Investigation.md
+                // Finding 4e.
                 let wLength = dims.outChannels * dims.inChannels * dims.kernelSize * dims.kernelSize * 2
                 let wData = createNonZeroData(byteCount: wLength, dataType: .float16, magnitude: weightMag)
                 let w = graph.constant(wData, shape: wShape, dataType: .float16)
 
+                // Also needs the bias fix (see matmul-as-1x1-conv branch
+                // above): scale alone only got to a scale-invariant 19.6%
+                // zero, matching MIL's clean 0% needed the bias too.
+                let int8Scale: Double = 1.0 / 32.0
+                let biasData = createAlternatingBiasData(channels: dims.outChannels)
+                let bias = graph.constant(biasData, shape: [1, NSNumber(value: dims.outChannels), 1, 1], dataType: .float16)
                 for _ in 0..<dims.layers {
-                    let lhs = graph.cast(cur, to: .float16, name: "dequant")
-                    let outFP16 = graph.convolution2D(lhs, weights: w, descriptor: d, name: nil)
-                    cur = graph.cast(outFP16, to: .int8, name: "requant")
+                    let lhs = graph.dequantize(cur, scale: int8Scale, zeroPoint: 0.0, dataType: .float16, name: "act_dequant")
+                    let convOut = graph.convolution2D(lhs, weights: w, descriptor: d, name: nil)
+                    let outFP16 = graph.addition(convOut, bias, name: "add_bias")
+                    cur = graph.quantize(outFP16, scale: int8Scale, zeroPoint: 0.0, dataType: mpsType, name: "act_quant")
                 }
             } else {
                 // Constant weights

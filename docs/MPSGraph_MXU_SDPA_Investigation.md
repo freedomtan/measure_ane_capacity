@@ -456,8 +456,137 @@ Pulling the FP8 and INT8 traces and comparing the actual dispatched kernel
 function names (not just the MPSGraph-level op graph) is the most direct
 remaining way to settle whether the two paths hit different compiled GPU
 kernels underneath the identical-looking FP16 `convolution2D` call — something
-no amount of further static disassembly can substitute for. Not yet run on a
-physical device.
+no amount of further static disassembly can substitute for.
+
+**Run on a physical device (iPhone 16 Pro) — and it turned out not to be
+necessary to open the traces at all. The premise of the whole question was
+wrong.** Launched via `devicectl device process launch` using this app's
+existing `--autorun` CLI automation (`BenchmarkViewModel.swift`), one run each
+for `--gpu --fp8` and `--gpu --int8`, 20 layers, same shape as the default
+(`Cin=128, Cout=128, K=3x3`):
+
+```
+[GPU FP8 (E4M3)] Avg: 192.46 ms, 2.0084 TOPS, Zeros: 244/8388608 (0.0%)
+[GPU INT8]        Avg: 154.73 ms, 2.4982 TOPS, Zeros: 8388608/8388608 (100.0%)
+[GPU INT8] WARNING: 100% zero output (8388608/8388608 elements) -- this is
+not a real measurement. The TOPS below is almost certainly hardware zero-skip
+inflating a degenerate result, not real throughput.
+```
+
+**The GPU INT8 benchmark output is 100% zero** — the app's own built-in
+sanity check (added specifically because of the analogous ANE FP8 underflow
+bug documented in `measure_conv_fp8.m`) caught it immediately. The "INT8 is
+about as fast as FP16" result that kicked off this entire sub-investigation
+was never a *correct* measurement of real INT8 convolution — it was computing
+20 cascaded layers of degenerate zero-propagation. (The app's own log message
+here guesses "hardware zero-skip inflating a degenerate result," copied from
+the ANE-side version of this same check — but every "zero-skip" comment
+anywhere in this codebase names it with **H17/H18** generation numbers, which
+is Apple's ANE hardware-generation naming scheme, not GPU/AGX's (`G13`–`G19`).
+Pushback on this specific claim is warranted: there's no evidence in this
+investigation that AGX's GPU dense SIMD/MXU compute path has any data-dependent
+zero-skip at all — that's a documented ANE sparsity-engine feature, and
+nothing found so far suggests the GPU conv kernels special-case zero operands.
+So whether the measured `154.73 ms` is "artificially fast" or just the
+ordinary cost of running this (numerically broken) op sequence is **unresolved,
+not confirmed** — don't take the inflation claim as established.)
+
+**Root cause, directly from the code:** both the FP8 and INT8 GPU branches in
+`ANECapacityEngine.swift` use `scale: 1.0` for `quantize`/`dequantize`. For
+INT8, that scale *is* the quantization step size — any activation with
+magnitude `< 0.5` rounds to exactly `0`. The conv weights here are
+deliberately small (`weightMag ≈ 0.96/√(reductionLen) ≈ 0.028` for this
+shape), and critically **there is no bias term anywhere in this GPU conv
+chain** — so once one layer's output rounds to `0` under INT8's fixed
+scale-1.0 step, dequantize gives `0.0` exactly, and every subsequent layer
+convolves zero with the weights and stays exactly zero (`0 × w = 0`, no bias
+to perturb it). Over 20 cascaded layers the signal fully decays to zero.
+FP8 (e4m3) doesn't hit this because floating-point quantization error is
+*relative* to magnitude, not a fixed absolute step — small values stay
+representable instead of all collapsing into the same zero bucket.
+
+**This retroactively obsoletes the "operator fusion" and "Winograd" lines of
+investigation above — not because they were wrong, but because the thing they
+were trying to explain (a genuine 2x hardware-throughput gap) was never real
+to begin with.** The INT8 number being compared against FP8's was a broken
+measurement the whole time. There is, as of this finding, no evidence of any
+real GPU MXU throughput difference between INT8 and FP8 convolution at all.
+
+## Finding 4f — fixing the GPU INT8 all-zero bug, and what it took
+
+A natural question followed: **this app's separate MIL/CoreML backend has its
+own, independently-implemented INT8 path (`MILSpecBuilder.m`) — does it have
+the same bug?** No. Run on the same iPhone 16 Pro, same shape:
+
+```
+[MIL][GPU INT8]        Avg: 161.59 ms, Zeros: 0/8388608 (0.0%)
+[MIL][GPU FP8 (E4M3)]  Avg: 3410.75 ms, Zeros: 3/8388608 (0.0%)
+```
+
+MIL's INT8 is clean. Two differences from the broken MPSGraph path explain
+why: MIL uses `scale = fp16(0.0625)` (not `1.0`), and critically its `conv()`
+MIL op has a **real per-channel bias** baked in (`"Zero-overhead fused
+hardware bias: alternating +/-0.05 to maintain signal vitality without extra
+cycles"` — a comment already in `MILSpecBuilder.m`, written for exactly this
+reason). (The MIL FP8 number is a separate, striking result: 3.4 *seconds* —
+~21x slower than MIL's own INT8, and ~18x slower than MPSGraph's FP8 number
+on the same device/shape. This suggests CoreML's GPU compiler may not be
+reaching a real hardware FP8 path at all on this chip, unlike MPSGraph's FP8,
+which at least stays in the same order of magnitude as FP16/INT8. Not
+investigated further here.)
+
+**Fix applied to `ANECapacityEngine.swift`'s GPU INT8 branches** (both the
+matmul-as-1x1-conv and the plain-conv paths), tuning scale and bias
+independently and re-running on the iPhone 16 Pro after each change:
+
+| Fix | Avg latency | Zero % |
+|---|---|---|
+| (baseline) scale=1.0, no bias | 154.73 ms | 100.0% |
+| scale=1/8, no bias | 154.62 ms | 19.6% |
+| scale=1/32, no bias | 154.75 ms | 19.6% (*identical element count* to scale=1/8 — ruling out quantization step size as the cause of this residual) |
+| scale=1/32, bias=±0.05 (MIL's exact value) | 155.90 ms | 3.3% |
+| scale=1/32, bias=±0.15 | 155.98 ms | 1.1% |
+| scale=1/32, bias=±0.3 | 155.94 ms | 0.7% |
+| plain GPU FP16 (no quantization at all, for reference) | 154.50 ms | 0.0% |
+
+The bias (via `graph.addition` after `convolution2D`, before `quantize`,
+broadcast over the channel dimension) is what actually mattered — scale alone
+plateaued at a scale-invariant 19.6%, exactly matching the hypothesis that
+with no bias, `0` is an absorbing state once *any* activation underflows the
+quantization step, and once the mechanism is understood, it's clear scale
+alone can only control *how easily* an element enters that state, not whether
+the state is reachable at all. Settled on `±0.3` (`0.7%` zero) as a pragmatic
+stopping point — diminishing returns past `±0.15` suggest the remaining
+fraction is a different, likely-benign source (plausibly legitimate
+zero-padding border effects, matching plain FP16's own clean behavior at the
+image edges in a 20-layer SAME-padded chain) rather than the same bug.
+Verified consistent across GEMM sizes 512–2048 via the matmul-as-1x1-conv
+branch too (0.7%–1.5% zero, no degenerate 100% case at any size).
+
+**Confirms the zero-skip pushback from the previous finding, directly:**
+latency stayed flat (`154.5`–`155.98 ms`) across every one of these variants —
+100% zero, 19.6% zero, 3.3%, 1.1%, 0.7%, and a fully clean 0% FP16 baseline —
+regardless of how much of the output was zero. If GPU zero-skip existed and
+mattered here, these latencies would not be indistinguishable.
+
+**The real, now-trustworthy comparison on iPhone 16 Pro (A18 Pro):**
+
+| Precision/path | Avg latency |
+|---|---|
+| GPU FP16 | 154.50 ms |
+| GPU INT8 (fixed) | ~155.9 ms |
+| GPU FP8 | 192.46 ms |
+| ANE INT8 (native, no QDQ needed) | 8.22 ms (47.0 TOPS) |
+
+On *this* device, **FP8 is the slow one** — about 24% slower than FP16/INT8,
+not >2x faster. That's the opposite of the original iPhone 18 Pro (A20 Pro)
+observation that kicked off this whole sub-investigation. Since the exact same
+INT8 bug would have been present in whatever produced that original iPhone 18
+Pro number (it's the same code), that device's original INT8 reading was
+almost certainly broken the same way, which means **the original ">2x FP8"
+claim has never actually been validated against a correct INT8 baseline on
+any device.** Re-running this same fixed code on an iPhone 18 Pro is the
+obvious next step and has not been done yet.
 
 ## Finding 5 — `MPSNDArraySDPAA18Behavior::EncodeSDPA`, decompiled
 
@@ -833,13 +962,19 @@ flowchart TB
 
 ## Open threads (not pursued further)
 
-- **Reopened by Finding 4e:** the real cause of the ~2x GPU FP8-vs-INT8 conv
-  throughput gap measured on physical iPhone 18 Pro. The op-fusion hypothesis
-  (`quantize`/`dequantize` vs `cast`) was tested on-device and falsified. Not
-  explained by anything else found in this document either. Candidate
-  directions not yet tried: profiling to see which actual GPU kernel name gets
-  dispatched for each dtype (Metal System Trace), and isolating the one-time
-  weight-loading path from the per-layer activation QDQ path.
+- ~~The real cause of the ~2x GPU FP8-vs-INT8 conv throughput gap...~~
+  **Resolved by Finding 4e/4f, on an iPhone 16 Pro:** there was no real gap to
+  explain — the GPU INT8 benchmark's output was 100% zero (a `scale=1.0`,
+  no-bias signal-decay bug), so its original "throughput" number was never
+  real work. Fixed (scale=1/32 + a per-channel bias, Finding 4f), re-measured:
+  on this device FP8 is actually ~24% *slower* than FP16/INT8, not faster.
+  **Still open:** this fix+re-measurement has only been done on iPhone 16 Pro
+  (A18 Pro) — the original ">2x FP8" claim came from an iPhone 18 Pro (A20
+  Pro), which almost certainly has the identical INT8 bug (same code) and so
+  was never validated against a correct baseline either. Re-running this fixed
+  code on an actual iPhone 18 Pro is the obvious next step and hasn't been
+  done. Also open: why MIL's bias (`±0.05`) alone gets to 0% zero while
+  MPSGraph needed `±0.3` to reach a comparable `0.7%` floor — not isolated.
 - What the `w28` cached flag at page `0x1e4748000+0xb88` (the thing
   `_MPSForceMatrixUnit`'s result is `OR`'d against in `A18Behavior::EncodeSDPA`,
   Finding 7) actually represents — a real device-capability check, another cached
