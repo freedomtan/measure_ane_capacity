@@ -87,11 +87,14 @@ enum NativeInt8ConvProbe {
 
         var inputData = [Int8](repeating: 0, count: Cin * H * W)
         var weightData = [Int8](repeating: 0, count: Cout * Cin * KH * KW)
+        // Bounded regardless of Cin/Cout (overflowed Int8 at Cin=32 with the
+        // previous unbounded c*4+h*2+w+1 formula -- caught via a Swift
+        // runtime trap, not an MPS assertion, on the real A20 Pro device).
         for c in 0..<Cin { for h in 0..<H { for w in 0..<W {
-            inputData[c*H*W + h*W + w] = Int8(c*4 + h*2 + w + 1)
+            inputData[c*H*W + h*W + w] = Int8((c % 7) - 3 + h + w)
         }}}
         for o in 0..<Cout { for c in 0..<Cin {
-            weightData[o*Cin + c] = Int8(c == 0 ? 2 : -3)
+            weightData[o*Cin + c] = Int8(c % 2 == 0 ? 2 : -3)
         }}
 
         var expected = [Int32](repeating: 0, count: Cout * H * W)
