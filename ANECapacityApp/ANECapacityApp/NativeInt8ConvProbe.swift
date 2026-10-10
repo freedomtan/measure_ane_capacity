@@ -64,7 +64,12 @@ enum NativeInt8ConvProbe {
         // below is NOT updated for KH/KW>1 (still only sums over channels,
         // ignoring kernel spatial taps) -- this round only checks whether
         // the assertion itself changes, not numeric correctness.
-        let Cin = 16, Cout = 16, H = 8, W = 8, KH = 3, KW = 3
+        // Cin (2..256), Cout, H/W (2..32), and KH/KW (1 and 3) have each
+        // independently made zero difference across 7 rounds -- strong sign
+        // the issue isn't shape magnitude at all. Testing structure instead:
+        // back to the simple known shapes, but with sourceArrays order
+        // swapped below (weight first, then input).
+        let Cin = 16, Cout = 16, H = 2, W = 2, KH = 1, KW = 1
         desc.setValue(KW, forKey: "kernelWidth")
         desc.setValue(KH, forKey: "kernelHeight")
         desc.setValue(Cin, forKey: "inputFeatureChannels")
@@ -134,7 +139,7 @@ enum NativeInt8ConvProbe {
         let destArr = ndArray(dataType: .int32, shape: [1, Cout, H, W])
 
         let cb = queue.makeCommandBuffer()!
-        kernel.encode(to: cb, sourceArrays: [inputArr, weightArr], destinationArray: destArr)
+        kernel.encode(to: cb, sourceArrays: [weightArr, inputArr], destinationArray: destArr)
         cb.commit()
         cb.waitUntilCompleted()
 
