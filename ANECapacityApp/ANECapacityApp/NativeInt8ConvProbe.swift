@@ -52,7 +52,7 @@ enum NativeInt8ConvProbe {
         }
         let desc = descClass.init()
 
-        let Cin = 32, Cout = 32, H = 2, W = 2, KH = 1, KW = 1
+        let Cin = 64, Cout = 64, H = 2, W = 2, KH = 1, KW = 1
         desc.setValue(KW, forKey: "kernelWidth")
         desc.setValue(KH, forKey: "kernelHeight")
         desc.setValue(Cin, forKey: "inputFeatureChannels")
