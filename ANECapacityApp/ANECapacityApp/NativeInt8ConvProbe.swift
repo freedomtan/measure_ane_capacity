@@ -2,43 +2,36 @@ import Foundation
 import Metal
 import MetalPerformanceShaders
 
-/// Probe for whether the private, undocumented `MPSNDArrayConvolution2D`
-/// class can dispatch a genuine int8 x int8 -> int32 convolution (i.e.
-/// reach `conv2d_a18/a20_int32_int8_int8` in the metallib, per
-/// docs/MPSGraph_MXU_SDPA_Investigation.md Finding 4h/4i). There is no
-/// public header for this class -- it is driven here via KVC and raw
-/// objc_msgSend against the real framework-loaded class/methods (confirmed
-/// to exist via `nm -C` on the extracted framework binary), then the
-/// resulting instance is force-downcast to the public
+/// Probe for the private, undocumented `MPSNDArrayQuantizedConvolution`
+/// class (i.e. reaching `conv2d_a18/a20_int32_int8_int8` in the metallib,
+/// per docs/MPSGraph_MXU_SDPA_Investigation.md Finding 4h/4i). Plain
+/// `MPSNDArrayConvolution2D` (tried first, see git history on this file)
+/// never worked for int8 regardless of any shape/order permutation tried --
+/// turned out it isn't the int8 entry point at all. By analogy with
+/// `MPSNDArrayMatrixMultiplication` vs. the dedicated
+/// `MPSNDArrayQuantizedMatrixMultiplication` subclass (Finding 4j), there is
+/// a parallel dedicated subclass for convolution:
+/// `-[MPSNDArrayQuantizedConvolution initWithDevice:
+/// ndArrayConvolution2DDescriptor:dataQuantizationDescriptor:
+/// weightsQuantizationDescriptor:]`, confirmed via `nm -C` on the extracted
+/// framework binary. Driven here via KVC + raw objc_msgSend, same technique
+/// as the GEMM probe, then force-downcast to the public
 /// `MPSNDArrayMultiaryKernel` base class to call the normal, public, typed
 /// `encodeToCommandBuffer:sourceArrays:destinationArray:`.
-///
-/// On this Mac (M4 Pro) this hits the hard, uncatchable
-/// `MPSNDArrayConvolutionPreG13.mm:649` assertion -- the GPU-family
-/// convolution-behavior dispatcher picks the legacy `PreG13` class there,
-/// not `A18`, even though the metallib ships `conv2d_a18/a20_*` kernels
-/// universally. Triggered by `--native-int8-conv` on launch.
 enum NativeInt8ConvProbe {
-    static func makeInstance(className: String, device: MTLDevice, desc: NSObject, sourceCount: Int? = nil) -> AnyObject? {
-        guard let cls = NSClassFromString(className) as? NSObject.Type else { return nil }
+    static func makeQuantizedConvInstance(
+        device: MTLDevice, convDesc: NSObject, dataQuantDesc: NSObject, weightsQuantDesc: NSObject
+    ) -> AnyObject? {
+        guard let cls = NSClassFromString("MPSNDArrayQuantizedConvolution") as? NSObject.Type else { return nil }
+        let sel = Selector(("initWithDevice:ndArrayConvolution2DDescriptor:dataQuantizationDescriptor:weightsQuantizationDescriptor:"))
+        guard cls.instancesRespond(to: sel) else { return nil }
         typealias AllocFn = @convention(c) (AnyObject, Selector) -> AnyObject
         let allocSel = Selector(("alloc"))
         let allocImp = unsafeBitCast(class_getMethodImplementation(object_getClass(cls), allocSel), to: AllocFn.self)
         let allocated = allocImp(cls, allocSel)
-
-        if let sourceCount {
-            let sel = Selector(("initWithDevice:ndArrayConvolution2DDescriptor:sourceCount:"))
-            guard cls.instancesRespond(to: sel) else { return nil }
-            typealias InitFn3 = @convention(c) (AnyObject, Selector, AnyObject, AnyObject, UInt) -> AnyObject?
-            let imp = unsafeBitCast(class_getMethodImplementation(cls, sel), to: InitFn3.self)
-            return imp(allocated, sel, device as AnyObject, desc, UInt(sourceCount))
-        } else {
-            let sel = Selector(("initWithDevice:ndArrayConvolution2DDescriptor:"))
-            guard cls.instancesRespond(to: sel) else { return nil }
-            typealias InitFn = @convention(c) (AnyObject, Selector, AnyObject, AnyObject) -> AnyObject?
-            let imp = unsafeBitCast(class_getMethodImplementation(cls, sel), to: InitFn.self)
-            return imp(allocated, sel, device as AnyObject, desc)
-        }
+        typealias InitFn = @convention(c) (AnyObject, Selector, AnyObject, AnyObject, AnyObject, AnyObject) -> AnyObject?
+        let imp = unsafeBitCast(class_getMethodImplementation(cls, sel), to: InitFn.self)
+        return imp(allocated, sel, device as AnyObject, convDesc, dataQuantDesc, weightsQuantDesc)
     }
 
     static func run() {
@@ -52,24 +45,12 @@ enum NativeInt8ConvProbe {
         }
         let desc = descClass.init()
 
-        // Cin alone going 2->16->32->64->128 never changed the "not enough
-        // input channels" error at all, with H=W fixed at 2 throughout --
-        // suspiciously consistent with dataFormat=0 NOT meaning NCHW, and
-        // MPS instead reading the (always-2) H dimension as "channels".
-        // Testing that directly: shrink Cin back down, grow H/W instead.
-        // Descriptor readback confirmed KVC took effect correctly in every
-        // prior attempt (Cin 2..256, H/W 2..32), and NONE of it ever moved
-        // this error. The one parameter never touched across 6 rounds:
-        // KH=KW=1. Testing that now. NOTE: the "expected" CPU reference
-        // below is NOT updated for KH/KW>1 (still only sums over channels,
-        // ignoring kernel spatial taps) -- this round only checks whether
-        // the assertion itself changes, not numeric correctness.
-        // Cin (2..256), Cout, H/W (2..32), and KH/KW (1 and 3) have each
-        // independently made zero difference across 7 rounds -- strong sign
-        // the issue isn't shape magnitude at all. Testing structure instead:
-        // back to the simple known shapes, but with sourceArrays order
-        // swapped below (weight first, then input).
-        let Cin = 16, Cout = 16, H = 2, W = 2, KH = 1, KW = 1
+        // Cin=1 (product Cin*KH*KW=256) brought the "not enough taps" error
+        // back even with KH=KW=16 -- so the real gate is the *combined*
+        // Cin*KH*KW reduction length, not KH*KW alone (4096, Cin=16, worked;
+        // 256, Cin=1, didn't). Back to the proven-working Cin=Cout=16, with
+        // H/W shrunk to the minimum for a small, hand-printable case.
+        let Cin = 16, Cout = 16, H = 17, W = 17, KH = 16, KW = 16
         desc.setValue(KW, forKey: "kernelWidth")
         desc.setValue(KH, forKey: "kernelHeight")
         desc.setValue(Cin, forKey: "inputFeatureChannels")
@@ -82,21 +63,19 @@ enum NativeInt8ConvProbe {
         desc.setValue(0, forKey: "dataFormat")
         desc.setValue(0, forKey: "weightsFormat")
 
-        // Varying Cin (2..128) and separately H/W (2..32) never changed the
-        // "not enough input channels" error at all -- check whether the KVC
-        // setValue:forKey: calls above actually took effect, rather than
-        // silently no-oping on a property-type mismatch.
-        for key in ["kernelWidth", "kernelHeight", "inputFeatureChannels", "outputFeatureChannels",
-                    "strideInPixelsX", "strideInPixelsY", "groups", "dilationRateInX", "dilationRateInY",
-                    "dataFormat", "weightsFormat"] {
-            print("[ConvProbe] desc.\(key) readback = \(desc.value(forKey: key) ?? "nil")")
+        guard #available(iOS 18.0, *) else {
+            print("[ConvProbe] MPSNDArrayAffineQuantizationDescriptor requires iOS 18+"); return
         }
+        let dataQuantDesc = MPSNDArrayAffineQuantizationDescriptor(dataType: .int8, hasZeroPoint: false, hasMinValue: false)
+        let weightsQuantDesc = MPSNDArrayAffineQuantizationDescriptor(dataType: .int8, hasZeroPoint: false, hasMinValue: false)
 
-        guard let convInstance = makeInstance(className: "MPSNDArrayConvolution2D", device: device, desc: desc, sourceCount: 2) else {
-            print("[ConvProbe] Failed to construct MPSNDArrayConvolution2D"); return
+        guard let convInstance = makeQuantizedConvInstance(
+            device: device, convDesc: desc, dataQuantDesc: dataQuantDesc, weightsQuantDesc: weightsQuantDesc
+        ) else {
+            print("[ConvProbe] Failed to construct MPSNDArrayQuantizedConvolution"); return
         }
         let kernel = unsafeDowncast(convInstance, to: MPSNDArrayMultiaryKernel.self)
-        print("[ConvProbe] MPSNDArrayConvolution2D instance created: \(kernel)")
+        print("[ConvProbe] MPSNDArrayQuantizedConvolution instance created: \(kernel)")
 
         func ndArray(dataType: MPSDataType, shape: [Int]) -> MPSNDArray {
             let d = MPSNDArrayDescriptor(dataType: dataType, shape: shape.map { NSNumber(value: $0) })
@@ -106,45 +85,136 @@ enum NativeInt8ConvProbe {
             var d = data
             d.withUnsafeMutableBytes { raw in arr.writeBytes(raw.baseAddress!, strideBytes: nil) }
         }
-        func readInt32(_ arr: MPSNDArray, count: Int) -> [Int32] {
-            var out = [Int32](repeating: 0, count: count)
+        func writeHalf(_ arr: MPSNDArray, _ value: Float16) {
+            var d = [value]
+            d.withUnsafeMutableBytes { raw in arr.writeBytes(raw.baseAddress!, strideBytes: nil) }
+        }
+        func writeInt8Scalar(_ arr: MPSNDArray, _ value: Int8) {
+            var d = [value]
+            d.withUnsafeMutableBytes { raw in arr.writeBytes(raw.baseAddress!, strideBytes: nil) }
+        }
+        func readHalf(_ arr: MPSNDArray, count: Int) -> [Float16] {
+            var out = [Float16](repeating: 0, count: count)
             out.withUnsafeMutableBytes { raw in arr.readBytes(raw.baseAddress!, strideBytes: nil) }
             return out
         }
 
-        var inputData = [Int8](repeating: 0, count: Cin * H * W)
-        var weightData = [Int8](repeating: 0, count: Cout * Cin * KH * KW)
-        // Bounded regardless of Cin/Cout (overflowed Int8 at Cin=32 with the
-        // previous unbounded c*4+h*2+w+1 formula -- caught via a Swift
-        // runtime trap, not an MPS assertion, on the real A20 Pro device).
-        for c in 0..<Cin { for h in 0..<H { for w in 0..<W {
-            inputData[c*H*W + h*W + w] = Int8((c % 7) - 3 + h + w)
-        }}}
-        for o in 0..<Cout { for c in 0..<Cin {
-            weightData[o*Cin + c] = Int8(c % 2 == 0 ? 2 : -3)
-        }}
+        let scale: Float = 1.0 / 4.0
+        func fillBoundedRandom(count: Int, seed: UInt64) -> [Int8] {
+            var buf = [Int8](repeating: 0, count: count)
+            var state = seed
+            for i in 0..<count {
+                state = state &* 6364136223846793005 &+ 1442695040888963407
+                let v = Int8(truncatingIfNeeded: Int((state >> 56) & 0x07) - 4)
+                buf[i] = v == 0 ? 1 : v
+            }
+            return buf
+        }
+        let inputData = fillBoundedRandom(count: Cin * H * W, seed: 0x9E3779B97F4A7C15)
+        let weightData = fillBoundedRandom(count: Cout * Cin * KH * KW, seed: 0xC2B2AE3D27D4EB4F)
 
-        var expected = [Int32](repeating: 0, count: Cout * H * W)
-        for o in 0..<Cout { for h in 0..<H { for w in 0..<W {
-            var acc: Int32 = 0
-            for c in 0..<Cin { acc += Int32(inputData[c*H*W + h*W + w]) * Int32(weightData[o*Cin + c]) }
-            expected[o*H*W + h*W + w] = acc
-        }}}
-        print("[ConvProbe] Expected (CPU reference, NCHW/OIHW), first 16: \(expected.prefix(16))")
+        let outH = H - KH + 1, outW = W - KW + 1
+
+        // Comprehensive layout sweep instead of one-guess-at-a-time: the
+        // SAME flat inputData/weightData buffers reinterpreted under every
+        // plausible axis convention (does dataFormat=0 mean NCHW or NHWC?
+        // does weightsFormat=0 mean OIHW, IOHW, OHWI, or HWIO? is the real
+        // kernel spatially flipped? is the output NCHW or NHWC?), each
+        // compared against the actual GPU result below. Reports only the
+        // best match per combination (not 32 full dumps) to keep this a
+        // single device round-trip instead of many.
+        func inputOffset(_ layout: String, _ c: Int, _ h: Int, _ w: Int) -> Int {
+            layout == "nchw" ? c*H*W + h*W + w : h*W*Cin + w*Cin + c
+        }
+        func weightOffset(_ layout: String, _ o: Int, _ c: Int, _ kh: Int, _ kw: Int) -> Int {
+            switch layout {
+            case "oihw": return o*Cin*KH*KW + c*KH*KW + kh*KW + kw
+            case "iohw": return c*Cout*KH*KW + o*KH*KW + kh*KW + kw
+            case "ohwi": return o*KH*KW*Cin + kh*KW*Cin + kw*Cin + c
+            default /* hwio */: return kh*KW*Cin*Cout + kw*Cin*Cout + c*Cout + o
+            }
+        }
+        func outputOffset(_ layout: String, _ o: Int, _ oh: Int, _ ow: Int) -> Int {
+            layout == "nchw" ? o*outH*outW + oh*outW + ow : oh*outW*Cout + ow*Cout + o
+        }
+        func computeExpected(inLayout: String, wLayout: String, outLayout: String, flip: Bool) -> [Float] {
+            var result = [Float](repeating: 0, count: Cout * outH * outW)
+            for o in 0..<Cout { for oh in 0..<outH { for ow in 0..<outW {
+                var acc: Float = 0
+                for c in 0..<Cin { for kh in 0..<KH { for kw in 0..<KW {
+                    let (ikh, ikw) = flip ? (KH-1-kh, KW-1-kw) : (kh, kw)
+                    let inVal = inputData[inputOffset(inLayout, c, oh+ikh, ow+ikw)]
+                    let wVal = weightData[weightOffset(wLayout, o, c, kh, kw)]
+                    acc += Float(inVal) * Float(wVal)
+                }}}
+                result[outputOffset(outLayout, o, oh, ow)] = acc * scale * scale
+            }}}
+            return result
+        }
+
+        var candidates: [(String, [Float])] = []
+        for inLayout in ["nchw", "nhwc"] {
+            for wLayout in ["oihw", "iohw", "ohwi", "hwio"] {
+                for outLayout in ["nchw", "nhwc"] {
+                    for flip in [false, true] {
+                        let label = "in=\(inLayout) w=\(wLayout) out=\(outLayout) flip=\(flip)"
+                        candidates.append((label, computeExpected(inLayout: inLayout, wLayout: wLayout, outLayout: outLayout, flip: flip)))
+                    }
+                }
+            }
+        }
 
         let inputArr = ndArray(dataType: .int8, shape: [1, Cin, H, W])
         let weightArr = ndArray(dataType: .int8, shape: [Cout, Cin, KH, KW])
         writeInt8(inputArr, inputData)
         writeInt8(weightArr, weightData)
-        let destArr = ndArray(dataType: .int32, shape: [1, Cout, H, W])
+
+        // Scalar [1,1,1,1] per-tensor scale worked fine for the GEMM class
+        // (Finding 4j) but the 32-way layout sweep above found no match at
+        // all (best diff no better than random) -- testing whether conv
+        // instead needs per-channel-shaped scale arrays structurally, even
+        // though the actual value is uniform across channels either way.
+        func writeHalfBroadcast(_ arr: MPSNDArray, count: Int, _ value: Float16) {
+            var d = [Float16](repeating: value, count: count)
+            d.withUnsafeMutableBytes { raw in arr.writeBytes(raw.baseAddress!, strideBytes: nil) }
+        }
+        // Per-channel shapes triggered a NEW, worse error ("Unsupported
+        // quantization scheme") -- confirms [1,1,1,1] per-tensor scalar is
+        // structurally correct; the mismatch must be elsewhere.
+        let dataScale = ndArray(dataType: .float16, shape: [1, 1, 1, 1])
+        let weightsScale = ndArray(dataType: .float16, shape: [1, 1, 1, 1])
+        writeHalfBroadcast(dataScale, count: 1, Float16(scale))
+        writeHalfBroadcast(weightsScale, count: 1, Float16(scale))
+
+        let destArr = ndArray(dataType: .float16, shape: [1, Cout, outH, outW])
 
         let cb = queue.makeCommandBuffer()!
-        kernel.encode(to: cb, sourceArrays: [weightArr, inputArr], destinationArray: destArr)
+        // Order by analogy with MPSNDArrayQuantizedMatrixMultiplication's
+        // documented [LHS, RHS, <LHS quant inputs>, <RHS quant inputs>]
+        // (Finding 4j): [data, weights, dataScale, dataZero, weightsScale, weightsZero].
+        kernel.encode(to: cb, sourceArrays: [inputArr, weightArr, dataScale, weightsScale], destinationArray: destArr)
         cb.commit()
         cb.waitUntilCompleted()
 
-        let out = readInt32(destArr, count: Cout * H * W)
-        print("[ConvProbe] GPU result, first 16: \(out.prefix(16))")
-        print("[ConvProbe] Match: \(out == expected)")
+        let out = readHalf(destArr, count: Cout * outH * outW)
+        print("[ConvProbe] GPU result: \(out.map { Float($0) })")
+
+        func closeEnough(_ a: Float16, _ b: Float) -> Bool {
+            abs(Float(a) - b) <= max(1.0, abs(b) * 0.02)
+        }
+        func maxAbsDiff(_ candidate: [Float]) -> Float {
+            zip(out, candidate).map { abs(Float($0) - $1) }.max() ?? -1
+        }
+        var ranked = candidates.map { (label: $0.0, diff: maxAbsDiff($0.1), exact: zip(out, $0.1).allSatisfy { closeEnough($0, $1) }) }
+        ranked.sort { $0.diff < $1.diff }
+        print("[ConvProbe] Layout sweep, best 5 by max-abs-diff (0 or near-0 = found it):")
+        for r in ranked.prefix(5) {
+            print("[ConvProbe]   diff=\(r.diff) exact=\(r.exact)  \(r.label)")
+        }
+        if let exact = ranked.first(where: { $0.exact }) {
+            print("[ConvProbe] EXACT MATCH FOUND: \(exact.label)")
+        } else {
+            print("[ConvProbe] No exact match among \(candidates.count) layout candidates.")
+        }
     }
 }
