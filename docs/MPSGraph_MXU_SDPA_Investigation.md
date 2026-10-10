@@ -947,6 +947,29 @@ selection logic at the ISA level (the same "undocumented, no public
 tooling" wall this investigation keeps hitting), or isn't reachable from
 outside Apple's own framework code at all.
 
+**Confirmed empirically: `MPSNDARRAY_FORCE_MXU=1` (Finding 7) does not help
+either path.** Re-ran both the conv probe and the GEMM probe (Finding 4j) on
+the physical iPhone 16 Pro with the env var set via `devicectl ... -e
+'{"MPSNDARRAY_FORCE_MXU":"1"}'`:
+- Conv probe: identical `PreG13` crash, byte-for-byte. Consistent with
+  Finding 7's own disassembly — the override only flips eligibility checks
+  *inside* an already-constructed `A18`-class behavior (`isMXUDTypeSupported`,
+  `IsWinogradSupported`, `IsIntrinsicsSupported`, etc.); it has no way to make
+  `MPSNDArrayConvolution2D` construct the `A18` behavior in the first place,
+  since nothing here ever does regardless of the override.
+- GEMM probe: identical timing, `77.12 ms` vs. the unset baseline's
+  `77.13 ms` — no measurable effect at all. This independently reproduces
+  Finding 7's own disassembly sweep, which explicitly checked
+  `IsInt8AffineSupportedQuantization` and
+  `EncodeQuantizedMatrixMultiplicationInt8Affine` and found **zero** calls to
+  either `_MPSForceMatrixUnit` or `_MPSDisableMatrixUnit` — the quantized-
+  matmul kernel family doesn't consult this override at all, by design, not
+  by omission.
+
+So the override is real, well-understood now from two independent angles
+(static disassembly in Finding 7, live behavior here), and still doesn't
+open a path to the native int8 kernels from app code.
+
 ## Finding 5 — `MPSNDArraySDPAA18Behavior::EncodeSDPA`, decompiled
 
 Address: `0x190c876d8` (`MPSNDArray.framework`, a sub-framework of
