@@ -57,7 +57,14 @@ enum NativeInt8ConvProbe {
         // suspiciously consistent with dataFormat=0 NOT meaning NCHW, and
         // MPS instead reading the (always-2) H dimension as "channels".
         // Testing that directly: shrink Cin back down, grow H/W instead.
-        let Cin = 16, Cout = 16, H = 32, W = 32, KH = 1, KW = 1
+        // Descriptor readback above confirmed KVC took effect correctly in
+        // every prior attempt -- so "not enough input channels in filter"
+        // must be checking something that stayed constant across all of
+        // them. The one thing never varied: KH=KW=1. Testing whether the
+        // real threshold is on the filter's total reduction length
+        // Cin*KH*KW rather than raw Cin: this doubles Cin again (128->256,
+        // product still 256*1*1) with H/W back down to something small.
+        let Cin = 256, Cout = 16, H = 2, W = 2, KH = 1, KW = 1
         desc.setValue(KW, forKey: "kernelWidth")
         desc.setValue(KH, forKey: "kernelHeight")
         desc.setValue(Cin, forKey: "inputFeatureChannels")
