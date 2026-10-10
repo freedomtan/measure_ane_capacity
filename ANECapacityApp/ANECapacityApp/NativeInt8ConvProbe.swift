@@ -70,6 +70,16 @@ enum NativeInt8ConvProbe {
         desc.setValue(0, forKey: "dataFormat")
         desc.setValue(0, forKey: "weightsFormat")
 
+        // Varying Cin (2..128) and separately H/W (2..32) never changed the
+        // "not enough input channels" error at all -- check whether the KVC
+        // setValue:forKey: calls above actually took effect, rather than
+        // silently no-oping on a property-type mismatch.
+        for key in ["kernelWidth", "kernelHeight", "inputFeatureChannels", "outputFeatureChannels",
+                    "strideInPixelsX", "strideInPixelsY", "groups", "dilationRateInX", "dilationRateInY",
+                    "dataFormat", "weightsFormat"] {
+            print("[ConvProbe] desc.\(key) readback = \(desc.value(forKey: key) ?? "nil")")
+        }
+
         guard let convInstance = makeInstance(className: "MPSNDArrayConvolution2D", device: device, desc: desc, sourceCount: 2) else {
             print("[ConvProbe] Failed to construct MPSNDArrayConvolution2D"); return
         }
