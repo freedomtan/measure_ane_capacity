@@ -52,7 +52,12 @@ enum NativeInt8ConvProbe {
         }
         let desc = descClass.init()
 
-        let Cin = 128, Cout = 128, H = 2, W = 2, KH = 1, KW = 1
+        // Cin alone going 2->16->32->64->128 never changed the "not enough
+        // input channels" error at all, with H=W fixed at 2 throughout --
+        // suspiciously consistent with dataFormat=0 NOT meaning NCHW, and
+        // MPS instead reading the (always-2) H dimension as "channels".
+        // Testing that directly: shrink Cin back down, grow H/W instead.
+        let Cin = 16, Cout = 16, H = 32, W = 32, KH = 1, KW = 1
         desc.setValue(KW, forKey: "kernelWidth")
         desc.setValue(KH, forKey: "kernelHeight")
         desc.setValue(Cin, forKey: "inputFeatureChannels")
@@ -103,7 +108,7 @@ enum NativeInt8ConvProbe {
             for c in 0..<Cin { acc += Int32(inputData[c*H*W + h*W + w]) * Int32(weightData[o*Cin + c]) }
             expected[o*H*W + h*W + w] = acc
         }}}
-        print("[ConvProbe] Expected (CPU reference, NCHW/OIHW): \(expected)")
+        print("[ConvProbe] Expected (CPU reference, NCHW/OIHW), first 16: \(expected.prefix(16))")
 
         let inputArr = ndArray(dataType: .int8, shape: [1, Cin, H, W])
         let weightArr = ndArray(dataType: .int8, shape: [Cout, Cin, KH, KW])
@@ -117,7 +122,7 @@ enum NativeInt8ConvProbe {
         cb.waitUntilCompleted()
 
         let out = readInt32(destArr, count: Cout * H * W)
-        print("[ConvProbe] GPU result: \(out)")
+        print("[ConvProbe] GPU result, first 16: \(out.prefix(16))")
         print("[ConvProbe] Match: \(out == expected)")
     }
 }
