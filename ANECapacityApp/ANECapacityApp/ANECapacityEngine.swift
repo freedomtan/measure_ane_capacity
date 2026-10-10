@@ -448,6 +448,36 @@ final class ANECapacityEngine {
         let ed = MPSGraphExecutableExecutionDescriptor()
         ed.waitUntilCompleted = true
 
+        // Optional GPU frame capture, gated by env var so default runs are
+        // unaffected -- set ANE_CAPACITY_GPU_CAPTURE=1 (plus MetalCaptureEnabled
+        // in Info.plist, already set) to dump a .gputrace per GPU benchmark
+        // run into the app's Documents directory. Written to investigate
+        // docs/MPSGraph_MXU_SDPA_Investigation.md Finding 4e: whether FP8 and
+        // INT8 convolution dispatch to different compiled GPU kernels despite
+        // both nominally running the same FP16-only convolution2D op.
+        var gpuCapture: MTLCaptureManager? = nil
+        if target != .ane, ProcessInfo.processInfo.environment["ANE_CAPACITY_GPU_CAPTURE"] == "1" {
+            let captureManager = MTLCaptureManager.shared()
+            if captureManager.supportsDestination(.gpuTraceDocument) {
+                let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+                let fileName = "capture_\(target.shortName)_\(precision.rawValue)_\(Int(Date().timeIntervalSince1970)).gputrace"
+                let traceURL = docs.appendingPathComponent(fileName)
+                let descriptor = MTLCaptureDescriptor()
+                descriptor.captureObject = device
+                descriptor.destination = .gpuTraceDocument
+                descriptor.outputURL = traceURL
+                do {
+                    try captureManager.startCapture(with: descriptor)
+                    gpuCapture = captureManager
+                    logHandler("[\(target.shortName) \(precision.rawValue)] GPU capture -> \(traceURL.lastPathComponent)")
+                } catch {
+                    logHandler("[\(target.shortName) \(precision.rawValue)] GPU capture failed to start: \(error.localizedDescription)")
+                }
+            } else {
+                logHandler("[\(target.shortName) \(precision.rawValue)] GPU capture requested but .gpuTraceDocument destination unsupported on this device/OS.")
+            }
+        }
+
         // 5. Warmup with Exception Protection
         logHandler("[\(target.shortName) \(precision.rawValue)] Warming up pipeline...")
         do {
@@ -455,7 +485,15 @@ final class ANECapacityEngine {
                 exe.run(with: queue, inputs: [iData], results: [oData], executionDescriptor: ed)
             }
         } catch {
+            gpuCapture?.stopCapture()
             throw BenchmarkError.executionFailed("Warmup failed: \(error.localizedDescription)")
+        }
+
+        if let gpuCapture {
+            // One compiled-executable dispatch is enough to see which actual
+            // GPU kernel name got selected; stop immediately to keep the
+            // trace small and avoid skewing the timed loop below.
+            gpuCapture.stopCapture()
         }
 
         if Task.isCancelled { throw BenchmarkError.executionCancelled }
