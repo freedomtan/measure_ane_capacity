@@ -887,7 +887,65 @@ measured turned out to be a clear loss, not a win**, for GEMM. Whether the
 private convolution kernel behaves differently remains untested; doing so
 would require the `NSClassFromString`-based private-header-reconstruction
 route for `MPSNDArrayConvolution2D` discussed when this path was first
-identified, which was not attempted.
+identified — attempted next, in Finding 4k.
+
+## Finding 4k — `MPSNDArrayConvolution2D` itself cannot reach `conv2d_a18/a20_int32_int8_int8`: it hardcodes the old `PreG13` (float-only) behavior regardless of chip or config
+
+Finding 4i found `MPSNDArrayConvolution2D` has no public header, but its
+class and every method (`initWithDevice:ndArrayConvolution2DDescriptor:`,
+`initWithDevice:ndArrayConvolution2DDescriptor:sourceCount:`, and the
+sibling `MPSNDArrayConvolution2DDescriptor` with `kernelWidth`/
+`inputFeatureChannels`/`dataFormat`/etc. properties) are real, exported
+Objective-C symbols. Since its base class `MPSNDArrayMultiaryKernel` *is*
+public (`encodeToCommandBuffer:sourceArrays:destinationArray:`), it can be
+driven entirely from app code: `NSClassFromString` + raw `objc_msgSend`
+(via `class_getMethodImplementation` + a `@convention(c)` function-pointer
+cast) to construct the private class and set its private descriptor's
+properties via plain KVC (`setValue:forKey:`), then `unsafeDowncast` the
+result to the public `MPSNDArrayMultiaryKernel` type to call the normal,
+typed, public encode method. No bridging header, no private-header
+reconstruction needed — this works directly from Swift.
+
+**Result: it doesn't reach the native kernel, on either chip tested, under
+any configuration tried.** A tiny, hand-verified int8×int8→int32 1×1
+pointwise "convolution" (CPU reference computed and compared) was run
+three ways:
+- On this Mac (M4 Pro): hits
+  `MPSNDArrayConvolutionPreG13.mm:649: failed assertion 'Only FP32 or FP16
+  convolution supported'` — the exact same uncatchable `abort()` Finding 4e
+  found via the public `MPSGraphConvolution2DOpDescriptor` path, this time
+  triggered directly through the private class with no MPSGraph involved at
+  all.
+- On the physical iPhone 16 Pro (A18 Pro) — the chip whose
+  `isMXUDTypeSupported` disassembly (Finding 4i) explicitly showed int8
+  combinations being accepted — **the identical assertion fires**, with
+  `Cin=Cout=2` (first attempt, in case the all-ones-descriptor default was
+  somehow invalid) and again with `Cin=Cout=16` (in case eligibility is
+  gated on reaching the `simdgroup_matrix<T,16,16>` tile width, mirroring
+  the `Ci,Co≥16` thresholds `MPS_Winograd_Convolution.md` found gating other
+  convolution eligibility checks) — both configurations crash identically.
+- Also retried with the 3-argument `initWithDevice:ndArrayConvolution2DDescriptor:
+  sourceCount:` initializer instead of the 2-argument one, in case the
+  simpler initializer path hardcodes a legacy behavior — same crash.
+
+**Conclusion: `MPSNDArrayConvolution2D` is not the code path that reaches
+`conv2d_a18/a20_int32_int8_int8` at all, for any configuration reachable
+from app code — not a channel-count, chip-generation, or initializer-arity
+issue.** Combined with Finding 4h/4i (the native kernels and the
+chip-aware `isMXUDTypeSupported` eligibility logic both genuinely exist in
+the binary) and Finding 4j (the one public native-int8 primitive that *does*
+dispatch, `MPSNDArrayQuantizedMatrixMultiplication`, turned out ~8x slower
+than FP16), the picture that emerges is: the `A18`-class convolution
+device-behavior dispatch is real, but whatever decides to actually
+*construct* an `MPSNDArrayConvolutionDeviceBehaviorA18` instance (as
+opposed to the always-available, FP16/FP32-only `PreG13` one) is apparently
+never triggered through this ObjC class — only, presumably, through
+MPSGraph's own internal compiled-kernel-selection machinery, which has no
+externally callable entry point. Reaching the native int8 convolution
+kernel family appears to require either reverse-engineering that internal
+selection logic at the ISA level (the same "undocumented, no public
+tooling" wall this investigation keeps hitting), or isn't reachable from
+outside Apple's own framework code at all.
 
 ## Finding 5 — `MPSNDArraySDPAA18Behavior::EncodeSDPA`, decompiled
 
