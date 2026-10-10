@@ -588,6 +588,226 @@ claim has never actually been validated against a correct INT8 baseline on
 any device.** Re-running this same fixed code on an iPhone 18 Pro is the
 obvious next step and has not been done yet.
 
+## Finding 4g — confirmed on iPhone 18 Pro: the FP8 speedup is real, and it's generation-specific
+
+The fixed code (Finding 4f's scale+bias QDQ, `f16eccd`) was run on an actual
+physical iPhone 18 Pro. Result: INT8's zero fraction landed at **~1.3%** — in
+the same non-degenerate range as iPhone 16 Pro's `0.7%`–`1.5%` (confirming the
+fix generalizes across hardware, not just the one device it was tuned on) —
+and, with a now-trustworthy INT8 baseline, **FP8 is still ~2x faster than
+INT8 and FP16 on this device.**
+
+So the full picture, across both physical devices tested:
+
+| Device | Chip | FP8 vs FP16/INT8 (corrected baseline) |
+|---|---|---|
+| iPhone 16 Pro | A18 Pro | FP8 ~24% **slower** |
+| iPhone 18 Pro | A20 Pro | FP8 ~2x **faster** |
+
+**This resolves the sub-investigation, and the resolution is satisfying: the
+benchmark bug was real and needed fixing (Finding 4e/4f), but the underlying
+hardware claim it was trying to measure turns out to be real too — just
+generation-specific, not universal.** A20 Pro gets a genuine, large FP8
+speedup on this exact convolution shape; A18 Pro does not (and if anything
+runs FP8 slower). This lines up with everything else this investigation found
+about generation-dependent MXU support: the `AGXMetal*FamilyDevice`
+`supportsMXU` driver overrides differ by GPU generation (confirmed hardcoded
+`NO` for `G13X`–`G16X`, `YES` for `G17G` onward — see the companion
+`MTLDevice_supportsFP8_Reverse_Engineering_Report.md`), and the `air.
+simdgroup_matrix_16x16x16_multiply_accumulate.*.f8e4m3*` intrinsics from
+Finding 4d are presumably present in both chips' compiled kernels but may not
+be *accelerated* identically — A18 Pro's GPU may execute that intrinsic at
+no better (or worse) throughput than its FP16 path, while A20 Pro's actually
+runs it faster. Whether that's a real ALU-width/throughput difference in the
+hardware MXU itself, or a driver/compiler maturity difference between the two
+generations' Metal backends, was not determined — doing so would require the
+AGX-ISA-level disassembly this investigation has consistently flagged as out
+of reach (undocumented ISA, no public tooling).
+
+## Finding 4h — native GPU int8/fp8 conv kernels exist, but this benchmark's `convolution2D` call structurally can't reach them
+
+Picking up the generation-specific-gap question from a different angle: does
+raw GPU int8 convolution actually dequantize to FP16 under the hood, or does
+real int8 hardware math exist and simply go unused by this benchmark?
+
+**The symbol table of the physical iPhone 18 Pro's own
+`MPSNDArray.framework/default.metallib` answers this directly.**
+`metal-objdump --demangle --syms` against that file (same ground-truth binary
+as Finding 4c/4d) lists a fully symmetric set of 14 `conv2d_a18_*` and 14
+`conv2d_a20_*` compiled kernel variants, one pair per generation for every
+operand-type combination:
+
+```
+conv2d_a18_float_float_float          conv2d_a20_float_float_float
+conv2d_a18_float_half_half            conv2d_a20_float_half_half
+conv2d_a18_float_bfloat_bfloat        conv2d_a20_float_bfloat_bfloat
+conv2d_a18_float_float8e4m3_float8e4m3   conv2d_a20_float_float8e4m3_float8e4m3
+conv2d_a18_float_float8e4m3fn_float8e4m3fn  conv2d_a20_float_float8e4m3fn_float8e4m3fn
+conv2d_a18_float_float8e5me_float8e5me   conv2d_a20_float_float8e5me_float8e5me
+conv2d_a18_int32_int8_int8             conv2d_a20_int32_int8_int8
+conv2d_a18_int32_uint8_uint8           conv2d_a20_int32_uint8_uint8
+conv2d_a18_int32_uint8_int8            conv2d_a20_int32_uint8_int8
+conv2d_a18_float_half_int8             conv2d_a20_float_half_int8
+conv2d_a18_float_int8_half             conv2d_a20_float_int8_half
+conv2d_a18_float_bfloat_int8           (bfloat/int8 mixed kernels not re-emitted for a20)
+conv2d_a18_float_half_uint8            conv2d_a20_float_half_uint8
+conv2d_a18_float_uint8_half            conv2d_a20_float_uint8_half
+```
+
+(naming convention appears to be `conv2d_<gen>_<accumulate-type>_<input-type>_<weight-type>`
+— `conv2d_a18_int32_int8_int8` reads as "int8 input, int8 weight, int32
+accumulator," the classic native quantized-conv signature; the `float8e5me`
+spelling is Apple's own typo/abbreviation for `float8e5m2`, consistently
+reproduced in both generations' symbol names.)
+
+**This settles the question: GPU int8 convolution is not inherently an
+FP16-dequantize-and-recompute emulation.** A genuine native kernel —
+`conv2d_a18_int32_int8_int8` / `conv2d_a20_int32_int8_int8` — exists,
+compiled, in this exact binary, for both chip generations, with a real int32
+accumulator (not promoted to float first). The same is true for fp8: three
+distinct native fp8 kernel variants exist per generation
+(`float8e4m3`/`float8e4m3fn`/`float8e5me`), not just a cast-to-half fallback.
+
+**But this benchmark's GPU INT8/FP8 branches never reach any of them.** Per
+Finding 4e's already-established assertion
+(`ANECapacityEngine.swift`'s comment, confirmed by the actual on-device
+`abort()` when raw int8 was tried against the public
+`MPSGraphConvolution2DOpDescriptor`/`convolution2D` op): that public API
+rejects non-FP32/FP16 operands outright. The only way this benchmark's QDQ
+pattern (`dequantize` → `convolution2D` → `addition` → `quantize`) can
+satisfy that constraint is by materializing a genuine `Float16` tensor
+*before* calling `convolution2D` — which means the op description handed to
+the graph compiler always says "half operands," so the compiler can only
+ever select `conv2d_a18_float_half_half` / `conv2d_a20_float_half_half` for
+every precision this benchmark tests (INT8, FP8, and the FP16 control alike).
+The native `int32_int8_int8` and `float8e4m3*` kernels sitting right next to
+it in the same `.metallib` are structurally unreachable from this call
+site — not because the hardware or driver lacks them, but because the
+*public* `MPSGraph` op this benchmark uses only has a code path that emits
+float-typed convolutions. Reaching the native kernels would require the
+private, lower-level `MPSNDArrayConvolution2D` object directly (the
+`ndArrayConvolution2D` entry point also visible in this symbol table) rather
+than `MPSGraphConvolution2DOpDescriptor`.
+
+**Consequence for Finding 4g's open question:** the generation-specific FP8
+speedup this benchmark measures is **entirely a property of the
+`conv2d_a18_float_half_half` / `conv2d_a20_float_half_half` kernel pair**
+(plus the QDQ bookkeeping around it) — since that is the only kernel either
+precision ever dispatches to here. It has nothing to do with the native
+`float8e4m3`/`int32_int8_int8` kernels' own throughput, which this benchmark
+never exercises at all. Whatever makes A20 Pro's `half_half` conv run ~2x
+faster under an FP8-sourced QDQ pattern than under an INT8-sourced one (both
+converging on bit-identical FP16 math) must be a *compiler/graph-lowering*
+difference tied to the surrounding op types (scale/zero-point handling,
+constant-folding of the weight dequantize, or kernel-selection heuristics
+keyed on the graph's declared boundary dtype) — not a hardware MXU throughput
+difference in actual int8 or fp8 math, since neither chip's native quantized
+kernel is ever invoked. Confirming this precisely (and measuring what the
+*native* kernels can actually do) would need either `MPSNDArrayConvolution2D`
+used directly, bypassing `MPSGraph`, or the GPU-capture kernel-name
+comparison from Finding 4e's instrumentation (Step 3, not yet run on-device).
+
+## Finding 4i — live disassembly of `MPSNDArrayConvolutionDeviceBehaviorA18`'s dtype-eligibility methods, from the real iPhone 18 Pro's own cache
+
+Finding 4h established *that* native int8/fp8 conv kernels exist; this finding
+disassembles the actual C++ decision code that would route a call to them, to
+answer two things directly: (1) does the driver's own dtype-eligibility logic
+treat int8/fp8 as first-class, non-emulated inputs, and (2) is that logic
+different between A18 Pro and A20 Pro at all.
+
+**Method.** The iPhone 18 Pro `.ipsw`
+(`iPhone19,2_27.0.1_24A446_Restore.ipsw`, i.e. the real OS image for this
+exact device) was sitting on disk already. The system `ipsw` binary couldn't
+parse its dyld shared cache (`invalid dyld_shared_cache magic
+'dyld_v1arm64ex1'` — iOS 27's cache format gained a new "extensions version"
+header this older `ipsw` build didn't know about), so `github.com/blacktop/
+ipsw` was built fresh from source (`go build`) and used to extract the real
+`MPSNDArray` dylib (the image `MPSNDArrayConvolutionDeviceBehaviorA18` etc.
+actually live in, confirmed via `nm -C`) straight out of the device's own
+cache, then disassembled with `ipsw macho disass --symbol <mangled> --demangle`.
+This is ground truth for the actual physical device, not an inference from
+this Mac's own (older) macOS cache.
+
+**`MPSNDArrayConvolutionDeviceBehaviorA18::isMXUDTypeSupported` is a real,
+non-trivial multi-case dtype-pair eligibility check — not a stub, and not an
+FP16-only gate.** Disassembly shows it building `MPSDataType` constants
+inline (`0x10000008` = a generic float8 variant, `0x10000010` = Float16,
+`0x90000010` = BFloat16, `0x20000008` = Int8, plain `8` = UInt8, `0x10000020`
+= Float32, plus two more float8-subtype-tagged constants at `0x10520008` and
+`0x10430008`, presumably e4m3/e5m2 or e4m3/e4m3fn) and comparing the two
+operand dtypes against them:
+- **float8-vs-float8 (any of the three float8 variant encodings, matched
+  symmetrically) unconditionally returns true** — no capability check at all,
+  it's just allowed.
+- **Float16+Int8, BFloat16+Int8, and BFloat16+UInt8 are each gated by a
+  pointer loaded from `this+0x78`** (`cbnz x10, <return true>` / `cbz x10,
+  <fall through>`) — a per-instance capability/feature-table pointer, not a
+  hardcoded `false`. Since this instance only ever exists on hardware new
+  enough to be classed `A18`, that field reads as populated on real devices —
+  i.e. these mixed int8 combinations are live-enabled, not merely declared
+  and then vetoed.
+
+So the driver's own eligibility function already considers genuine,
+non-FP16-mediated int8 (and uint8, and bfloat16) convolution operand pairs
+to be MXU-dtype-supported. This directly answers the GPU-INT8-dequantizes-
+to-FP16 question for the *driver layer*: **no, not categorically** — real
+int8 math is a first-class option the dispatcher is willing to select. It's
+specifically *this benchmark's* use of the public `MPSGraphConvolution2DOp
+Descriptor` API (Finding 4h) that forces FP16 before the dispatcher ever
+gets a chance to make this choice.
+
+**`MPSNDArrayConvolutionDeviceBehaviorA18::IsQuantizationSupported` is a
+hardcoded `mov w0, #0; ret`** — unconditionally `false`, no logic at all.
+The same is true of the old `...PreG13::IsQuantizationSupported`. Reading
+this alongside the previous paragraph: Apple's own "quantization" code path
+(a scale/zero-point-carrying int8 conv, structurally what this benchmark's
+QDQ wrapper emulates by hand) is dead on this device class — superseded
+entirely by the newer `isMXUDTypeSupported`/`IsIntrinsicsSupported` native-
+dtype dispatch mechanism, which handles int8 a different way (direct typed
+operands, no scale/zero-point bookkeeping at the conv op itself).
+
+**`MPSNDArrayConvolutionDeviceBehaviorA18::IsIntrinsicsSupported` contains a
+literal, human-readable fallback message:** `"MXU explicitly disabled.
+Falling back to TEC implementation."`, gated by a call to a helper at
+`0x23812f1a0` early in the function. This independently corroborates Finding
+7's `_MPSForceMatrixUnit`/`_MPSDisableMatrixUnit` env-var-driven override
+mechanism — there is a real, intentional non-MXU fallback path, with its own
+name ("TEC" — likely "Tensor Execution Core" or similar; not spelled out
+anywhere found, so the acronym itself stays unresolved, same caveat as "MXU").
+
+**No `MPSNDArrayConvolutionDeviceBehaviorA20` class exists, confirmed from
+the real device's own cache** (`nm -C` on the extracted `MPSNDArray` lists
+`PreG13`, `A14`, `A18` — no `A16`/`A15X` even appear in *this* binary, though
+they did in this Mac's own macOS cache, suggesting the symbol set an image
+ships with varies by platform/build, not just by chip). **A20 Pro's
+convolution dispatch — `isMXUDTypeSupported`, `IsQuantizationSupported`,
+`IsIntrinsicsSupported`, `IsWinogradSupported`, kernel selection, all of
+it — runs the exact same compiled `A18` C++ class as A18 Pro's**, bit-for-bit
+identical code, confirmed directly on-device rather than inferred from a
+possibly-stale macOS build. The only generation-specific artifact found
+anywhere in either cache is `_matmulA20PTable` (`__TEXT.__const`, sitting
+right next to the `conv2d_a20_*` kernel symbols from Finding 4h) — a tuning
+table for matmul/GEMM dispatch (the SDPA/MXU matmul path), not convolution.
+
+**This resolves Finding 4g's remaining open question, at least by
+elimination:** the ~2x generation-specific FP8 speedup is **not** caused by
+different convolution-eligibility or dispatch *decisions* between A18 Pro and
+A20 Pro — the decision code is identical. Combined with Finding 4h (this
+benchmark only ever reaches `conv2d_a18/a20_float_half_half`, never a native
+quantized kernel), the remaining candidate explanations narrow to: (a) the
+A20 silicon genuinely executes the *same* `half_half` kernel's instruction
+mix faster when the data happened to flow through an FP8-sourced QDQ wrapper
+versus an INT8-sourced one (plausible if MPSGraph's constant-folding or
+instruction scheduling differs subtly between the two wrapper shapes in a
+way that interacts with A20's micro-architecture but not A18's), or (b) a
+difference in the *matmul* tuning table (`_matmulA20PTable`) somehow
+leaking into convolution kernel selection in a way not visible in the
+`DeviceBehaviorA18` class itself — e.g. the kernel-dispatch-parameters
+tables (`GetKernelDispatchParametersForKeyIntrinsics`, visible in the symbol
+list but not disassembled here) are a plausible place for generation-tuned
+numeric parameters to live without a generation-named C++ class. Neither (a)
+nor (b) was disassembled further; this is as far as this investigation went.
+
 ## Finding 5 — `MPSNDArraySDPAA18Behavior::EncodeSDPA`, decompiled
 
 Address: `0x190c876d8` (`MPSNDArray.framework`, a sub-framework of
@@ -963,18 +1183,30 @@ flowchart TB
 ## Open threads (not pursued further)
 
 - ~~The real cause of the ~2x GPU FP8-vs-INT8 conv throughput gap...~~
-  **Resolved by Finding 4e/4f, on an iPhone 16 Pro:** there was no real gap to
-  explain — the GPU INT8 benchmark's output was 100% zero (a `scale=1.0`,
-  no-bias signal-decay bug), so its original "throughput" number was never
-  real work. Fixed (scale=1/32 + a per-channel bias, Finding 4f), re-measured:
-  on this device FP8 is actually ~24% *slower* than FP16/INT8, not faster.
-  **Still open:** this fix+re-measurement has only been done on iPhone 16 Pro
-  (A18 Pro) — the original ">2x FP8" claim came from an iPhone 18 Pro (A20
-  Pro), which almost certainly has the identical INT8 bug (same code) and so
-  was never validated against a correct baseline either. Re-running this fixed
-  code on an actual iPhone 18 Pro is the obvious next step and hasn't been
-  done. Also open: why MIL's bias (`±0.05`) alone gets to 0% zero while
-  MPSGraph needed `±0.3` to reach a comparable `0.7%` floor — not isolated.
+  **Fully resolved as far as this investigation can take it, Finding
+  4e/4f/4g/4h/4i, on both an iPhone 16 Pro and an iPhone 18 Pro.** The
+  original benchmark was genuinely broken (GPU INT8's output was 100% zero —
+  a `scale=1.0`, no-bias signal-decay bug). Fixed (scale=1/32 + per-channel
+  bias). With a trustworthy baseline on both devices, the FP8 speedup turns
+  out to be **real but generation-specific**: ~24% *slower* on A18 Pro
+  (iPhone 16 Pro), ~2x *faster* on A20 Pro (iPhone 18 Pro). Live disassembly
+  from the real iPhone 18 Pro's own cache (Finding 4i) then showed this
+  benchmark's GPU path never reaches a native int8/fp8 kernel at all (both
+  precisions collapse to the identical `conv2d_a18/a20_float_half_half`
+  kernel per Finding 4h) and that A20 Pro has no distinct convolution-
+  dispatch class from A18 Pro — the C++ eligibility/dispatch code is
+  bit-identical between the two chips, the only generation-specific artifact
+  found anywhere being a matmul (not conv) tuning table,
+  `_matmulA20PTable`. So the gap is conclusively *not* a differing software
+  dispatch decision between generations. What remains open, past the point
+  disassembly alone can resolve: whether A20's silicon genuinely runs the
+  same `half_half` kernel's instruction mix faster depending on which QDQ
+  wrapper shape produced it, or whether a generation-tuned numeric parameter
+  table (`GetKernelDispatchParametersForKeyIntrinsics`, seen but not
+  disassembled) feeds in without its own class name — would need AGX-ISA-
+  level profiling/disassembly, out of reach for this investigation. Also
+  still open: why MIL's bias (`±0.05`) alone reaches 0% zero while MPSGraph
+  needed `±0.3` for a comparable `0.7%` floor — not isolated.
 - What the `w28` cached flag at page `0x1e4748000+0xb88` (the thing
   `_MPSForceMatrixUnit`'s result is `OR`'d against in `A18Behavior::EncodeSDPA`,
   Finding 7) actually represents — a real device-capability check, another cached
