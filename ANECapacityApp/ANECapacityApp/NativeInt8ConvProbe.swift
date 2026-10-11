@@ -11,6 +11,11 @@ import MetalPerformanceShaders
 /// no match there either -- isolating whether the issue is in the
 /// quantization path specifically or in this low-level class's conventions
 /// generally (see git history on this file for the quantized-path attempts).
+///
+/// GPU dispatch runs BEFORE the CPU-side layout sweep is computed, since the
+/// sweep is O(32 * Cout*outH*outW*Cin*KH*KW) and dwarfs dispatch cost at
+/// large channel counts -- no point paying it if the kernel is about to
+/// hard-abort on a validation gate anyway.
 enum NativeInt8ConvProbe {
     static func run() {
         guard let device = MTLCreateSystemDefaultDevice(), let queue = device.makeCommandQueue() else {
@@ -18,7 +23,7 @@ enum NativeInt8ConvProbe {
         }
         print("[ConvProbe] Device: \(device.name)")
 
-        let Cin = 16, Cout = 8, H = 17, W = 17, KH = 16, KW = 16
+        let Cin = 128, Cout = 128, H = 34, W = 34, KH = 3, KW = 3
         let outH = H - KH + 1, outW = W - KW + 1
         print("[ConvProbe] Cin=\(Cin) Cout=\(Cout) H=\(H) W=\(W) KH=\(KH) KW=\(KW) outH=\(outH) outW=\(outW)")
 
@@ -34,48 +39,6 @@ enum NativeInt8ConvProbe {
         }
         let inputData = fillBoundedRandom(count: Cin * H * W, seed: 0x9E3779B97F4A7C15)
         let weightData = fillBoundedRandom(count: Cout * Cin * KH * KW, seed: 0xC2B2AE3D27D4EB4F)
-
-        func inputOffset(_ layout: String, _ c: Int, _ h: Int, _ w: Int) -> Int {
-            layout == "nchw" ? c*H*W + h*W + w : h*W*Cin + w*Cin + c
-        }
-        func weightOffset(_ layout: String, _ o: Int, _ c: Int, _ kh: Int, _ kw: Int) -> Int {
-            switch layout {
-            case "oihw": return o*Cin*KH*KW + c*KH*KW + kh*KW + kw
-            case "iohw": return c*Cout*KH*KW + o*KH*KW + kh*KW + kw
-            case "ohwi": return o*KH*KW*Cin + kh*KW*Cin + kw*Cin + c
-            default /* hwio */: return kh*KW*Cin*Cout + kw*Cin*Cout + c*Cout + o
-            }
-        }
-        func outputOffset(_ layout: String, _ o: Int, _ oh: Int, _ ow: Int) -> Int {
-            layout == "nchw" ? o*outH*outW + oh*outW + ow : oh*outW*Cout + ow*Cout + o
-        }
-        func computeExpected(inLayout: String, wLayout: String, outLayout: String, flip: Bool) -> [Float] {
-            var result = [Float](repeating: 0, count: Cout * outH * outW)
-            for o in 0..<Cout { for oh in 0..<outH { for ow in 0..<outW {
-                var acc: Float = 0
-                for c in 0..<Cin { for kh in 0..<KH { for kw in 0..<KW {
-                    let (ikh, ikw) = flip ? (KH-1-kh, KW-1-kw) : (kh, kw)
-                    guard oh+ikh < H, ow+ikw < W else { continue }
-                    let inVal = inputData[inputOffset(inLayout, c, oh+ikh, ow+ikw)]
-                    let wVal = weightData[weightOffset(wLayout, o, c, kh, kw)]
-                    acc += inVal * wVal
-                }}}
-                result[outputOffset(outLayout, o, oh, ow)] = acc
-            }}}
-            return result
-        }
-
-        var candidates: [(String, [Float])] = []
-        for inLayout in ["nchw", "nhwc"] {
-            for wLayout in ["oihw", "iohw", "ohwi", "hwio"] {
-                for outLayout in ["nchw", "nhwc"] {
-                    for flip in [false, true] {
-                        let label = "in=\(inLayout) w=\(wLayout) out=\(outLayout) flip=\(flip)"
-                        candidates.append((label, computeExpected(inLayout: inLayout, wLayout: wLayout, outLayout: outLayout, flip: flip)))
-                    }
-                }
-            }
-        }
 
         guard let descClass = NSClassFromString("MPSNDArrayConvolution2DDescriptor") as? NSObject.Type else {
             print("[ConvProbe] descriptor class not found"); return
@@ -135,12 +98,55 @@ enum NativeInt8ConvProbe {
         cb.waitUntilCompleted()
 
         let out = readHalf(destArr, count: Cout * outH * outW)
-        print("[ConvProbe] GPU result: \(out.map { Float($0) })")
+        print("[ConvProbe] GPU result (first 16): \(out.prefix(16).map { Float($0) })")
+        print("[ConvProbe] Dispatch succeeded, no crash -- computing layout sweep now")
+
+        func inputOffset(_ layout: String, _ c: Int, _ h: Int, _ w: Int) -> Int {
+            layout == "nchw" ? c*H*W + h*W + w : h*W*Cin + w*Cin + c
+        }
+        func weightOffset(_ layout: String, _ o: Int, _ c: Int, _ kh: Int, _ kw: Int) -> Int {
+            switch layout {
+            case "oihw": return o*Cin*KH*KW + c*KH*KW + kh*KW + kw
+            case "iohw": return c*Cout*KH*KW + o*KH*KW + kh*KW + kw
+            case "ohwi": return o*KH*KW*Cin + kh*KW*Cin + kw*Cin + c
+            default /* hwio */: return kh*KW*Cin*Cout + kw*Cin*Cout + c*Cout + o
+            }
+        }
+        func outputOffset(_ layout: String, _ o: Int, _ oh: Int, _ ow: Int) -> Int {
+            layout == "nchw" ? o*outH*outW + oh*outW + ow : oh*outW*Cout + ow*Cout + o
+        }
+        func computeExpected(inLayout: String, wLayout: String, outLayout: String, flip: Bool) -> [Float] {
+            var result = [Float](repeating: 0, count: Cout * outH * outW)
+            for o in 0..<Cout { for oh in 0..<outH { for ow in 0..<outW {
+                var acc: Float = 0
+                for c in 0..<Cin { for kh in 0..<KH { for kw in 0..<KW {
+                    let (ikh, ikw) = flip ? (KH-1-kh, KW-1-kw) : (kh, kw)
+                    guard oh+ikh < H, ow+ikw < W else { continue }
+                    let inVal = inputData[inputOffset(inLayout, c, oh+ikh, ow+ikw)]
+                    let wVal = weightData[weightOffset(wLayout, o, c, kh, kw)]
+                    acc += inVal * wVal
+                }}}
+                result[outputOffset(outLayout, o, oh, ow)] = acc
+            }}}
+            return result
+        }
 
         func maxAbsDiff(_ candidate: [Float]) -> Float {
             zip(out, candidate).map { abs(Float($0) - $1) }.max() ?? -1
         }
-        var ranked = candidates.map { (label: $0.0, diff: maxAbsDiff($0.1)) }
+
+        var ranked: [(label: String, diff: Float)] = []
+        for inLayout in ["nchw", "nhwc"] {
+            for wLayout in ["oihw", "iohw", "ohwi", "hwio"] {
+                for outLayout in ["nchw", "nhwc"] {
+                    for flip in [false, true] {
+                        let label = "in=\(inLayout) w=\(wLayout) out=\(outLayout) flip=\(flip)"
+                        let diff = maxAbsDiff(computeExpected(inLayout: inLayout, wLayout: wLayout, outLayout: outLayout, flip: flip))
+                        ranked.append((label, diff))
+                    }
+                }
+            }
+        }
         ranked.sort { $0.diff < $1.diff }
         print("[ConvProbe] Layout sweep (asymmetric dims), best 5 by max-abs-diff (near-0 = found it):")
         for r in ranked.prefix(5) {
