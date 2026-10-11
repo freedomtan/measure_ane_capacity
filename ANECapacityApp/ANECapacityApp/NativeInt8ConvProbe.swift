@@ -23,7 +23,7 @@ enum NativeInt8ConvProbe {
         }
         print("[ConvProbe] Device: \(device.name)")
 
-        let Cin = 128, Cout = 128, H = 34, W = 34, KH = 3, KW = 3
+        let Cin = 512, Cout = 512, H = 34, W = 34, KH = 3, KW = 3
         let outH = H - KH + 1, outW = W - KW + 1
         print("[ConvProbe] Cin=\(Cin) Cout=\(Cout) H=\(H) W=\(W) KH=\(KH) KW=\(KW) outH=\(outH) outW=\(outW)")
 
