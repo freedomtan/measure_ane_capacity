@@ -970,6 +970,62 @@ So the override is real, well-understood now from two independent angles
 (static disassembly in Finding 7, live behavior here), and still doesn't
 open a path to the native int8 kernels from app code.
 
+## Finding 4l — native FP8-E4M3 GEMM via `MPSNDArrayMatrixMultiplication`: unsupported on A18 Pro, ~1.1–1.8x faster than FP16/INT8 on A20 Pro
+
+`MPSDataTypeFloat8e4m3`/`Float8e5m2`/`Float8e8m0` are new public `MPSDataType`
+cases in the iOS/macOS 27 SDK (`MPSCoreTypes.h:273-275`). Unlike int8-affine
+(Finding 4j), FP8 is a native floating-point encoding, not an integer+scale
+pair, so no `MPSNDArrayQuantizationDescriptor` is needed — the **plain**
+`MPSNDArrayMatrixMultiplication` class should accept FP8 `MPSNDArray` sources
+directly. Added this as a third path alongside the existing FP16/INT8 GEMM
+probe (`NativeInt8GEMMProbe.swift`, M=N=K=2048, 20 iterations).
+
+**A18 Pro (iPhone 16 Pro): hard, structural rejection.** Every destination
+dtype tried (FP16, FP32, FP8-E4M3 itself) crashes identically and immediately:
+
+```
+MPSNDArrayMatrixMultiplication.mm:2109: failed assertion
+`Error: unsupported input/output datatypes to MPSNDArrayMatrixMultiplication kernel'
+```
+
+This is not "FP8 is slow on A18 Pro" (as the public-API convolution path
+showed in Finding 4g/4i, where A18 Pro merely *regressed* relative to INT8) —
+this native GEMM kernel refuses to dispatch at all for FP8 operands on this
+chip. A hard capability gate, not a performance regression.
+
+**A20 Pro (iPhone 18 Pro): dispatches cleanly, and wins.** Two independent
+runs:
+
+| Path | Run 1 | Run 2 |
+|---|---|---|
+| INT8-affine (`MPSNDArrayQuantizedMatrixMultiplication`) | 2.45 ms / 7.02 TOPS | 2.44 ms / 7.04 TOPS |
+| FP16 (`MPSNDArrayMatrixMultiplication`, baseline) | 2.66 ms / 6.46 TOPS | 3.40 ms / 5.05 TOPS |
+| **FP8-E4M3** (`MPSNDArrayMatrixMultiplication`, native) | **1.45 ms / 11.88 TOPS** | **2.16 ms / 7.95 TOPS** |
+
+The absolute margin varied between runs (likely thermal/scheduling noise —
+FP16 itself varied 6.46→5.05 TOPS between runs with no code change), but the
+direction was consistent both times: FP8 beat both INT8 and FP16 on A20 Pro.
+
+**A correctness false alarm worth recording.** The first FP8 run's output
+read back all-zero (`nonZero=0/4194304`), which looked like a degenerate/
+no-op dispatch. It wasn't a bug: the test data cycled through the 8-value
+pattern `[1.0, -1.0, 0.5, -0.5, 1.5, -1.5, 2.0, -2.0]`, which sums to exactly
+zero per cycle, and `K=N=2048` are both multiples of 8 — so every dot product
+summed whole cycles of that pattern, algebraically zero regardless of the
+kernel's correctness. Switching to an all-positive representable pattern
+(`[1.0, 0.5, 1.5, 0.25, 1.25, 0.75, 1.75, 0.125]`, raw E4M3 bytes
+`[0x38, 0x30, 0x3C, 0x28, 0x3A, 0x34, 0x3E, 0x20]`) produced a fully non-zero
+result on the re-run (`nonZero=4194304/4194304`, decoded sample bytes `120`→
+`1.75×2^7=224` and similar magnitudes, consistent with a real 2048-term
+reduction) — confirming the dispatch does real work, not a hardware
+zero-skip or silent no-op.
+
+This closes out one half of the "how do we reach the native int8/fp8 matrix
+unit" question from Finding 4h with a clean, generation-specific answer for
+GEMM specifically: FP8 matmul is a real, A20-Pro-only capability at the
+`MPSNDArrayMatrixMultiplication` level, gated by a hard dtype-support check
+rather than silently falling back to a slower path.
+
 ## Finding 5 — `MPSNDArraySDPAA18Behavior::EncodeSDPA`, decompiled
 
 Address: `0x190c876d8` (`MPSNDArray.framework`, a sub-framework of
