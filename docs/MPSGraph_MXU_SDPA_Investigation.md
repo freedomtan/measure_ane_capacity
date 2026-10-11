@@ -1111,8 +1111,11 @@ dump, or decompiled `.mm` listing checked, across repositories that *do* have
 exhaustive per-class `.mm` files for every other `MPSNDArray*` class. They are
 almost certainly internal C++ template instantiations selected at dispatch
 time, meaning the exact channel/kernel-size gate logic is not recoverable from
-any public decompilation source — only from live, on-device assertion text and
-systematic parameter sweeps, which is as far as this finding goes.
+any *public* decompilation source checked at the time of writing this finding
+— only from live, on-device assertion text and systematic parameter sweeps,
+which is as far as this finding goes. (This turned out to be wrong in one
+respect — see Finding 4n, which disassembles these exact gate functions from a
+different, better source than the ones checked here.)
 
 **Net result:** a working, correctness-verified dispatch to a native int8 or
 fp8 *convolution* kernel was not achieved from app code, on either chip, for
@@ -1122,6 +1125,90 @@ synthesis below: convolution on this hardware is not a native primitive the
 way matrix multiplication is, and the gates guarding it look like artifacts
 of forcing a conv's shape onto a matmul-shaped tile, not a deliberate,
 cleanly-specified capability boundary.
+
+## Finding 4n — live disassembly of the actual `PreG13` channel/dtype gates: an exact-equality check confirmed, but not against a literal `16`
+
+Finding 4m's hunt for the FP8-E4M3 convolution result (A18 Pro: hard crash at
+`PreG13.mm:649`, confirming the hypothesis that this config routes through the
+old float-only class there) prompted one more look at whether the gate logic
+itself could actually be disassembled, contrary to Finding 4m's own
+conclusion. It could — the key was the *source* of the binary. Rather than a
+dyld shared cache or a hand-extracted device image (Finding 4c/4i's
+approach, which requires re-extracting per device/OS version), Xcode had
+already cached a fully-symboled copy of this exact dylib locally, at
+`~/Library/Developer/Xcode/iOS DeviceSupport/<device model> <OS version>/
+arm64e/Symbols/.../MPSNDArray.framework/MPSNDArray`, generated automatically
+the first time this project's physical devices were connected and debugged.
+`nm -C` against it lists the real, demangled C++ methods on
+`MPSNDArrayConvolutionDeviceBehaviorPreG13` (and presumably `A14`/`A18`
+siblings) directly — so Finding 4m's claim that these classes "never appear
+as named, dumpable Objective-C classes" was right about the Objective-C
+class-dump angle, but incomplete: they *do* exist as ordinary, nameable C++
+symbols, just not surfaced by any of the Objective-C-oriented tools or public
+header/source dumps checked there.
+
+**Method, since the obvious approach (grepping disassembly for the assertion
+message text) didn't work.** None of `IsConvolutionSupported`,
+`EncodeNDArrayConvolution`, or `GetKernelDispatchParametersForKey` — the only
+`PreG13` methods with public-sounding names — contained a readable string
+reference to `"Only FP32 or FP16 convolution supported"` or `"not enough
+input/output channels in filter"` when disassembled directly (`ipsw macho
+disass --symbol <mangled> --demangle`); the message strings themselves live
+in an `__AUTH_CONST` segment that this disassembler doesn't resolve to a
+comment. What *does* work: the `assert()`-style failure call takes the source
+line number as a plain integer immediate (`mov w2, #<line>`) right before the
+call to the shared failure handler — so converting the three known line
+numbers from the crash text (`649`, `712`, `713`) to hex (`0x289`, `0x2c8`,
+`0x2c9`) and grepping the disassembly for `mov w2, #0x289` etc. located the
+exact call sites unambiguously, inside `EncodeNDArrayConvolution` (all three,
+despite `IsConvolutionSupported` being the more obviously-named candidate).
+
+**The FP32/FP16 dtype gate (line 649) is a 3-way allowlist, not a 2-way one —
+and it's wider than the assertion text implies.** The check compares a dtype
+value against three hardcoded `MPSDataType`-shaped bit patterns in sequence
+(`0x90000010`, `0x10000010`, `0x10000020`) before falling through to the
+assert if none match. Per Finding 4i's own already-decoded constant table,
+those are `BFloat16`, `Float16`, and `Float32` respectively — so `PreG13`
+actually accepts **BFloat16 as well**, despite the literal assertion text
+("Only FP32 or FP16 convolution supported") never mentioning it. A minor but
+concrete example of assertion-message text lagging behind the code's actual
+behavior.
+
+**The channel-count gate (lines 712/713) is confirmed to be an exact-equality
+comparison, not a threshold — matching Finding 4m's empirical result from a
+completely independent angle.** The instruction sequence immediately
+preceding the jump into the line-713 ("not enough output channels in filter")
+failure block is:
+
+```
+ldr x8, [sp, #0x120]     ; a value staged earlier from
+                         ; NDArrayConvolutionEncodeData+0x60 (the 3rd argument
+                         ; to EncodeNDArrayConvolution)
+cmp x23, x8              ; x23 loaded earlier from a separate shape/descriptor
+                         ; structure
+b.eq <skip the assert>   ; only equal values pass
+```
+
+This independently confirms, from ground-truth disassembly rather than
+repeated empirical testing, that Finding 4m's "only `Cin=Cout=16` exactly
+works, not `≥16`" result is not a coincidence of the specific values tried —
+the code genuinely branches on exact equality.
+
+**What this does *not* confirm: the comparison is not against a literal `16`,
+or any other hardcoded tile-size constant.** Both operands of the `cmp` are
+themselves loaded from caller-supplied structures (`NDArrayConvolutionEncodeData`
+and a separate shape descriptor) — this reads as an **internal
+self-consistency check** between two different places a channel count is
+carried (plausibly: the weight array's declared channel dimension vs. the
+destination array's), not a direct "does this match the MXU's native tile
+width" test. The MXU-tile-size explanation offered in Finding 4m's framing
+and the closing synthesis below remains plausible — one of these two values
+could still ultimately derive from a tile-size constant set by code outside
+this function — but this disassembly doesn't prove that connection directly,
+and tracing it fully would mean following both operands back through their
+respective callers, a materially larger undertaking than the one disassembled
+here. Finding 4m's framing should be read as "consistent with, not
+proven by" this result.
 
 ## Finding 5 — `MPSNDArraySDPAA18Behavior::EncodeSDPA`, decompiled
 
@@ -1630,18 +1717,26 @@ flowchart TB
   appDataContainer` consistently failing to pull the resulting `.gputrace` off a
   physical device, with no working Xcode-GUI alternative found either (Xcode 27
   no longer has the traditional Window → Devices and Simulators container-download
-  path) — or disassembling the internal, non-introspectable C++ functions
-  (`MPSNDArrayConvolutionA14`/`A18`/`PreG13`) that implement the gates themselves,
-  which never appear as named classes in any public header or decompilation
-  source checked.
+  path) — or disassembling further than Finding 4n already went: that finding
+  found these device-behavior classes (`PreG13` at least; `A14`/`A18` presumably
+  similarly) *do* exist as real, nameable, disassemblable C++ symbols — contrary
+  to this item's original framing — via a fully-symboled dylib Xcode caches
+  locally per connected device (`~/Library/Developer/Xcode/iOS DeviceSupport/`),
+  not any public header/decompilation source. What Finding 4n didn't do is trace
+  the two operands of the channel-count `cmp` back to their ultimate origin, which
+  is what would be needed to confirm or refute the MXU-tile-size connection and,
+  separately, find the actual layout/stride convention this function expects.
 - Whether the `MPSNDArrayQuantizedConvolution` or `MPSNDArrayConvolution2D`
   gates found in Finding 4m generalize to the native FP8 convolution kernels
-  (`conv2d_a18/a20_float_float8e4m3_float8e4m3`, Finding 4h) was not tested —
-  all of Finding 4m's live probing used int8-affine quantization or plain FP16,
-  not FP8. Given Finding 4l's clean GEMM-level FP8 result on A20 Pro, whether
-  FP8 convolution is reachable (and correct) through this same low-level class
-  on that chip, where int8/plain-FP16 convolution was not, is an open and
-  possibly more tractable question than the one actually pursued here.
+  (`conv2d_a18/a20_float_float8e4m3_float8e4m3`, Finding 4h) was tested, partially:
+  A18 Pro hard-crashes on FP8 operands at the same `PreG13.mm:649` dtype gate as
+  plain FP16/int8 (Finding 4k), at the one Cin=Cout=16/KH=KW=16 config confirmed
+  to dispatch for other dtypes — consistent with Finding 4n's finding that
+  `PreG13`'s dtype allowlist is `{Float16, BFloat16, Float32}` only, FP8 not
+  included. Whether A20 Pro's FP8 result differs — motivated by Finding 4i's
+  disassembly showing the newer `A18`-equivalent device-behavior class
+  unconditionally accepts float8-vs-float8 pairs, and by Finding 4l's clean
+  FP8 GEMM win on that same chip — has not come back yet.
 
 None of these affect the companion report's (separately resolved) findings about
 `-[MTLDevice supportsFP8]`/`supportsMXU` or the `_featureInfo[]` table staleness
