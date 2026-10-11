@@ -130,9 +130,11 @@ enum NativeInt8GEMMProbe {
         // MPSDataType.float8e4m3 is new in iOS/macOS 27 SDK.
         func fillFP8E4M3(_ arr: MPSNDArray, count: Int) {
             // Raw 1-byte E4M3 encodings (sign:1 exp:4 bias7 mantissa:3) for a small
-            // cycling set of exactly-representable values: 1.0, -1.0, 0.5, -0.5,
-            // 1.5, -1.5, 2.0, -2.0 -- avoids rounding ambiguity in the fill itself.
-            let patterns: [UInt8] = [0x38, 0xB8, 0x30, 0xB0, 0x3C, 0xBC, 0x40, 0xC0]
+            // cycling set of exactly-representable, all-POSITIVE values: 1.0, 0.5,
+            // 1.5, 0.25, 1.25, 0.75, 1.75, 0.125 -- a +/- pattern summed exact zero
+            // over whole 8-cycles here (K=N=2048, both multiples of 8), which made
+            // the first attempt's output legitimately all-zero, not a dispatch bug.
+            let patterns: [UInt8] = [0x38, 0x30, 0x3C, 0x28, 0x3A, 0x34, 0x3E, 0x20]
             var buf = [UInt8](repeating: 0, count: count)
             for i in 0..<count { buf[i] = patterns[i % patterns.count] }
             buf.withUnsafeMutableBytes { raw in arr.writeBytes(raw.baseAddress!, strideBytes: nil) }
