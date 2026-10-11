@@ -1360,17 +1360,24 @@ reaching anything resembling the hardware-accelerated, MXU-tiled path this
 whole sub-investigation (4h onward) was trying to find — it reached a
 software/general-purpose fallback that happens not to hard-crash.
 
-**Open question this raises, not pursued further:** whether the *int8*
-dispatch at this same `Cin=Cout=16/KH=KW=16` configuration (confirmed
-non-crashing on both chips back in Finding 4m, before `MPSNDArrayQuantizedConvolution`
-was even found) goes through this same generic plugin path, or a genuinely
-different, specialized route — the kernel-name logger was only run against
-the FP8 case here. Running it against Finding 4m's original int8/plain-FP16
-dispatches would settle whether *any* configuration reachable from
-`MPSNDArrayConvolution2D`/`MPSNDArrayQuantizedConvolution` from app code ever
-reaches a native tiled kernel, or whether this plugin fallback is simply what
-this whole class family does whenever it's driven outside the handful of
-shapes/dtypes MPSGraph's own internal lowering is tuned to request.
+**Follow-up, checked immediately: the plain FP16 dispatch goes through the
+identical plugin.** Re-running `KernelNameLogger` against Finding 4m's
+original (pre-FP8, pre-`MPSNDArrayQuantizedConvolution`) plain FP16 test —
+same `Cin=Cout=16/KH=KW=16` config, same device (A18 Pro) — logs the exact
+same function sequence, symbol-for-symbol: `setupCoordSizeSrc0`,
+`extractValue_f`/`extractValue_4xf`, `setupCoordSizeDst0_f`/`_4xf`,
+`extractCoordSize_f`/`_4xf`, `extractValueCoord_f`/`_4xf`, `prefixPrimary_f`/
+`_4xf`, `prefixSecondary_f`/`_4xf`, `postfixPrimary_f`/`_4xf`,
+`postfixPrimaryAccumulate_f`/`_4xf`, `middlefixPrimary_f`/`_4xf`. This settles
+the open question completely, at least for this one shape: **every
+non-crashing `MPSNDArrayConvolution2D` dispatch tried in this entire
+investigation — plain FP16 on A18 Pro, FP8-E4M3 on A20 Pro — goes through this
+same generic plugin, not a native tiled kernel.** Whether this is specific to
+`Cin=Cout=16/KH=KW=16` (the one shape that clears the channel/tap gates at
+all) or holds more generally wasn't tested further; given that shape is the
+*only* one this investigation ever got a non-crashing dispatch from, there is
+currently no known configuration, dtype, or chip combination, reachable from
+app code via this class, that reaches a native `conv2d_a18/a20_*` kernel.
 
 ## Finding 5 — `MPSNDArraySDPAA18Behavior::EncodeSDPA`, decompiled
 
@@ -1878,25 +1885,23 @@ flowchart TB
   (`adrp 0x1e4747000` / `0x1e4748000` pages) were identified by behavior and
   proximity to the literal string `"MPS_SDPA_FORCE_TILED_PREFILL"`, but not
   individually confirmed by name.
-- **Resolved for the FP8 case (Finding 4p), via a different route than
-  either of the two originally planned.** GPU-frame-capture inspection
-  stayed blocked throughout (no `.gputrace` pull off-device via `devicectl`,
-  no Xcode 27 GUI fallback), and disassembling further than Finding 4n
-  wasn't needed either. Instead, swizzling `-[MTLLibrary newFunctionWithName:]`
-  (`KernelNameLogger.swift`) and running it against the Finding 4o FP8
-  convolution dispatch answered the question directly: that dispatch never
-  requests a single convolution kernel. It calls a generic, coordinate-driven
-  plugin engine (`setupCoordSize*`/`extractValue*`/`prefixPrimary*`/
-  `middlefixPrimary*`/`postfixPrimary*Accumulate*`) — almost certainly the
-  `_plugin`/`_forcePlugin` (`MPSExternalNDArrayBinary`) mechanism Finding 4m
-  found but couldn't explain. There is no fixed NCHW/NHWC/OIHW/HWIO
-  convention to find for this path because it isn't computing a standard
-  tiled convolution at all. **Still open:** whether the earlier int8/plain-FP16
-  dispatches from Finding 4m (confirmed non-crashing at this same
-  `Cin=Cout=16/KH=KW=16` config, before `MPSNDArrayQuantizedConvolution` was
-  even found) go through this same generic plugin, or a genuinely different,
-  specialized route — the kernel-name logger was only run against the FP8
-  case.
+- **Resolved (Finding 4p), via a different route than either of the two
+  originally planned.** GPU-frame-capture inspection stayed blocked throughout
+  (no `.gputrace` pull off-device via `devicectl`, no Xcode 27 GUI fallback),
+  and disassembling further than Finding 4n wasn't needed either. Instead,
+  swizzling `-[MTLLibrary newFunctionWithName:]` (`KernelNameLogger.swift`)
+  and running it against both the FP8-E4M3 dispatch (Finding 4o, A20 Pro) and
+  the original plain-FP16 dispatch (Finding 4m, A18 Pro) at the same
+  `Cin=Cout=16/KH=KW=16` config answered the question directly, and
+  identically for both: neither requests a single convolution kernel. Both
+  call the same generic, coordinate-driven plugin engine
+  (`setupCoordSize*`/`extractValue*`/`prefixPrimary*`/`middlefixPrimary*`/
+  `postfixPrimary*Accumulate*`) — almost certainly the `_plugin`/`_forcePlugin`
+  (`MPSExternalNDArrayBinary`) mechanism Finding 4m found but couldn't
+  explain. There is no fixed NCHW/NHWC/OIHW/HWIO convention to find for this
+  path because it isn't computing a standard tiled convolution at all —
+  resolved for every configuration this investigation ever got a non-crashing
+  dispatch from, on both chips tested.
 - Whether the `MPSNDArrayQuantizedConvolution` or `MPSNDArrayConvolution2D`
   gates found in Finding 4m generalize to the native FP8 convolution kernels
   (`conv2d_a18/a20_float_float8e4m3_float8e4m3`, Finding 4h) — **resolved for

@@ -2,15 +2,14 @@ import Foundation
 import Metal
 import MetalPerformanceShaders
 
-/// Finding 4o confirmed native FP8-E4M3 convolution dispatches cleanly on
-/// A20 Pro (where A18 Pro structurally rejects it), but couldn't check
-/// correctness: the test data accumulated to ~3249, far outside E4M3's
-/// ~448 max representable magnitude, so the destination array saturated
-/// regardless of whether the kernel was correct. This version scales the
-/// input/weight values down by 8x (average product ~1/64 of before) so the
-/// full Cin*KH*KW=4096-term reduction stays well inside E4M3's range, and
-/// adds back Finding 4m's 32-way layout sweep (now decoding the FP8
-/// destination bytes back to Float) to actually check correctness.
+/// Finding 4p showed A20 Pro's FP8 convolution dispatch never reaches a native
+/// conv kernel -- it calls a generic coordinate-walking plugin
+/// (setupCoordSize*/extractValue*/prefixPrimary*/middlefixPrimary*) instead.
+/// This version switches back to plain FP16 at the same Cin=Cout=16/KH=KW=16
+/// config from Finding 4m (the original, pre-FP8 test) with KernelNameLogger
+/// still wired in, to check whether that dispatch -- which predates discovery
+/// of MPSNDArrayQuantizedConvolution and was confirmed non-crashing on both
+/// chips -- goes through the same generic plugin, or something different.
 enum NativeInt8ConvProbe {
     static func run() {
         guard let device = MTLCreateSystemDefaultDevice(), let queue = device.makeCommandQueue() else {
@@ -23,29 +22,18 @@ enum NativeInt8ConvProbe {
         let outH = H - KH + 1, outW = W - KW + 1
         print("[ConvProbe] Cin=\(Cin) Cout=\(Cout) H=\(H) W=\(W) KH=\(KH) KW=\(KW) outH=\(outH) outW=\(outW)")
 
-        // Raw 1-byte E4M3 encodings for a small cycling set of exactly-
-        // representable, all-positive values -- the same pattern used
-        // elsewhere, but each value divided by 8 (exponent nibble shifted
-        // down by 3) relative to the original Finding 4o pattern, keeping
-        // every value in E4M3's *normal* range (none hit the exp=0 subnormal
-        // boundary) while making the full 4096-term reduction land around
-        // ~50, comfortably inside E4M3's ~448 max.
-        let fp8Patterns: [(byte: UInt8, value: Float)] = [
-            (0x20, 0.125), (0x18, 0.0625), (0x24, 0.1875), (0x10, 0.03125),
-            (0x22, 0.15625), (0x1C, 0.09375), (0x26, 0.21875), (0x08, 0.015625),
-        ]
-        func fillFP8(count: Int) -> (bytes: [UInt8], values: [Float]) {
-            var bytes = [UInt8](repeating: 0, count: count)
-            var values = [Float](repeating: 0, count: count)
+        func fillBoundedRandom(count: Int, seed: UInt64) -> [Float] {
+            var buf = [Float](repeating: 0, count: count)
+            var state = seed
             for i in 0..<count {
-                let p = fp8Patterns[i % fp8Patterns.count]
-                bytes[i] = p.byte
-                values[i] = p.value
+                state = state &* 6364136223846793005 &+ 1442695040888963407
+                let v = Float(Int((state >> 56) & 0x07)) - 4
+                buf[i] = v == 0 ? 1 : v
             }
-            return (bytes, values)
+            return buf
         }
-        let (inputBytes, inputData) = fillFP8(count: Cin * H * W)
-        let (weightBytes, weightData) = fillFP8(count: Cout * Cin * KH * KW)
+        let inputData = fillBoundedRandom(count: Cin * H * W, seed: 0x9E3779B97F4A7C15)
+        let weightData = fillBoundedRandom(count: Cout * Cin * KH * KW, seed: 0xC2B2AE3D27D4EB4F)
 
         guard let descClass = NSClassFromString("MPSNDArrayConvolution2DDescriptor") as? NSObject.Type else {
             print("[ConvProbe] descriptor class not found"); return
@@ -78,52 +66,35 @@ enum NativeInt8ConvProbe {
             print("[ConvProbe] Failed to construct MPSNDArrayConvolution2D"); return
         }
         let kernel = unsafeDowncast(convInstance, to: MPSNDArrayMultiaryKernel.self)
-        print("[ConvProbe] MPSNDArrayConvolution2D (plain, FP8-E4M3) instance created: \(kernel)")
+        print("[ConvProbe] MPSNDArrayConvolution2D (plain, FP16) instance created: \(kernel)")
 
         func ndArray(dataType: MPSDataType, shape: [Int]) -> MPSNDArray {
             let d = MPSNDArrayDescriptor(dataType: dataType, shape: shape.map { NSNumber(value: $0) })
             return MPSNDArray(device: device, descriptor: d)
         }
-        func writeBytes(_ arr: MPSNDArray, _ bytes: [UInt8]) {
-            var b = bytes
-            b.withUnsafeMutableBytes { raw in arr.writeBytes(raw.baseAddress!, strideBytes: nil) }
+        func writeHalf(_ arr: MPSNDArray, _ data: [Float]) {
+            var d = data.map { Float16($0) }
+            d.withUnsafeMutableBytes { raw in arr.writeBytes(raw.baseAddress!, strideBytes: nil) }
         }
-        func readBytes(_ arr: MPSNDArray, count: Int) -> [UInt8] {
-            var out = [UInt8](repeating: 0, count: count)
+        func readHalf(_ arr: MPSNDArray, count: Int) -> [Float16] {
+            var out = [Float16](repeating: 0, count: count)
             out.withUnsafeMutableBytes { raw in arr.readBytes(raw.baseAddress!, strideBytes: nil) }
             return out
         }
-        // E4M3 decode: 1 sign, 4 exponent (bias 7), 3 mantissa.
-        func decodeE4M3(_ byte: UInt8) -> Float {
-            let sign: Float = (byte & 0x80) != 0 ? -1 : 1
-            let exp = Int((byte >> 3) & 0x0F)
-            let mant = Int(byte & 0x07)
-            if exp == 0 {
-                return sign * Float(mant) / 8.0 * Float(exp2(Double(-6)))
-            }
-            if exp == 0b1111 && mant == 0b111 { return Float.nan }
-            let value = (1.0 + Double(mant) / 8.0) * pow(2.0, Double(exp - 7))
-            return sign * Float(value)
-        }
 
-        guard #available(iOS 27.0, *) else {
-            print("[ConvProbe] FP8 requires iOS 27+"); return
-        }
-        let inputArr = ndArray(dataType: .float8e4m3, shape: [1, Cin, H, W])
-        let weightArr = ndArray(dataType: .float8e4m3, shape: [Cout, Cin, KH, KW])
-        writeBytes(inputArr, inputBytes)
-        writeBytes(weightArr, weightBytes)
-        let destArr = ndArray(dataType: .float8e4m3, shape: [1, Cout, outH, outW])
+        let inputArr = ndArray(dataType: .float16, shape: [1, Cin, H, W])
+        let weightArr = ndArray(dataType: .float16, shape: [Cout, Cin, KH, KW])
+        writeHalf(inputArr, inputData)
+        writeHalf(weightArr, weightData)
+        let destArr = ndArray(dataType: .float16, shape: [1, Cout, outH, outW])
 
         let cb = queue.makeCommandBuffer()!
         kernel.encode(to: cb, sourceArrays: [inputArr, weightArr], destinationArray: destArr)
         cb.commit()
         cb.waitUntilCompleted()
 
-        let outBytes = readBytes(destArr, count: Cout * outH * outW)
-        let out = outBytes.map(decodeE4M3)
-        let nonZero = outBytes.filter { $0 != 0 }.count
-        print("[ConvProbe] Dispatch succeeded, no crash. GPU result (decoded): nonZero=\(nonZero)/\(outBytes.count) first16=\(out.prefix(16))")
+        let out = readHalf(destArr, count: Cout * outH * outW).map { Float($0) }
+        print("[ConvProbe] Dispatch succeeded, no crash. GPU result (first 16): \(out.prefix(16))")
 
         func inputOffset(_ layout: String, _ c: Int, _ h: Int, _ w: Int) -> Int {
             layout == "nchw" ? c*H*W + h*W + w : h*W*Cin + w*Cin + c
@@ -171,7 +142,7 @@ enum NativeInt8ConvProbe {
             }
         }
         ranked.sort { $0.diff < $1.diff }
-        print("[ConvProbe] Layout sweep (in-range FP8 data), best 5 by max-abs-diff (near-0 = found it):")
+        print("[ConvProbe] Layout sweep (plain FP16), best 5 by max-abs-diff (near-0 = found it):")
         for r in ranked.prefix(5) {
             print("[ConvProbe]   diff=\(r.diff)  \(r.label)")
         }
