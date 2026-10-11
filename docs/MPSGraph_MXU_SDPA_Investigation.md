@@ -1210,6 +1210,54 @@ respective callers, a materially larger undertaking than the one disassembled
 here. Finding 4m's framing should be read as "consistent with, not
 proven by" this result.
 
+## Finding 4o — confirmed on A20 Pro: native FP8-E4M3 convolution dispatches cleanly, where A18 Pro structurally rejects it
+
+The other half of Finding 4n's hypothesis, now tested. Running the identical
+probe (`Cin=Cout=16, H=W=17, KH=KW=16`, plain `MPSNDArrayConvolution2D`, FP8-E4M3
+source/destination arrays, no quantization descriptor) on a physical A20 Pro:
+
+```
+[ConvProbe] Device: Apple A20 Pro GPU
+[ConvProbe] MPSNDArrayConvolution2D (plain, FP8-E4M3) instance created: ...
+[ConvProbe] Dispatch succeeded, no crash. GPU result: nonZero=64/64
+  sampleBytes=[120, 120, 120, 120, 120, 120, 120, 120, ...]
+```
+
+No crash, fully non-zero output — a clean dispatch, where A18 Pro hard-rejected
+the identical call at `PreG13.mm:649` (Finding 4n). This confirms the
+hypothesis from Finding 4n/4m: A20 Pro routes this exact channel/kernel-size
+configuration through a different device-behavior class than A18 Pro's
+`PreG13`, and that class's dtype eligibility is permissive enough to accept
+FP8 operand pairs — consistent with Finding 4i's disassembly of the newer
+`A18`-equivalent class's `isMXUDTypeSupported`, which unconditionally accepts
+float8-vs-float8 regardless of capability flags.
+
+**The apparent "wrong answer" against the CPU reference is not a correctness
+bug — it's E4M3's own dynamic range.** The CPU reference (computed in full
+FP32, no destination rounding) gives `3249.0` for this reduction; the decoded
+GPU output bytes (`0x78` = `120` → `1.0×2^8 = 256`; `0x76` = `118` →
+`1.75×2^7 = 224`) are nowhere close. But E4M3's maximum representable
+magnitude is **~448** — `3249` cannot be represented at all in this format,
+with or without a working kernel. Choosing an FP8 *destination* array for a
+256-term reduction of exactly-representable-but-not-small input values was a
+test-harness mismatch (same category of self-inflicted artifact as Finding
+4l's exact-zero-sum GEMM pattern), not evidence the dispatch computed anything
+wrong. Confirming numeric correctness here would need either a wider
+(FP16/FP32) destination — which Finding 4m's layout-sweep work was already
+unable to validate even for the plain FP16 case, so a mismatch there would
+tell us nothing new — or deliberately small-magnitude FP8 input data that
+stays within E4M3's range through the full accumulation, which was not
+attempted.
+
+**Net effect on the open-thread list:** the "does FP8 convolution reach a
+working, non-float-only dispatch path on A20 Pro" question (left open after
+Finding 4m) is answered **yes, it dispatches** — joining Finding 4l's FP8
+GEMM result as a second, independent confirmation that A20 Pro's matrix unit
+genuinely extends real capability to FP8 operands where A18 Pro's does not.
+Whether that dispatch computes *correct* int8/fp8 convolution results remains
+exactly as unresolved as the rest of Finding 4m's low-level correctness
+question — this finding only answers reachability, not correctness.
+
 ## Finding 5 — `MPSNDArraySDPAA18Behavior::EncodeSDPA`, decompiled
 
 Address: `0x190c876d8` (`MPSNDArray.framework`, a sub-framework of
@@ -1728,15 +1776,19 @@ flowchart TB
   separately, find the actual layout/stride convention this function expects.
 - Whether the `MPSNDArrayQuantizedConvolution` or `MPSNDArrayConvolution2D`
   gates found in Finding 4m generalize to the native FP8 convolution kernels
-  (`conv2d_a18/a20_float_float8e4m3_float8e4m3`, Finding 4h) was tested, partially:
-  A18 Pro hard-crashes on FP8 operands at the same `PreG13.mm:649` dtype gate as
-  plain FP16/int8 (Finding 4k), at the one Cin=Cout=16/KH=KW=16 config confirmed
-  to dispatch for other dtypes — consistent with Finding 4n's finding that
-  `PreG13`'s dtype allowlist is `{Float16, BFloat16, Float32}` only, FP8 not
-  included. Whether A20 Pro's FP8 result differs — motivated by Finding 4i's
-  disassembly showing the newer `A18`-equivalent device-behavior class
-  unconditionally accepts float8-vs-float8 pairs, and by Finding 4l's clean
-  FP8 GEMM win on that same chip — has not come back yet.
+  (`conv2d_a18/a20_float_float8e4m3_float8e4m3`, Finding 4h) — **resolved for
+  reachability, still open for correctness (Finding 4o).** A18 Pro
+  hard-crashes on FP8 operands at the same `PreG13.mm:649` dtype gate as plain
+  FP16/int8 (Finding 4k/4n); A20 Pro dispatches the identical call cleanly, with
+  fully non-zero output. But the output couldn't be checked against the CPU
+  reference — the test data's accumulated magnitude (`3249.0`) exceeds E4M3's
+  representable range (~448) regardless of whether the kernel is correct, so a
+  mismatch there is uninformative. Whether this dispatch computes *correct*
+  int8/fp8 convolution math remains exactly as open as the rest of Finding
+  4m's low-level correctness question — would need either small-magnitude FP8
+  test data that stays in-range through the full accumulation, or the same
+  GPU-capture/deeper-disassembly approaches already listed above as blocked/
+  partial.
 
 None of these affect the companion report's (separately resolved) findings about
 `-[MTLDevice supportsFP8]`/`supportsMXU` or the `_featureInfo[]` table staleness
