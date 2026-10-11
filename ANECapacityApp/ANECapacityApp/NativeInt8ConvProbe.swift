@@ -2,17 +2,15 @@ import Foundation
 import Metal
 import MetalPerformanceShaders
 
-/// Open-thread item #1 from docs/MPSGraph_MXU_SDPA_Investigation.md Finding 4m:
-/// does native FP8 convolution dispatch through the plain MPSNDArrayConvolution2D
-/// class, where int8/plain-FP16 did not reach a non-float-only device-behavior
-/// class cleanly? Motivating hypothesis: Finding 4i's isMXUDTypeSupported
-/// disassembly showed the A18-equivalent device-behavior class unconditionally
-/// accepts float8-vs-float8 operand pairs, while the older PreG13 class (Finding
-/// 4k) hardcodes "Only FP32 or FP16 convolution supported." Finding 4m found
-/// A18 Pro routes this exact Cin=Cout=16/KH=KW=16 config through PreG13, while
-/// A20 Pro routes the identical call through the A18-equivalent class instead --
-/// so FP8 is expected to hard-crash on A18 Pro (PreG13 gate) but may dispatch
-/// cleanly on A20 Pro (A18-equivalent class's own eligibility logic).
+/// Finding 4o confirmed native FP8-E4M3 convolution dispatches cleanly on
+/// A20 Pro (where A18 Pro structurally rejects it), but couldn't check
+/// correctness: the test data accumulated to ~3249, far outside E4M3's
+/// ~448 max representable magnitude, so the destination array saturated
+/// regardless of whether the kernel was correct. This version scales the
+/// input/weight values down by 8x (average product ~1/64 of before) so the
+/// full Cin*KH*KW=4096-term reduction stays well inside E4M3's range, and
+/// adds back Finding 4m's 32-way layout sweep (now decoding the FP8
+/// destination bytes back to Float) to actually check correctness.
 enum NativeInt8ConvProbe {
     static func run() {
         guard let device = MTLCreateSystemDefaultDevice(), let queue = device.makeCommandQueue() else {
@@ -20,20 +18,20 @@ enum NativeInt8ConvProbe {
         }
         print("[ConvProbe] Device: \(device.name)")
 
-        // The one channel/kernel-size configuration confirmed to dispatch
-        // without crashing in Finding 4m (Cin=Cout=16 exactly, matching the
-        // MXU's native 16x16x16 tile size).
         let Cin = 16, Cout = 16, H = 17, W = 17, KH = 16, KW = 16
         let outH = H - KH + 1, outW = W - KW + 1
         print("[ConvProbe] Cin=\(Cin) Cout=\(Cout) H=\(H) W=\(W) KH=\(KH) KW=\(KW) outH=\(outH) outW=\(outW)")
 
-        // Raw 1-byte E4M3 encodings (sign:1 exp:4 bias7 mantissa:3) for a small
-        // cycling set of exactly-representable, all-positive values -- same
-        // pattern used in NativeInt8GEMMProbe's FP8 test, avoiding both
-        // overflow and the exact-zero-sum cancellation bug found there.
+        // Raw 1-byte E4M3 encodings for a small cycling set of exactly-
+        // representable, all-positive values -- the same pattern used
+        // elsewhere, but each value divided by 8 (exponent nibble shifted
+        // down by 3) relative to the original Finding 4o pattern, keeping
+        // every value in E4M3's *normal* range (none hit the exp=0 subnormal
+        // boundary) while making the full 4096-term reduction land around
+        // ~50, comfortably inside E4M3's ~448 max.
         let fp8Patterns: [(byte: UInt8, value: Float)] = [
-            (0x38, 1.0), (0x30, 0.5), (0x3C, 1.5), (0x28, 0.25),
-            (0x3A, 1.25), (0x34, 0.75), (0x3E, 1.75), (0x20, 0.125),
+            (0x20, 0.125), (0x18, 0.0625), (0x24, 0.1875), (0x10, 0.03125),
+            (0x22, 0.15625), (0x1C, 0.09375), (0x26, 0.21875), (0x08, 0.015625),
         ]
         func fillFP8(count: Int) -> (bytes: [UInt8], values: [Float]) {
             var bytes = [UInt8](repeating: 0, count: count)
@@ -89,6 +87,23 @@ enum NativeInt8ConvProbe {
             var b = bytes
             b.withUnsafeMutableBytes { raw in arr.writeBytes(raw.baseAddress!, strideBytes: nil) }
         }
+        func readBytes(_ arr: MPSNDArray, count: Int) -> [UInt8] {
+            var out = [UInt8](repeating: 0, count: count)
+            out.withUnsafeMutableBytes { raw in arr.readBytes(raw.baseAddress!, strideBytes: nil) }
+            return out
+        }
+        // E4M3 decode: 1 sign, 4 exponent (bias 7), 3 mantissa.
+        func decodeE4M3(_ byte: UInt8) -> Float {
+            let sign: Float = (byte & 0x80) != 0 ? -1 : 1
+            let exp = Int((byte >> 3) & 0x0F)
+            let mant = Int(byte & 0x07)
+            if exp == 0 {
+                return sign * Float(mant) / 8.0 * Float(exp2(Double(-6)))
+            }
+            if exp == 0b1111 && mant == 0b111 { return Float.nan }
+            let value = (1.0 + Double(mant) / 8.0) * pow(2.0, Double(exp - 7))
+            return sign * Float(value)
+        }
 
         guard #available(iOS 27.0, *) else {
             print("[ConvProbe] FP8 requires iOS 27+"); return
@@ -97,11 +112,6 @@ enum NativeInt8ConvProbe {
         let weightArr = ndArray(dataType: .float8e4m3, shape: [Cout, Cin, KH, KW])
         writeBytes(inputArr, inputBytes)
         writeBytes(weightArr, weightBytes)
-        // Destination also FP8: NativeInt8GEMMProbe's FP8 GEMM test found this
-        // was the one combination that dispatched on A20 Pro (FP16/FP32
-        // destinations crashed identically on A18 Pro regardless, so this
-        // choice shouldn't matter for the A18-Pro-crashes-either-way side of
-        // the comparison, and matches the one confirmed-working side).
         let destArr = ndArray(dataType: .float8e4m3, shape: [1, Cout, outH, outW])
 
         let cb = queue.makeCommandBuffer()!
@@ -109,26 +119,60 @@ enum NativeInt8ConvProbe {
         cb.commit()
         cb.waitUntilCompleted()
 
-        var outBytes = [UInt8](repeating: 0, count: Cout * outH * outW)
-        outBytes.withUnsafeMutableBytes { raw in destArr.readBytes(raw.baseAddress!, strideBytes: nil) }
+        let outBytes = readBytes(destArr, count: Cout * outH * outW)
+        let out = outBytes.map(decodeE4M3)
         let nonZero = outBytes.filter { $0 != 0 }.count
-        print("[ConvProbe] Dispatch succeeded, no crash. GPU result: nonZero=\(nonZero)/\(outBytes.count) sampleBytes=\(outBytes.prefix(16))")
+        print("[ConvProbe] Dispatch succeeded, no crash. GPU result (decoded): nonZero=\(nonZero)/\(outBytes.count) first16=\(out.prefix(16))")
 
-        // CPU reference, NCHW/OIHW (the convention confirmed structurally
-        // correct, if not numerically matching, in Finding 4m) -- printed for
-        // comparison even though Finding 4m's full layout sweep found no exact
-        // match; this is a coarse sanity check (right order of magnitude?) not
-        // a byte-for-byte correctness claim.
-        func inputOffset(_ c: Int, _ h: Int, _ w: Int) -> Int { c*H*W + h*W + w }
-        func weightOffset(_ o: Int, _ c: Int, _ kh: Int, _ kw: Int) -> Int { o*Cin*KH*KW + c*KH*KW + kh*KW + kw }
-        var expected = [Float](repeating: 0, count: Cout * outH * outW)
-        for o in 0..<Cout { for oh in 0..<outH { for ow in 0..<outW {
-            var acc: Float = 0
-            for c in 0..<Cin { for kh in 0..<KH { for kw in 0..<KW {
-                acc += inputData[inputOffset(c, oh+kh, ow+kw)] * weightData[weightOffset(o, c, kh, kw)]
+        func inputOffset(_ layout: String, _ c: Int, _ h: Int, _ w: Int) -> Int {
+            layout == "nchw" ? c*H*W + h*W + w : h*W*Cin + w*Cin + c
+        }
+        func weightOffset(_ layout: String, _ o: Int, _ c: Int, _ kh: Int, _ kw: Int) -> Int {
+            switch layout {
+            case "oihw": return o*Cin*KH*KW + c*KH*KW + kh*KW + kw
+            case "iohw": return c*Cout*KH*KW + o*KH*KW + kh*KW + kw
+            case "ohwi": return o*KH*KW*Cin + kh*KW*Cin + kw*Cin + c
+            default /* hwio */: return kh*KW*Cin*Cout + kw*Cin*Cout + c*Cout + o
+            }
+        }
+        func outputOffset(_ layout: String, _ o: Int, _ oh: Int, _ ow: Int) -> Int {
+            layout == "nchw" ? o*outH*outW + oh*outW + ow : oh*outW*Cout + ow*Cout + o
+        }
+        func computeExpected(inLayout: String, wLayout: String, outLayout: String, flip: Bool) -> [Float] {
+            var result = [Float](repeating: 0, count: Cout * outH * outW)
+            for o in 0..<Cout { for oh in 0..<outH { for ow in 0..<outW {
+                var acc: Float = 0
+                for c in 0..<Cin { for kh in 0..<KH { for kw in 0..<KW {
+                    let (ikh, ikw) = flip ? (KH-1-kh, KW-1-kw) : (kh, kw)
+                    guard oh+ikh < H, ow+ikw < W else { continue }
+                    let inVal = inputData[inputOffset(inLayout, c, oh+ikh, ow+ikw)]
+                    let wVal = weightData[weightOffset(wLayout, o, c, kh, kw)]
+                    acc += inVal * wVal
+                }}}
+                result[outputOffset(outLayout, o, oh, ow)] = acc
             }}}
-            expected[o*outH*outW + oh*outW + ow] = acc
-        }}}
-        print("[ConvProbe] CPU reference (NCHW/OIHW), first 8: \(expected.prefix(8))")
+            return result
+        }
+        func maxAbsDiff(_ candidate: [Float]) -> Float {
+            zip(out, candidate).map { abs($0 - $1) }.max() ?? -1
+        }
+
+        var ranked: [(label: String, diff: Float)] = []
+        for inLayout in ["nchw", "nhwc"] {
+            for wLayout in ["oihw", "iohw", "ohwi", "hwio"] {
+                for outLayout in ["nchw", "nhwc"] {
+                    for flip in [false, true] {
+                        let label = "in=\(inLayout) w=\(wLayout) out=\(outLayout) flip=\(flip)"
+                        let diff = maxAbsDiff(computeExpected(inLayout: inLayout, wLayout: wLayout, outLayout: outLayout, flip: flip))
+                        ranked.append((label, diff))
+                    }
+                }
+            }
+        }
+        ranked.sort { $0.diff < $1.diff }
+        print("[ConvProbe] Layout sweep (in-range FP8 data), best 5 by max-abs-diff (near-0 = found it):")
+        for r in ranked.prefix(5) {
+            print("[ConvProbe]   diff=\(r.diff)  \(r.label)")
+        }
     }
 }
