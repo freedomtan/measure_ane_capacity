@@ -5,10 +5,18 @@ report traced `-[MTLDevice supportsFP8]`/`supportsMXU` down to Metal's own
 `_MTLDeviceFeatureQueries` machinery and found a per-generation hardware cutoff for
 MXU (Apple's GPU matrix-multiply block) at roughly the G17 driver generation. This
 document asks the next question: **who outside Metal.framework actually consults
-MXU, and how?** It traces one real, concrete consumer end-to-end:
+MXU, and how?** It started by tracing one consumer end-to-end —
 `MetalPerformanceShadersGraph.framework`'s `MPSGraphDeviceDescriptor`, and
 `MetalPerformanceShaders.framework`'s `MPSNDArray` Scaled-Dot-Product-Attention
-(SDPA) kernel dispatcher. Purely exploratory, same spirit as the FP8 report — not
+(SDPA) kernel dispatcher (Findings 1–3, 5–8) — then grew into a broader empirical
+survey of where the real hardware matrix unit is (and isn't) reachable from app
+code at all: convolution dispatch internals (Findings 4h–4k, 4m), and native
+int8/fp8 GEMM and convolution throughput measured directly on two physical devices
+(Findings 4e–4g, 4j, 4l). The headline result, stated in the closing synthesis: the
+GPU's matrix unit is fundamentally a **matrix-multiply** engine — GEMM dispatches
+cleanly and fast; convolution is bolted on top via tiling adapters that are, by
+comparison, fragile, generation-dependent, and in several configurations tried here,
+simply unreachable. Purely exploratory, same spirit as the FP8 report — not
 required for, and does not affect, this repo's actual ANE benchmarking code.
 
 **Environment:** same as the companion report — `ipsw`, the live system
@@ -1026,6 +1034,95 @@ GEMM specifically: FP8 matmul is a real, A20-Pro-only capability at the
 `MPSNDArrayMatrixMultiplication` level, gated by a hard dtype-support check
 rather than silently falling back to a slower path.
 
+## Finding 4m — the other half of that question, for convolution: an extensive live channel/kernel-size gate hunt on `MPSNDArrayConvolution2D` and `MPSNDArrayQuantizedConvolution`, inconclusive on correctness, suggestive on cause
+
+Finding 4k showed `MPSNDArrayConvolution2D` hardcodes the float-only `PreG13`
+behavior for a trivial 1×1 config on both a Mac and an iPhone 16 Pro. This
+finding went much further on real hardware (iPhone 16 Pro/A18 Pro and iPhone
+18 Pro/A20 Pro) to see whether *some* configuration reaches a genuinely
+different, int8-capable device-behavior class — and, separately, discovered a
+dedicated `MPSNDArrayQuantizedConvolution` class (an exact structural analog
+of Finding 4j's `MPSNDArrayQuantizedMatrixMultiplication`, confirmed via both
+`nm -C` and the real header dump described below) that Finding 4k didn't know
+existed.
+
+**Dispatch-class selection depends on kernel size, not just chip, and A20 Pro
+shares A18 Pro's classes verbatim.** A 16×16 kernel routes to the
+`PreG13`/`A18`-equivalent class (on A20 Pro, confirmed via live assertion text
+at a *different* source line than A18 Pro's — `MPSNDArrayConvolutionA18.mm` —
+than the plain class hierarchy would suggest, reconfirming Finding 4i's
+"no distinct `DeviceBehaviorA20` class" result at the `MPSNDArrayConvolution2D`
+level too); a 3×3 kernel routes to an entirely different class
+(`MPSNDArrayConvolutionA14`), with its own, differently-worded gates.
+
+**The channel-count gate for the 16×16-kernel path is an exact-equality
+constraint, not a minimum — and it lines up with Finding 4's MXU tile size.**
+Systematically varying `Cin`/`Cout` independently (`8`, `16`, `17`, `32`, `64`
+all tried, with `H=W=17` fixed) found that **only `Cin=Cout=16` avoids the
+"not enough input/output channels in filter" assertion** — values both below
+and above `16` fail identically. Since `16×16×16` is literally the MXU's
+base/native `simdgroup_matrix` tile shape (Finding 4), the likely explanation
+is that `MPSNDArrayConvolution2D`'s `PreG13`/`A18` dispatch path is itself a
+tiling adapter onto the matmul unit, and this particular, oddly specific gate
+is really asking "does this conv's channel count exactly fill one MXU tile" —
+not a general convolution-capability check at all.
+
+**The 3×3-kernel path (`MPSNDArrayConvolutionA14`) never cleared its
+equivalent gate at any channel count tried**, from `16` up through `512` —
+ruling out both a simple minimum and the `Cin×KH×KW ≥ ~4096` reduction-length
+rule found separately on the quantized-matmul path (`512×9=4608` still
+failed). Setting the descriptor's `dataFormat`/`weightsFormat` to `1`
+(plausibly `NHWC`, if this private field shares the public
+`MPSGraphTensorNamedDataLayout` enum — `NCHW=0, NHWC=1, OIHW=2, HWIO=3`,
+confirmed from a public Swift overlay) moved the failure to a *different,
+later* gate ("source slice doesn't have enough feature channels") at every
+channel count tried, but never past it. `channelMultiplier` (an undocumented
+ivar with no corresponding setter property) was also tried explicitly set to
+`1`; no effect.
+
+**Even where dispatch succeeds, correctness could not be established — and
+the gap isn't specific to quantization.** With the one known-working
+16×16-kernel configuration (`Cin=Cout=16`), a 32-way sweep over input
+layout (NCHW/NHWC) × weight layout (OIHW/IOHW/OHWI/HWIO) × output layout ×
+kernel-flip, each candidate hand-computed on CPU and compared against the
+real GPU output by max-absolute-difference, found **no match** — for either
+the quantized path (`MPSNDArrayQuantizedConvolution`) or, when the same sweep
+was re-run against the plain, trusted, non-quantized FP16
+`MPSNDArrayConvolution2D` class with the identical shape, there too. Reversing
+the `MPSNDArrayDescriptor` shape-array order entirely (fastest-varying-first,
+in case this API follows Finding 4j's GEMM "batch-first" convention rather
+than the NumPy-style ordering assumed everywhere else) broke dispatch
+structurally (`"source and destination batch size not matching"`), confirming
+the originally-assumed shape order is at least *structurally* correct — so
+the mismatch, whatever it is, is not a shape-array ordering bug.
+
+**A real header/source dump for this exact class family exists publicly**
+(`lechium/iOS14Headers`, `thatmarcel/macOS-26.4-headers`,
+`EthanArbuckle/iPhone18-3_26.1_23B85_Restore`'s decompiled `.mm` sources, and
+a local `ipsw`-generated dump against this project's own macOS 27 cache),
+confirming the class/ivar structure assumed above (`_dataQuantizationDescriptor`/
+`_weightsQuantizationDescriptor` live on the base `MPSNDArrayConvolution2D`
+class itself, not only on the `Quantized` subclass; `_channelMultiplier`,
+`_srcDataFormat`, `_offsets`, `_plugin`/`_forcePlugin` are all real,
+undocumented ivars). But none of these sources contain the device-behavior
+classes themselves (`MPSNDArrayConvolutionA14`/`A18`/`PreG13`) as named,
+dumpable Objective-C classes — they never appear in any class-dump, header
+dump, or decompiled `.mm` listing checked, across repositories that *do* have
+exhaustive per-class `.mm` files for every other `MPSNDArray*` class. They are
+almost certainly internal C++ template instantiations selected at dispatch
+time, meaning the exact channel/kernel-size gate logic is not recoverable from
+any public decompilation source — only from live, on-device assertion text and
+systematic parameter sweeps, which is as far as this finding goes.
+
+**Net result:** a working, correctness-verified dispatch to a native int8 or
+fp8 *convolution* kernel was not achieved from app code, on either chip, for
+either kernel-size regime tried. The evidence assembled here is suggestive
+rather than conclusive, but it points the same direction as the closing
+synthesis below: convolution on this hardware is not a native primitive the
+way matrix multiplication is, and the gates guarding it look like artifacts
+of forcing a conv's shape onto a matmul-shaped tile, not a deliberate,
+cleanly-specified capability boundary.
+
 ## Finding 5 — `MPSNDArraySDPAA18Behavior::EncodeSDPA`, decompiled
 
 Address: `0x190c876d8` (`MPSNDArray.framework`, a sub-framework of
@@ -1376,6 +1473,73 @@ real dedicated MXU silicon backs every call. `MPSGraphDeviceDescriptor.supportsM
 that happen to share the "MXU" name — one is a compiled-module cache-key input, the
 other is a size/dtype-gated kernel-family selector, and neither consults the other.
 
+## Closing synthesis — the GPU's matrix unit is a matmul engine; convolution is bolted on top, unlike on the ANE
+
+Pulling together the GEMM results (Finding 4j, 4l) and the convolution-dispatch
+results (Finding 4h, 4i, 4k, 4m) side by side makes a pattern obvious that no
+single finding states on its own:
+
+**Every native GEMM path tried dispatches cleanly and produces sane, correctness-
+verified numbers.** Plain FP16 `MPSNDArrayMatrixMultiplication`, int8-affine
+`MPSNDArrayQuantizedMatrixMultiplication` (Finding 4j), and now native FP8-E4M3
+`MPSNDArrayMatrixMultiplication` (Finding 4l) all ran to completion on real
+hardware with no exotic configuration required beyond the documented API shape —
+and where they're slow (INT8 on both A18 Pro and an M4 Pro Mac) or outright
+unsupported (FP8 on A18 Pro), that's a clean, legible result: a single hard
+assertion or a consistent throughput ratio, not a maze of undocumented gates.
+This is exactly what you'd expect if GEMM is the hardware's **native** operation —
+Finding 4's `16×16×16` tile size, Finding 4b–4d's `simdgroup_matrix`/
+`multiply_accumulate` AIR intrinsics, and Finding 4c's `mpp::tensor_ops::matmul2d`
+symbols all independently point at the same thing: whatever "MXU" denotes, it is
+hardware built to execute matrix multiplication directly.
+
+**Every native convolution path tried, by contrast, was fragile, inconsistent,
+and in most configurations, simply unreachable.** `MPSNDArrayConvolution2D`
+hardcodes float-only behavior for the most natural inputs (Finding 4k); the real
+int8/fp8 conv kernels sitting in the same `.metallib` (`conv2d_a18/
+a20_int32_int8_int8`, `conv2d_a18/a20_float_float8e4m3_float8e4m3`, Finding 4h)
+are structurally unreachable from the public `MPSGraphConvolution2DOpDescriptor`
+API, which only ever emits float operands (Finding 4h); and even going directly
+at the private `MPSNDArrayConvolution2D`/`MPSNDArrayQuantizedConvolution` classes
+from app code, the gates guarding non-float dispatch turned out to be oddly
+*exact* — not "channels ≥ some minimum," but "channels == 16" for the one
+kernel-size regime that worked at all (Finding 4m), with `16` being exactly the
+MXU's native tile dimension from Finding 4. The natural reading: on this
+hardware, convolution isn't a first-class matrix-unit primitive. It's lowered
+onto the matmul unit — presumably via something functionally equivalent to
+im2col — and the device-behavior classes named by chip generation
+(`PreG13`/`A14`/`A18`) are tiling adapters for that lowering, not dedicated conv
+datapaths. A gate like "`Cin` must equal exactly `16`" makes little sense as a
+convolution-capability check, but makes immediate sense as "does this shape
+tile evenly onto one `16×16×16` matmul tile" — and a different kernel size
+(3×3 vs. 16×16) genuinely needs a different adapter (`A14` vs. `A18`-class)
+with its own, differently-shaped tiling constraints, which is exactly the
+kernel-size-dependent class selection Finding 4m found.
+
+**This also explains why Winograd convolution exists as a separate, heavily
+cost-model-gated code path at all (Finding 8).** If convolution were a native
+operation the way GEMM is, there would be little reason to maintain an entirely
+separate algorithmic strategy — chosen by a FLOPs cost-model comparison against
+direct convolution — purely to reduce the *number* of multiplications before
+handing them to the matrix unit. Winograd's existence is itself evidence that
+feeding convolution to this hardware's matmul-shaped unit is expensive enough,
+and shaped awkwardly enough, that reducing the multiply count first is
+sometimes worth it — a cost tradeoff that would not arise if the hardware
+executed convolution directly and natively.
+
+**The ANE's NE cores are, by design, convolution engines** — the public
+CoreML/Espresso compute path this repo's actual ANE benchmarks use (not MPSGraph
+or MPSNDArray at all) reaches native convolution without any of this gate dance,
+consistent with Apple's own framing of the Neural Engine as purpose-built neural-
+network/convolution silicon rather than a general matrix-multiply block with
+convolution bolted on afterward. The GPU's MXU and the ANE's NE are solving a
+superficially similar problem (fast tensor contraction) with, on this evidence,
+structurally different native primitives — one matmul-first, one convolution-
+first — which is as good an explanation as this investigation found for why
+reaching native low-precision *convolution* performance from GPU app code
+proved so much harder than reaching native low-precision *matrix-multiply*
+performance, on the same hardware, via the same framework family.
+
 ## Call chain diagram
 
 ```mermaid
@@ -1452,6 +1616,32 @@ flowchart TB
   (`adrp 0x1e4747000` / `0x1e4748000` pages) were identified by behavior and
   proximity to the literal string `"MPS_SDPA_FORCE_TILED_PREFILL"`, but not
   individually confirmed by name.
+- **The exact layout/correctness convention for `MPSNDArrayConvolution2D`/
+  `MPSNDArrayQuantizedConvolution` (Finding 4m) remains unresolved.** A 32-way
+  sweep over input/weight/output axis order and kernel-flip found no match
+  against real GPU output, for either the quantized or the plain FP16 class, at
+  the one channel/kernel-size configuration that dispatches without crashing.
+  Either a convention outside those 32 candidates is correct, or one of the
+  unconfigured ivars found in Finding 4m (`_offsets`, the `MPSExternalNDArrayBinary`
+  `_plugin`/`_forcePlugin` mechanism) needs to be set for correct results. Resolving
+  this would need either GPU-frame-capture inspection of the actual dispatched
+  kernel name and buffer bindings — attempted in this investigation via
+  `MTLCaptureManager`, but blocked by `devicectl device copy --domain-type
+  appDataContainer` consistently failing to pull the resulting `.gputrace` off a
+  physical device, with no working Xcode-GUI alternative found either (Xcode 27
+  no longer has the traditional Window → Devices and Simulators container-download
+  path) — or disassembling the internal, non-introspectable C++ functions
+  (`MPSNDArrayConvolutionA14`/`A18`/`PreG13`) that implement the gates themselves,
+  which never appear as named classes in any public header or decompilation
+  source checked.
+- Whether the `MPSNDArrayQuantizedConvolution` or `MPSNDArrayConvolution2D`
+  gates found in Finding 4m generalize to the native FP8 convolution kernels
+  (`conv2d_a18/a20_float_float8e4m3_float8e4m3`, Finding 4h) was not tested —
+  all of Finding 4m's live probing used int8-affine quantization or plain FP16,
+  not FP8. Given Finding 4l's clean GEMM-level FP8 result on A20 Pro, whether
+  FP8 convolution is reachable (and correct) through this same low-level class
+  on that chip, where int8/plain-FP16 convolution was not, is an open and
+  possibly more tractable question than the one actually pursued here.
 
 None of these affect the companion report's (separately resolved) findings about
 `-[MTLDevice supportsFP8]`/`supportsMXU` or the `_featureInfo[]` table staleness
