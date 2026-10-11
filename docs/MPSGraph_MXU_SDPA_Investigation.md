@@ -1258,6 +1258,36 @@ Whether that dispatch computes *correct* int8/fp8 convolution results remains
 exactly as unresolved as the rest of Finding 4m's low-level correctness
 question — this finding only answers reachability, not correctness.
 
+**Follow-up, with the saturation problem actually fixed: still no correctness
+match, and now it's a real mismatch, not an artifact.** Scaling the test
+pattern down 8x (every value still exactly representable in E4M3's normal
+range) brought the full 4096-term reduction down to a plausible, non-saturated
+magnitude. Re-running the same probe (now with the saturation problem removed)
+and Finding 4m's full 32-way layout sweep on A20 Pro:
+
+```
+[ConvProbe] Dispatch succeeded, no crash. GPU result (decoded): nonZero=64/64
+  first16=[14.0, 16.0, 16.0, 18.0, 7.0, 8.0, 8.0, 9.0, 22.0, 24.0, 24.0, 28.0,
+           3.5, 4.0, 4.0, 4.5]
+[ConvProbe] Layout sweep (in-range FP8 data), best 5 by max-abs-diff (near-0 = found it):
+[ConvProbe]   diff=49.015625  in=nchw w=oihw out=nchw flip=false
+[ConvProbe]   diff=49.015625  in=nchw w=oihw out=nchw flip=true
+[ConvProbe]   diff=49.015625  in=nchw w=oihw out=nhwc flip=false
+```
+
+The output values are now plausible-magnitude (`3.5`–`28`, consistent with the
+scaled-down input range) rather than saturated — so this time the mismatch is
+real, not an artifact of choosing an FP8 destination that couldn't represent
+the correct answer. `diff=49` against output values in the `3.5`–`28` range is
+large relative to the signal itself, confirming the layout/correctness problem
+from Finding 4m is genuine and persists even with FP8 operands on the chip
+where dispatch itself succeeds. One structural observation in the output worth
+recording, even without a matching convention: `first16[0:4] / 2 ==
+first16[4:8]` and `first16[0:4] / 4 == first16[12:16]` exactly (`14→7→3.5`,
+`16→8→4`, `16→8→4`, `18→9→4.5`) — a clean power-of-two relationship between
+groups of 4 output elements that doesn't correspond to any obvious artifact of
+the 32 candidate layouts tried, and wasn't investigated further.
+
 ## Finding 5 — `MPSNDArraySDPAA18Behavior::EncodeSDPA`, decompiled
 
 Address: `0x190c876d8` (`MPSNDArray.framework`, a sub-framework of
