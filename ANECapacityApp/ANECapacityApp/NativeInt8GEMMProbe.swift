@@ -70,7 +70,7 @@ enum NativeInt8GEMMProbe {
         )
         let sourceArrays: [MPSNDArray] = [lhs, rhs, lhsScale, lhsZero, rhsScale, rhsZero]
 
-        func runTimed(label: String, dest: MPSNDArray, body: (MTLCommandBuffer) -> Void) {
+        func runTimed(label: String, dest: MPSNDArray, destIsFloat32: Bool = false, destIsRawByte: Bool = false, body: (MTLCommandBuffer) -> Void) {
             do {
                 let cb = queue.makeCommandBuffer()!
                 body(cb); cb.commit(); cb.waitUntilCompleted()
@@ -86,10 +86,22 @@ enum NativeInt8GEMMProbe {
             let tops = flops / (avgMs / 1000.0) / 1e12
             print("[Int8GEMMProbe][\(label)] Avg: \(avgMs) ms, \(tops) TOPS")
 
-            var out = [Float16](repeating: 0, count: M * N)
-            out.withUnsafeMutableBytes { raw in dest.readBytes(raw.baseAddress!, strideBytes: nil) }
-            let nonZero = out.filter { $0 != 0 }.count
-            print("[Int8GEMMProbe][\(label)] nonZero=\(nonZero)/\(out.count) sample=\(out.prefix(8).map { Float($0) })")
+            if destIsRawByte {
+                var out = [UInt8](repeating: 0, count: M * N)
+                out.withUnsafeMutableBytes { raw in dest.readBytes(raw.baseAddress!, strideBytes: nil) }
+                let nonZero = out.filter { $0 != 0 }.count
+                print("[Int8GEMMProbe][\(label)] nonZero=\(nonZero)/\(out.count) sampleBytes=\(out.prefix(8))")
+            } else if destIsFloat32 {
+                var out = [Float32](repeating: 0, count: M * N)
+                out.withUnsafeMutableBytes { raw in dest.readBytes(raw.baseAddress!, strideBytes: nil) }
+                let nonZero = out.filter { $0 != 0 }.count
+                print("[Int8GEMMProbe][\(label)] nonZero=\(nonZero)/\(out.count) sample=\(out.prefix(8))")
+            } else {
+                var out = [Float16](repeating: 0, count: M * N)
+                out.withUnsafeMutableBytes { raw in dest.readBytes(raw.baseAddress!, strideBytes: nil) }
+                let nonZero = out.filter { $0 != 0 }.count
+                print("[Int8GEMMProbe][\(label)] nonZero=\(nonZero)/\(out.count) sample=\(out.prefix(8).map { Float($0) })")
+            }
         }
 
         let int8GemmDest = ndArray(dataType: .float16, shape: [1, 1, M, N])
@@ -110,6 +122,34 @@ enum NativeInt8GEMMProbe {
         let fp16Dest = ndArray(dataType: .float16, shape: [1, 1, M, N])
         runTimed(label: "GPU FP16 GEMM (MPSNDArrayMatrixMultiplication, baseline)", dest: fp16Dest) { cb in
             mm.encode(to: cb, sourceArrays: [lhsF, rhsF], destinationArray: fp16Dest)
+        }
+
+        // FP8 is a native float encoding (not integer+scale), so the plain
+        // MPSNDArrayMatrixMultiplication should accept FP8 source arrays directly --
+        // no MPSNDArrayQuantizedMatrixMultiplication/quantization descriptor needed.
+        // MPSDataType.float8e4m3 is new in iOS/macOS 27 SDK.
+        func fillFP8E4M3(_ arr: MPSNDArray, count: Int) {
+            // Raw 1-byte E4M3 encodings (sign:1 exp:4 bias7 mantissa:3) for a small
+            // cycling set of exactly-representable values: 1.0, -1.0, 0.5, -0.5,
+            // 1.5, -1.5, 2.0, -2.0 -- avoids rounding ambiguity in the fill itself.
+            let patterns: [UInt8] = [0x38, 0xB8, 0x30, 0xB0, 0x3C, 0xBC, 0x40, 0xC0]
+            var buf = [UInt8](repeating: 0, count: count)
+            for i in 0..<count { buf[i] = patterns[i % patterns.count] }
+            buf.withUnsafeMutableBytes { raw in arr.writeBytes(raw.baseAddress!, strideBytes: nil) }
+        }
+
+        if #available(iOS 27.0, *) {
+            let lhs8 = ndArray(dataType: .float8e4m3, shape: [1, 1, M, K])
+            let rhs8 = ndArray(dataType: .float8e4m3, shape: [1, 1, K, N])
+            fillFP8E4M3(lhs8, count: M * K)
+            fillFP8E4M3(rhs8, count: K * N)
+            let fp8Dest = ndArray(dataType: .float8e4m3, shape: [1, 1, M, N])
+            let mm8 = MPSNDArrayMatrixMultiplication(device: device, sourceCount: 2)
+            runTimed(label: "GPU Native FP8-E4M3 GEMM (MPSNDArrayMatrixMultiplication)", dest: fp8Dest, destIsRawByte: true) { cb in
+                mm8.encode(to: cb, sourceArrays: [lhs8, rhs8], destinationArray: fp8Dest)
+            }
+        } else {
+            print("[Int8GEMMProbe] FP8 requires iOS 27+")
         }
 
         print("[Int8GEMMProbe] Done.")
