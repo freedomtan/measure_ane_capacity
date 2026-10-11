@@ -95,12 +95,14 @@ BSD libc's `ctype.h` rune-classification structure, `+0x3c` landing in its
     if (generation != 17) {
         return NO;
     }
-    // generation == 17 exactly: one more disambiguating check, reading one
-    // character past the parsed digit run and comparing — plausibly to tell a
-    // base variant ("A17") from a suffixed one ("A17P"). Not fully resolved;
-    // see "Open threads" below.
-    unichar extra = [chipCode characterAtIndex:chipCode.length];
-    return /* some comparison involving `extra` and `digits` */;
+    // generation == 17 exactly: one more disambiguating check, reading the
+    // character right after the parsed digit run. RESOLVED (see Finding 1b):
+    // real disassembly from a physical device shows this compares that
+    // character against the literal lowercase 'p' (0x70) and returns YES
+    // unless it matches -- i.e. only a chip-codename variant whose suffix
+    // starts with lowercase 'p' is excluded from the >17 fast path's twin.
+    unichar extra = [chipCode characterAtIndex:index];  // index = right after the digit run
+    return extra != 'p';
 }
 ```
 
@@ -117,6 +119,47 @@ guaranteed-identical mechanism: if a future chip's codename string doesn't parse
 the way this function expects, MPSGraph's and Metal's answers could in principle
 diverge — the same class of risk documented for the `_featureInfo[]` table in the
 companion report.
+
+## Finding 1b — the `generation == 17` tie-break, resolved from a real device's disassembly
+
+Finding 1's reconstruction (built from an older macOS cache) left the `== 17`
+tie-break as an open question — "plausibly" distinguishing a base chip variant
+from a suffixed one, not confirmed. The same `~/Library/Developer/Xcode/iOS
+DeviceSupport/` cached dylib technique used in Finding 4n applies equally to
+`MetalPerformanceShadersGraph` (not just `MPSNDArray`) — the exact same
+`-[MPSGraphDeviceDescriptor supportsMXU]` symbol exists there, from a real
+iPhone 16 Pro, and `ipsw macho disass` gives the full, unambiguous
+disassembly of the tie-break tail:
+
+```
+cmp x0, #0x11            ; x0 = [digits integerValue]; 0x11 = 17
+b.le loc_...             ; <=17 falls through to the tie-break; >17 -> YES
+...
+b.ne loc_...             ; (same cmp's flags) if generation != 17 -> NO
+...                      ; falls through only when generation == 17 exactly
+ldr x0, [x20, x23]       ; reload chipCode
+mov x2, x21              ; x21 = index right after the parsed digit run
+bl 0x240004bc0           ; -[NSString characterAtIndex:]
+cmp w0, #0x70            ; 0x70 = ASCII 'p'
+cset w20, ne             ; result = (character != 'p')
+```
+
+**Resolved:** when the parsed generation is exactly `17`, the function reads
+the character immediately following the digit run and returns `YES` unless
+that character is the literal lowercase letter `'p'`. So a chip-codename
+string parsing to generation `17` with a suffix starting in lowercase `p`
+(plausibly Apple's internal codename convention for "A17 Pro," the one A17
+variant that actually shipped, as iPhone 15 Pro/Max's chip) is excluded from
+the `supportsMXU == YES` fast path that every generation `> 17` gets
+unconditionally; any other generation-17 codename (including no suffix at
+all) returns `YES` the same as `> 17` would. This lines up with the known
+hardware boundary: A17 Pro's GPU predates the real MXU cutoff (G17 is the
+first MXU-capable driver generation per the companion report, and A17 Pro's
+GPU is G16-class), so excluding specifically the shipped A17 Pro codename
+from the generation-17 fast path, while still returning `YES` for the
+`>17`-numbered generations the comparison was designed around, is consistent
+with the real hardware story rather than an arbitrary string-parsing
+artifact.
 
 ## Finding 2 — how `supportsMXU` is used: a compiled-module cache key, not a runtime check
 
@@ -1858,14 +1901,26 @@ flowchart TB
   level profiling/disassembly, out of reach for this investigation. Also
   still open: why MIL's bias (`±0.05`) alone reaches 0% zero while MPSGraph
   needed `±0.3` for a comparable `0.7%` floor — not isolated.
-- What the `w28` cached flag at page `0x1e4748000+0xb88` (the thing
-  `_MPSForceMatrixUnit`'s result is `OR`'d against in `A18Behavior::EncodeSDPA`,
-  Finding 7) actually represents — a real device-capability check, another cached
-  env-var override, or something else — was not traced to its origin/initializer.
-- The exact semantics of `-[MPSGraphDeviceDescriptor supportsMXU]`'s `generation ==
-  17` tie-break branch (reading one character past the parsed digit run and
-  comparing) were not fully resolved — plausibly distinguishing a base chip variant
-  from a suffixed one (e.g. `"A17"` vs `"A17P"`), but not confirmed.
+- **Partially advanced.** What the `w28`-style cached flags in
+  `A18Behavior::EncodeSDPA` represent: disassembling the real device's own
+  `EncodeSDPA` (same `~/Library/Developer/Xcode/iOS DeviceSupport/` technique
+  as Finding 4n, applied to `MPSNDArray` this time) confirmed these are
+  genuinely `dispatch_once`-cached values — the inlined fast-path pattern
+  (`cmn x8, #1` against the libdispatch `DISPATCH_ONCE_DONE` sentinel) is
+  unambiguous, and there are at least **five** distinct cached slots feeding
+  this one function, not the three originally estimated. What's still
+  unresolved: each slot's value comes from a `dispatch_once` block whose
+  `getenv()`-reading body lives behind a PAC-signed function pointer inside
+  a `__block_literal_global` data structure — parsing that out would need
+  pointer-authentication-aware disassembly beyond what `ipsw macho disass`
+  does automatically from a symbol name, not attempted here.
+- ~~The exact semantics of `-[MPSGraphDeviceDescriptor supportsMXU]`'s
+  `generation == 17` tie-break branch...~~ **Resolved, Finding 1b:** real
+  disassembly from a physical device's own dylib shows the tie-break compares
+  the character right after the parsed digit run against literal lowercase
+  `'p'`, returning `YES` unless it matches — plausibly distinguishing the
+  shipped "A17 Pro" codename (GPU predates the real MXU cutoff) from any other
+  generation-17-parsing codename.
 - Whether `MPSGraphDeviceDescriptor.supportsMXU` feeds any actual codegen/lowering
   decision inside MPSGraph's optimizer passes (as opposed to only the module
   cache-key role established in Finding 2) was not traced.
@@ -1881,10 +1936,6 @@ flowchart TB
   since both are `simdgroup_matrix<T,16,16>`-based.) What remains open is only
   the one level below this: the actual AGX ISA opcode this AIR intrinsic lowers
   to was not disassembled — undocumented ISA, no public tooling, out of scope.
-- The three environment-variable-shaped global booleans gating tile-path eligibility
-  (`adrp 0x1e4747000` / `0x1e4748000` pages) were identified by behavior and
-  proximity to the literal string `"MPS_SDPA_FORCE_TILED_PREFILL"`, but not
-  individually confirmed by name.
 - **Resolved (Finding 4p), via a different route than either of the two
   originally planned.** GPU-frame-capture inspection stayed blocked throughout
   (no `.gputrace` pull off-device via `devicectl`, no Xcode 27 GUI fallback),
