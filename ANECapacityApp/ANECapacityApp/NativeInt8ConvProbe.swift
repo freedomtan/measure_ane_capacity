@@ -17,6 +17,7 @@ enum NativeInt8ConvProbe {
             print("[ConvProbe] No Metal device/queue"); return
         }
         print("[ConvProbe] Device: \(device.name)")
+        KernelNameLogger.install(on: device)
 
         let Cin = 16, Cout = 16, H = 17, W = 17, KH = 16, KW = 16
         let outH = H - KH + 1, outW = W - KW + 1
