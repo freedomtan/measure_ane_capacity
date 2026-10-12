@@ -558,6 +558,66 @@ Not done here: writing that standalone `BNNSMatMul`-direct harness. Flagged as t
 step if "does BNNS's `KERNEL_MATMUL_WITH_AFFINE_QUANTIZE_WEIGHT` (or any real quantized kernel)
 actually exist and get selected" is worth settling definitively.
 
+## Finding 11 — calling libBNNS directly: BNNSMatMul rejects INT8 outright; BNNSFilterCreateLayerFullyConnected accepts real INT8 weights but routes them through legacy AMX, not SME2
+
+Finding 10 showed the MIL-builder path can't reach BNNS with a genuinely-INT8-typed tensor at all
+— the compiler folds it away first. The natural next step: skip MIL/CoreML entirely and call
+`libBNNS.dylib`'s public, documented `bnns.h` C API directly (new standalone harnesses,
+`bnns_matmul_probe.m` and `bnns_fc_probe.m`, linked straight against `Accelerate.framework`, no
+MIL/CoreML/protobuf anywhere in the binary).
+
+**`BNNSMatMul` (and `BNNSMatMulWorkspaceSize`) reject every integer `BNNSDataType` combination
+outright.** Tried `Int8`/`Int8`→`Int8`, `→Int32`, `→Float32`, `→Float16`, `Int16`/`Int16`→`Int32`,
+and mixed `Int8`/`Float16`→`Float16`, with both `data_scale=1` and the default — every single one
+returns `BNNSMatMulWorkspaceSize() == -1` (invalid), before `BNNSMatMul` itself is even called.
+This free function's "GEMM" is float-only, full stop; the `data_scale`/`data_bias` fields on
+`BNNSNDArrayDescriptor` are documented generically but `BNNSMatMul` doesn't honor them for
+non-float inputs at all.
+
+**`BNNSFilterCreateLayerFullyConnected` does accept a genuinely-INT8 weight matrix.**
+`BNNSLayerParametersFullyConnected` gives `i_desc`/`w_desc`/`o_desc` *independent*
+`BNNSNDArrayDescriptor`s, so `w_desc` can be `BNNSDataTypeInt8` (with `data_scale`) while
+`i_desc`/`o_desc` stay `BNNSDataTypeFloat16` — and since there's no compiler in this path at all,
+there's nothing to constant-fold it away. **Correctness confirmed by hand**: a tiny 4-input/3-output
+case with weight rows `[1,1,1,1]`, `[2,2,2,2]`, `[1,2,3,4]` and input `[1,2,3,4]` produced exactly
+the expected `[10, 20, 30]`.
+
+**But it's slower than FP16, not faster** (1024³, `BNNSFilterApplyBatch` with `batch_size=M`):
+
+| | Avg | TOPS |
+|---|---|---|
+| FC, FP16 weight | 1.497 ms | 1.4349 |
+| FC, INT8 weight (scale=1/32) | 3.488 ms | 0.6156 |
+
+**Why: this legacy API reaches real Apple AMX instructions, not SME2.** Sampling the INT8-weight
+call and resolving the hot leaf's file offset against the function-start table from Finding 6 lands
+in a ~6 KB function containing instructions `otool` can't decode at all — printed as raw
+`.long 0x0020100f` / `0x0020102f` / `0x0020118a..8d` words, which is exactly the signature of
+Apple's private, undocumented AMX coprocessor (no public mnemonics exist for it, same point Finding
+6 raised and didn't chase at the time). Decoding the operand field by the publicly known AMX
+NOP-space encoding scheme (instruction `= 0x00201000 | (op << 5) | operand`), `0x00f`→op 0 (`ldx`),
+`0x02f`→op 1 (`ldy`), and the repeated `0x18a`/`8b`/`8c`/`8d` block → op 12 (`fma64`) four times
+with incrementing accumulator operands — a textbook AMX load-X/load-Y/four-way-FMA-accumulate GEMM
+microkernel. The FP16-weight call, sampled the same way, never reaches this function at all; its
+hot path instead calls out to addresses entirely outside `libBNNS.dylib`'s own mapped range,
+consistent with (though not conclusively proven to be) delegating to Accelerate's `libBLAS.dylib`
+instead.
+
+**Net result: real native INT8 compute through BNNS's public API exists and is callable today**,
+confirmed both by output correctness and by direct instruction-level inspection (not CoreML/MIL
+constant-folding it away this time) — but it's the *old* AMX-coprocessor path from before SME2
+existed, which this specific legacy, `__API_DEPRECATED(macOS 15)` `BNNSFilterCreateLayerFullyConnected`
+API still routes to, and on this M4 Pro it's measurably slower than the modern SME2-based FP16 path
+Finding 6 traced through `BNNSGraphContextExecute_v2`. This reframes the original question: it's
+not that BNNS "can't" do native low-precision matmul — it's that Apple's newer, faster SME2 kernel
+set (reached only through the modern `BNNSGraph*` APIs that CoreML itself uses) apparently doesn't
+have an INT8-weight variant exposed on this path at all, while the older AMX-based kernel set that
+*does* support it predates the hardware generation that made SME2 worth switching to. Whether
+`BNNSGraphCompileFromFile` (the modern API, directly callable too) can be fed a hand-written
+`model.mil` text file with a genuinely non-foldable INT8 weight (e.g. a graph input instead of a
+constant) and reach a faster, modern quantized kernel is the natural next question — not attempted
+here.
+
 ## Not pursued here
 
 - Disassembling `applyOptimizationPassesWithDevice:` to confirm the nil-`metalDeviceName`
