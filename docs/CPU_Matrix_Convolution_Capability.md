@@ -679,6 +679,28 @@ modern SME2 kernel as the plain FP16 case** — the ~22% gap is the cost of the 
 preprocessing passes over the 1M-element weight tensor, not a different, slower kernel the way
 Finding 11's legacy AMX path was.
 
+**Confirmed live with `lldb`, not just inferred from `sample`.** The `sample`-based address match
+above is static-analysis-adjacent — it shows the hottest *sampled* instruction pointer lands in
+that function, which is strong but not the same as a direct, synchronous observation. Closed the
+gap the same way Finding 6 did: temporarily built a copy of `bnns_graph_matmul_probe.m` with the
+FP16 call commented out (so only the INT8-weight-input path runs at all), set an `lldb` breakpoint
+directly on `--shlib libBNNS.dylib --address 0x18f6e0ca4` with `breakpoint command add 1` scripted
+to auto-`bt 4`/`continue` (avoiding the interactive-hang mistake from Finding 6's first attempt),
+and launched the real benchmark under it:
+
+```
+* frame #0: libBNNS.dylib`___lldb_unnamed_symbol_18f6e0ca4            <- the SME2 kernel
+  frame #1: libBNNS.dylib`___lldb_unnamed_symbol_18f6e030c + 2412     <- dispatcher
+  frame #2: libBNNS.dylib`___lldb_unnamed_symbol_18ee1c2e8 + 348
+  frame #3: libdispatch.dylib`_dispatch_client_callout3_a + 16
+```
+
+Hit repeatedly, every time, with the FP16 path entirely absent from the binary's execution for that
+run — this is the same function, same dispatcher, same call shape as Finding 6's live FP16 trace,
+now proven to also be live-executed by the INT8-weight-input path specifically, not merely
+statistically likely from sampling. Reverted the temporary edit afterward (confirmed via `git diff`
+that the source file matches its committed state).
+
 **Net result: `BNNSGraphCompileFromFile` is a materially better way to reach BNNS with a genuinely
 non-foldable low-precision weight than either of Finding 11's legacy `bnns.h` entry points.**
 `BNNSMatMul` rejected INT8 outright; `BNNSFilterCreateLayerFullyConnected` accepted it but paid for
