@@ -141,4 +141,104 @@ enum MTLFeatureProbe {
         let digits = s.dropFirst().prefix { $0.isNumber }
         return Int(digits) ?? 0
     }
+
+    struct DiffEntry: Identifiable, Hashable {
+        let id = UUID()
+        let tableIndex: Int
+        let tableName: String
+        let tableSupported: Bool
+        let matchedSelector: String
+        let selectorSupported: Bool
+        let matchScore: Int
+    }
+
+    private static let stopWords: Set<String> = [
+        "support", "supports", "the", "and", "for", "of", "on", "in", "with",
+        "from", "a", "to", "is", "this", "as", "or", "format", "formats",
+    ]
+
+    /// Splits a selector's CamelCase remainder (after stripping its
+    /// `supports`/`familySupports` prefix) and a display-name string into
+    /// lowercase word sets, dropping common filler words, so the two
+    /// differently-styled naming schemes (`supportsBCTextureCompression` vs.
+    /// "BC-format texture compression") can be compared.
+    private static func wordSet(fromCamelCase s: String) -> Set<String> {
+        var words: [String] = []
+        var current = ""
+        for ch in s {
+            if ch.isUppercase || ch.isNumber {
+                if !current.isEmpty, ch.isUppercase, let last = current.last, last.isLowercase {
+                    words.append(current)
+                    current = String(ch)
+                } else {
+                    current.append(ch)
+                }
+            } else {
+                current.append(ch)
+            }
+        }
+        if !current.isEmpty { words.append(current) }
+        return Set(words.map { $0.lowercased() }).subtracting(stopWords).filter { $0.count >= 3 }
+    }
+
+    private static func wordSet(fromDisplayName s: String) -> Set<String> {
+        let cleaned = s.lowercased().map { $0.isLetter || $0.isNumber ? $0 : " " }
+        let words = String(cleaned).split(separator: " ").map(String.init)
+        return Set(words).subtracting(stopWords).filter { $0.count >= 3 }
+    }
+
+    /// Best-effort name matching between the human-readable `_featureInfo[]`
+    /// display strings and the live `familySupports*` selectors, then a
+    /// direct boolean comparison -- the live selector is the real,
+    /// post-construction answer; the table entry is the value baked in once
+    /// during `-[_MTLDeviceFeatureQueries initWithDevice:]` itself (which
+    /// this document already showed is stale/wrong for any capability an AGX
+    /// driver class doesn't directly override; see the FP8/MXUNarrowTileSizes
+    /// finding). This surfaces every other capability with the same symptom.
+    static func fullTableDiff(_ device: MTLDevice) -> (diffs: [DiffEntry], unmatched: [String]) {
+        guard let fq = featureQueries(device), let cls = object_getClass(fq) else { return ([], []) }
+        let familySelectors = boolSelectors(startingAt: cls, matchingPrefix: "familySupports")
+        var selectorWordSets: [(sel: Selector, name: String, words: Set<String>)] = []
+        for sel in familySelectors {
+            let name = NSStringFromSelector(sel)
+            let remainder = String(name.dropFirst("familySupports".count))
+            selectorWordSets.append((sel, name, wordSet(fromCamelCase: remainder)))
+        }
+
+        let table = probeFeatureInfoTable(device)
+        var diffs: [DiffEntry] = []
+        var unmatched: [String] = []
+
+        for entry in table {
+            let tableWords = wordSet(fromDisplayName: entry.name)
+            guard !tableWords.isEmpty else { unmatched.append(entry.name); continue }
+
+            var best: (sel: Selector, name: String, score: Int)?
+            var secondBestScore = 0
+            for candidate in selectorWordSets {
+                let score = tableWords.intersection(candidate.words).count
+                guard score > 0 else { continue }
+                if best == nil || score > best!.score {
+                    secondBestScore = best?.score ?? 0
+                    best = (candidate.sel, candidate.name, score)
+                } else if score > secondBestScore {
+                    secondBestScore = score
+                }
+            }
+
+            guard let match = best, match.score >= 1, match.score > secondBestScore else {
+                unmatched.append(entry.name)
+                continue
+            }
+
+            guard let value = callBool(fq, match.sel) else { continue }
+            if value != entry.supported {
+                diffs.append(DiffEntry(
+                    tableIndex: entry.index, tableName: entry.name, tableSupported: entry.supported,
+                    matchedSelector: match.name, selectorSupported: value, matchScore: match.score
+                ))
+            }
+        }
+        return (diffs, unmatched)
+    }
 }

@@ -65,6 +65,13 @@ struct ContentView: View {
                     for row in featureTable where row.name.localizedCaseInsensitiveContains("MXU") || row.name.localizedCaseInsensitiveContains("8-bit floating") {
                         print("[MTLFeatureProbe] featureTable[\(row.index)] \(row.name) req=\(row.requirement) supported=\(row.supported)")
                     }
+
+                    let (diffs, unmatched) = MTLFeatureProbe.fullTableDiff(device)
+                    print("[MTLFeatureProbe] --- full table diff: \(diffs.count) disagreement(s), \(unmatched.count) unmatched name(s) ---")
+                    for d in diffs {
+                        print("[MTLFeatureProbe] DIFF [\(d.tableIndex)] \"\(d.tableName)\" table=\(d.tableSupported) vs \(d.matchedSelector)=\(d.selectorSupported) (matchScore=\(d.matchScore))")
+                    }
+                    print("[MTLFeatureProbe] unmatched table names: \(unmatched.joined(separator: " | "))")
                     exit(0)
                 }
             }

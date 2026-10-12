@@ -102,6 +102,50 @@ post-construction answer turns out to be. `supportsMXU` is the odd one out
 precisely because every AGX generation class gives it its own hardcoded
 override, so it never takes the self-referential path at all.
 
+**This is not a two-off quirk — it affects roughly a third of the entire
+table.** Extended `MTLFeatureProbe` with a full sweep (`fullTableDiff` in
+`FeatureProbe.swift`): fuzzy-match every `_featureInfo[]` display-name string
+against the closest `familySupports*` selector by shared significant words
+(stripping common filler words, requiring the winning match to strictly beat
+the runner-up), then diff the two booleans directly. Run live on the same
+iPhone 18 Pro:
+
+```
+[MTLFeatureProbe] --- full table diff: 125 disagreement(s), 86 unmatched name(s) ---
+```
+
+125 raw disagreements out of 237 total entries — but the name-matching is
+fuzzy, so not every one is trustworthy. Filtering to only matches with
+`matchScore >= 3` (3+ shared distinctive words, e.g. `familySupports`-
+`FixedLinePointFillDepthGradient` at `matchScore=6` is essentially an exact
+name match) leaves **77 high-confidence disagreements**, and **73 of those
+73/77 are the identical stale-`false`-in-the-table pattern**: real examples
+include `familySupportsRayTracingIndirectInstanceAccelerationStructureBuild`
+(`matchScore=7`, table says `false`, live says `true`),
+`familySupportsMipLevelsSmallerThanBlockSize` (`matchScore=6`, same split),
+`familySupportsNonZeroTextureWriteLOD`,
+`familySupportsReadWriteTextureCubeArguments`,
+`familySupportsImageBlockSampleCoverageControl` (all `matchScore=5`, same
+split) — a long tail of capabilities spanning ray tracing, tile shaders,
+texture formats, and argument buffers, with no apparent correlation to
+feature category. **The practical conclusion: the `_featureInfo[]` table is
+broadly unreliable, not narrowly broken** — only a minority of entries (the
+ones an AGX driver class happens to hardcode, like `supportsMXU`) can be
+trusted from this table at all; querying `[device supportsX]` or
+`[[device featureQueries] familySupportsX]` directly is the only reliable
+path for everything else.
+
+**A separate, smaller, unexplained oddity: 4 entries run the opposite
+direction** (table says `true`, the live `familySupports*` selector says
+`false`), all at `matchScore=3`: `Query Texture LOD`, `Resource detach
+backing`, `Buffer Bounds Checking`, `Explicit visibility groups`. These
+don't fit the "stale snapshot from construction" story at all — if
+anything, they'd suggest the opposite (the table captured a true answer
+that later queries no longer agree with), which doesn't have an obvious
+mechanism in the decompiled source above. Given there are only 4 and the
+fuzzy matcher's confidence is unverified at this scale, this is flagged as
+an open oddity, not a resolved finding.
+
 ```mermaid
 classDiagram
     direction TB
