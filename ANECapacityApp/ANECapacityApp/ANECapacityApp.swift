@@ -21,6 +21,18 @@ struct ANECapacityApp: App {
                 exit(0)
             }
         }
+        if ProcessInfo.processInfo.arguments.contains("--native-cpu-matmul") {
+            DispatchQueue.global().async {
+                NativeCPUMatmulConvProbe.runMatmul()
+                exit(0)
+            }
+        }
+        if ProcessInfo.processInfo.arguments.contains("--native-cpu-conv") {
+            DispatchQueue.global().async {
+                NativeCPUMatmulConvProbe.runConv()
+                exit(0)
+            }
+        }
     }
 
     var body: some Scene {

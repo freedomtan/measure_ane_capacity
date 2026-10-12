@@ -87,6 +87,54 @@ No crash, no code change needed — just the first time anyone pointed this tool
 TOPS is now this repo's first real CPU convolution baseline**, ~3.2x slower than GPU FP16 (9.92
 TOPS) and ~6.2x slower than ANE FP16 (19.10 TOPS) on the same chip, same workload shape.
 
+## Finding 3 — the same bug reproduces on iOS (A18 Pro, A20 Pro), but at a different pipeline stage
+
+Ported the macOS CLI's `kTargetCPU` path into `ANECapacityApp` as `NativeCPUMatmulConvProbe.swift`
+(`--native-cpu-matmul` / `--native-cpu-conv`), using the identical `+[MPSGraphDevice CPUDevice]`
+SPI call via the same raw-`IMP` pattern used throughout this app's other probes. Tested on both
+physical devices available: an iPhone 16 Pro (A18 Pro) and an iPhone 18 Pro (A20 Pro).
+
+**First attempt, full-size shapes (matmul 1024³×20, matching the macOS CLI): no crash, no output,
+no completion for several minutes.** Forced `setvbuf(stdout, nil, _IONBF, 0)` to rule out output
+buffering as the explanation — still nothing printed, including the very first `print()` call,
+until the process was manually terminated. This was ambiguous: either a true hang, or just an
+extremely slow compile with nothing to show for it in between.
+
+**Shrinking the shapes resolved the ambiguity: it's slow, not hung, and the crash moves to a
+different stage than on macOS.** At trivial sizes (64×64×64×1 matmul, 32×32×8ch 3×3×1 conv), both
+devices reliably reproduce a crash — but **the crash is no longer inside the compile call**.
+`-[MPSGraphExecutable compileWithDevice:...]` returns a real, non-nil executable; the identical
+`NSInvalidArgumentException`/`-stringByAppendingString:: nil argument` crash instead happens
+during `-[MPSGraphExecutable runWithMTLCommandQueue:inputsArray:resultsArray:executionDescriptor:]`:
+
+```
+[CPUProbe] Device: Apple A18 Pro GPU, targeting MPSGraphDevice.CPUDevice for matmul
+[CPUProbe] Compiling matmul graph for CPUDevice...
+[CPUProbe] Compile returned without crashing: <MPSGraphExecutable: 0x11a6c5400>
+*** Terminating app due to uncaught exception 'NSInvalidArgumentException', reason:
+'*** -[__NSCFConstantString stringByAppendingString:]: nil argument'
+```
+
+Identical on all four combinations tried (A18 Pro × {matmul, conv}, A20 Pro × {matmul, conv}) —
+same exception class, same message, same "compile succeeds, run crashes" ordering, differing only
+in raw unsymbolicated addresses (no on-device dSYM to resolve them to function names, unlike the
+macOS case where the crash reporter had full symbols).
+
+**Interpretation:** this is very likely the same underlying defect as Finding 1 (something
+building a cache key or debug label off a nil `metalDeviceName`-shaped string for a `CPUDevice`
+instance), but iOS's MPSGraph build apparently defers whatever triggers it from compile-time to
+run-time, and/or the macOS crash's `applyOptimizationPassesWithDevice:` code path legitimately
+takes much longer at full problem size on these phones' CPUs before failing — the full-size,
+several-minutes-with-no-output run was never confirmed to be either "still compiling" or "would
+crash eventually," since it was terminated rather than left to run further. Likely compounds with
+the fact that MPSGraph's CPU "device" has to synthesize working code on a path presumably never
+performance-tuned or perhaps even regularly exercised by Apple's own internal callers (Finding 2's
+CoreML/MIL route being the one that actually works).
+
+**Net result: `+[MPSGraphDevice CPUDevice]` is confirmed non-functional across all three physical
+chips tested in this repo (M4 Pro, A18 Pro, A20 Pro) and both benchmark shapes (matmul, conv).**
+Finding 2's CoreML/MIL route remains the only working CPU path.
+
 ## Open: no CoreML/MIL matmul equivalent exists yet
 
 `MILSpecBuilder.mm` (the in-process MIL-program builder behind `measure_conv_coreml.m`) only emits
