@@ -427,8 +427,10 @@ int main(int argc, char *argv[]) {
         cfg.precision = MILPrecisionINT8;
       } else if ([v isEqualToString:@"fp8"]) {
         cfg.precision = MILPrecisionFP8;
+      } else if ([v isEqualToString:@"int8w"]) {
+        cfg.precision = MILPrecisionINT8WeightOnly;
       } else {
-        fprintf(stderr, "error: unknown --precision value '%s' (expected fp16, int8, or fp8)\n", v.UTF8String);
+        fprintf(stderr, "error: unknown --precision value '%s' (expected fp16, int8, fp8, or int8w)\n", v.UTF8String);
         return 1;
       }
     } else if ([arg isEqualToString:@"--units"] && i + 1 < argc) {

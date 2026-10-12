@@ -493,6 +493,71 @@ the exact code location that reads the `FEAT_SME_F8F16` sysctl inside `libBNNS.d
 string-cross-reference attempt hit a dead end, repeatedly landing on unrelated pointer-
 authentication trampoline code rather than the real reader.)
 
+## Finding 10 — can we reach BNNS's real quantized kernel at all? Weight-only INT8 just gets constant-folded away
+
+Finding 6 turned up a kernel name worth testing directly: `KERNEL_MATMUL_WITH_AFFINE_QUANTIZE_WEIGHT`
+— a dense GEMM tier distinct from the plain `MLA1/2/3`/`SME2` ones, suggesting BNNS has a real
+weight-only-quantized compute path. The current INT8 matmul (Finding 7/8) wraps *activations* in
+an explicit `quantize`/`dequantize` pair every layer, mirroring the conv chain's pattern — maybe
+that's what's preventing the affine-quantize-weight kernel from being picked, and causing the
+CPU regression Finding 7 found (4.89 vs ~6.6 TOPS).
+
+Added a fourth precision, `MILPrecisionINT8WeightOnly` (`--precision int8w`): identical INT8
+weight representation (`constexpr_blockwise_shift_scale`) to the existing INT8 mode, but with the
+per-layer activation `quantize`/`dequantize` pair removed entirely — activations flow into
+`matmul` as plain FP16, same as the FP16 mode, with only the weight constant stored as INT8.
+
+| Precision | Avg | TOPS |
+|---|---|---|
+| FP16 | 6.50 ms | 6.6091 |
+| INT8 (QDQ) | 8.84 ms | 4.8569 |
+| INT8W (new) | 6.50 ms | 6.6088 |
+
+**INT8W is bit-identical to FP16** — same timing to two decimal places, same output values down to
+the printed digits (`0.0409851, -0.0431824, ...` for both). Confirmed via `sample` that INT8W hits
+the exact same hot function addresses as the FP16 SME2 kernel from Finding 6
+(`libBNNS.dylib + 0xa73ca4`/`+0xa7330c` region).
+
+**The real explanation: the MIL compiler constant-folds the whole thing away.** `weights =
+dequantize(weights_int8_const, scale_const)` has two compile-time-constant inputs, so the compiler
+evaluates it at compile time and bakes a plain FP16 constant into the compiled program — there is
+no quantized data left by the time BNNS executes anything. This settles two things at once:
+
+- **Finding 7's INT8-CPU-regression was never about hardware kernel selection at all** — it was
+  purely the per-layer `quantize`/`dequantize` *op overhead* on the activation path (20 extra op
+  pairs per inference), not a slower GEMM kernel. Weight-only quantization through this builder
+  path costs nothing at runtime, but also *gains* nothing at runtime — the only benefit is a
+  smaller compiled spec (half the inline weight bytes) and proportionally faster compile/load
+  time (compile: 58.71 ms vs FP16's 124.03 ms; load: 816 ms vs 1995 ms), not faster inference.
+- **This builder path cannot reach `KERNEL_MATMUL_WITH_AFFINE_QUANTIZE_WEIGHT` (or any genuinely
+  quantized BNNS kernel) at all**, because MIL's constant folding erases the INT8-ness before BNNS
+  ever sees the graph. Whatever that kernel is for, it isn't reachable by feeding BNNS a
+  compile-time-constant quantized weight through CoreML/MIL — you'd need the weight (or activation)
+  to be a genuine runtime-variable INT8 tensor that MIL's compiler can't fold away, which the
+  `quantize`/`dequantize`-wrapped activation path *does* satisfy (hence Finding 7's INT8 mode isn't
+  folded) — but that path pays the QDQ op overhead instead of reaching a faster kernel.
+
+**Where this leaves "native" low-precision compute through BNNS**: this repo's MIL-builder
+approach cannot produce a genuinely-INT8-typed `matmul` the compiler won't fold back to FP16/erase
+the overhead from — by construction, in MIL, a `matmul` op's `x`/`y` are typed FP16 whenever either
+operand traces back to a compile-time constant. Reaching real native INT8 (or any) compute would
+mean going around MIL/CoreML entirely and calling `libBNNS.dylib`'s own public C API directly:
+
+- **`BNNSMatMul`** / `BNNSFilterCreateLayerFullyConnected` (chained with a `BNNSQuantization`
+  filter) in the legacy, still-callable (if `__API_DEPRECATED`) `bnns.h` — takes raw
+  `BNNSNDArrayDescriptor` structs with an explicit `BNNSDataType`, including real `Int8`, no MIL or
+  CoreML involved, so no constant-folding compiler sits between us and whatever kernel BNNS
+  actually picks for an int8 x int8 call.
+- **No public `BNNSDataType` value exists for FP8 at all** — checked `bnns_constants.h`
+  exhaustively (Float16/32, BFloat16, Int8/16/32/64, UInt*, Indexed, Boolean). The `Float8E4M3FN_v1`
+  type strings found in Finding 9 belong to a private "AICode"/MLIR type system used internally by
+  the graph compiler, not exposed in this struct — so a standalone BNNS harness could test real
+  native INT8 this way, but not native FP8.
+
+Not done here: writing that standalone `BNNSMatMul`-direct harness. Flagged as the natural next
+step if "does BNNS's `KERNEL_MATMUL_WITH_AFFINE_QUANTIZE_WEIGHT` (or any real quantized kernel)
+actually exist and get selected" is worth settling definitively.
+
 ## Not pursued here
 
 - Disassembling `applyOptimizationPassesWithDevice:` to confirm the nil-`metalDeviceName`

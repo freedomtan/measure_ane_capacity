@@ -39,6 +39,14 @@ typedef NS_ENUM(NSInteger, MILPrecision) {
   /// Quantized FP8 / W8A8 QDQ: activation quantize/dequantize to FP8 E4M3,
   /// FP8 weights dequantized to FP16, targeting native FP8 ANE engines on H18/H19.
   MILPrecisionFP8 = 2,
+  /// Matmul only: weight-only INT8 (W8A16, no activation QDQ at all).
+  /// Activations stay FP16 straight through; only the weight constant is
+  /// INT8 (constexpr_blockwise_shift_scale), same as MILPrecisionINT8's
+  /// weight representation. Tests whether BNNS's CPU GEMM dispatcher picks
+  /// its KERNEL_MATMUL_WITH_AFFINE_QUANTIZE_WEIGHT kernel (see
+  /// docs/CPU_Matrix_Convolution_Capability.md Finding 6) once the
+  /// surrounding activation quantize/dequantize ops are no longer in the way.
+  MILPrecisionINT8WeightOnly = 3,
 };
 
 /// The workload: `layers` chained KxK convolutions over [batch, channelsIn,

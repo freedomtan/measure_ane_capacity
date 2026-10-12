@@ -465,10 +465,11 @@ NSString *MILWeightModeName(MILWeightMode mode) {
 
 NSString *MILPrecisionName(MILPrecision precision) {
   switch (precision) {
-    case MILPrecisionINT8: return @"INT8";
-    case MILPrecisionFP8:  return @"FP8";
+    case MILPrecisionINT8:         return @"INT8";
+    case MILPrecisionFP8:          return @"FP8";
+    case MILPrecisionINT8WeightOnly: return @"INT8W";
     case MILPrecisionFP16:
-    default:               return @"FP16";
+    default:                       return @"FP16";
   }
 }
 
@@ -801,6 +802,13 @@ NSData *MILBuildMatmulChainSpec(MILMatmulChainConfig config, NSError **error) {
     AddConstOp(&block, "act_scale", TensorValueType(mil::FLOAT16, {}),
                Float16ScalarValue(kFP16PlusOneThirtySecond));
     AddConstOp(&block, "dtype_int8", StringScalarType(), StringValue("int8"));
+  } else if (config.precision == MILPrecisionINT8WeightOnly) {
+    // Same INT8 weight representation as MILPrecisionINT8, but no activation
+    // quantize/dequantize ops at all -- activations stay FP16 straight
+    // through. Isolates whether BNNS's CPU kernel selection changes once the
+    // per-layer quantize/dequantize round-trip is out of the way.
+    AddConstexprBlockwiseShiftScaleOp(&block, "weights", weightShape,
+                                      WeightBytesMatmulINT8(config), kFP16PlusOneThirtySecond);
   } else if (config.precision == MILPrecisionFP8) {
     // Weights: constexpr_lut_to_dense with inline FP8 E4M3 indices and IEEE Float8 LUT
     AddConstexprLUTToDenseOp(&block, "weights", weightShape,
@@ -865,7 +873,7 @@ NSString *MILMatmulChainText(MILMatmulChainConfig config) {
   [text appendFormat:@"function main (opset %s):\n", kOpset];
   [text appendFormat:@"  x: fp16[%lu, 1, %lu, %lu]\n", (unsigned long)config.batch,
                      (unsigned long)config.M, (unsigned long)config.K];
-  if (config.precision == MILPrecisionINT8) {
+  if (config.precision == MILPrecisionINT8 || config.precision == MILPrecisionINT8WeightOnly) {
     [text appendFormat:@"  weights_int8 = const(int8[%lu, 1, %lu, %lu])  // %@, %lu bytes inline\n",
                        (unsigned long)config.batch, (unsigned long)config.K, (unsigned long)config.N,
                        MILWeightModeName(config.weightMode),
