@@ -2,7 +2,7 @@ import Foundation
 import Metal
 import ObjectiveC
 
-/// Open-thread item from docs/MPSGraph_MXU_SDPA_Investigation.md: with GPU-frame-
+/// Open-thread item from docs/GPU_MXU_And_Convolution_Dispatch_Investigation.md: with GPU-frame-
 /// capture inspection blocked (`devicectl device copy --domain-type
 /// appDataContainer` fails to pull `.gputrace` off a physical device, and Xcode 27
 /// has no Window -> Devices and Simulators GUI fallback), this swizzles

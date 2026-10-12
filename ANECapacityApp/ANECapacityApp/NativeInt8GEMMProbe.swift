@@ -7,7 +7,7 @@ import MetalPerformanceShaders
 /// or slower than a plain FP16 GEMM on this device's actual GPU. Triggered by
 /// `--native-int8-gemm` on launch (see ANECapacityApp.swift). Not part of the
 /// normal ConvDimensions/BenchmarkResult pipeline -- this is a standalone
-/// sanity check for docs/MPSGraph_MXU_SDPA_Investigation.md Finding 4h/4i.
+/// sanity check for docs/GPU_MXU_And_Convolution_Dispatch_Investigation.md Finding 4h/4i.
 enum NativeInt8GEMMProbe {
     static func run() {
         guard let device = MTLCreateSystemDefaultDevice(), let queue = device.makeCommandQueue() else {

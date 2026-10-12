@@ -128,7 +128,7 @@ private func createNonZeroData(byteCount: Int, dataType: MPSDataType, magnitude:
 // all, which makes 0 an absorbing state once any activation underflows the
 // quantization scale. +/-0.05 (MIL's value) only got MPSGraph's zero rate
 // from 19.6% to 3.3% here; +/-0.3 was needed to reach a MIL-comparable
-// <1% floor -- see docs/MPSGraph_MXU_SDPA_Investigation.md Finding 4e for
+// <1% floor -- see docs/GPU_MXU_And_Convolution_Dispatch_Investigation.md Finding 4e for
 // the full scale+bias tuning trail and the remaining open question of why
 // the magnitude needed differs between the two backends.
 private func createAlternatingBiasData(channels: Int) -> Data {
@@ -301,7 +301,7 @@ final class ANECapacityEngine {
                 // as weightMag's unit-variance-per-layer convention) so typical
                 // magnitudes map to a well-resolved, non-degenerate int8 range
                 // instead of rounding to zero. See
-                // docs/MPSGraph_MXU_SDPA_Investigation.md Finding 4e. A small
+                // docs/GPU_MXU_And_Convolution_Dispatch_Investigation.md Finding 4e. A small
                 // scale alone (tried 1/8 and 1/32) only got from 100% zero
                 // down to a scale-invariant 19.6% zero -- matching MIL's own
                 // GPU INT8 path (which has always been clean, 0% zero) needed
@@ -405,7 +405,7 @@ final class ANECapacityEngine {
                 // and scale=1.0 quantize/dequantize rounds sub-0.5-magnitude
                 // activations to exactly 0, which (with no bias anywhere in
                 // this chain) is an absorbing state that fully decays the
-                // signal by L=20. docs/MPSGraph_MXU_SDPA_Investigation.md
+                // signal by L=20. docs/GPU_MXU_And_Convolution_Dispatch_Investigation.md
                 // Finding 4e.
                 let wLength = dims.outChannels * dims.inChannels * dims.kernelSize * dims.kernelSize * 2
                 let wData = createNonZeroData(byteCount: wLength, dataType: .float16, magnitude: weightMag)
@@ -509,7 +509,7 @@ final class ANECapacityEngine {
         // unaffected -- set ANE_CAPACITY_GPU_CAPTURE=1 (plus MetalCaptureEnabled
         // in Info.plist, already set) to dump a .gputrace per GPU benchmark
         // run into the app's Documents directory. Written to investigate
-        // docs/MPSGraph_MXU_SDPA_Investigation.md Finding 4e: whether FP8 and
+        // docs/GPU_MXU_And_Convolution_Dispatch_Investigation.md Finding 4e: whether FP8 and
         // INT8 convolution dispatch to different compiled GPU kernels despite
         // both nominally running the same FP16-only convolution2D op.
         var gpuCapture: MTLCaptureManager? = nil

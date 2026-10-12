@@ -1,4 +1,4 @@
-# Investigation: MXU in MetalPerformanceShadersGraph / MPSNDArray
+# Investigation: Apple GPU MXU Detection and Convolution Dispatch (MPSGraph / MPSNDArray)
 
 **Scope:** a follow-on to `MTLDevice_supportsFP8_Reverse_Engineering_Report.md`. That
 report traced `-[MTLDevice supportsFP8]`/`supportsMXU` down to Metal's own
