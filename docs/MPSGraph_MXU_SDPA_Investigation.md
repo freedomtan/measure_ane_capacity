@@ -210,7 +210,7 @@ feeds a codegen branch inside the graph optimizer/lowering passes themselves (e.
 internals, out of scope here. The cache-key role is solid; a direct codegen-dispatch
 role is plausible but unverified.
 
-## Finding 2b — live `supportsMXU()` on a real MXU-capable device returns `NO`, consistent with Finding 2's "cache key, not runtime check" framing
+## Finding 2b — resolved: `MPSGraphDeviceDescriptor.supportsMXU` disagrees with the real hardware answer, which genuinely is `YES`
 
 Findings 1/1b's chip-codename string-parsing logic was reconstructed entirely
 from static disassembly. Tested live for the first time here, on a third
@@ -259,13 +259,41 @@ capability — which is exactly what was observed. This has not been confirmed
 by disassembling `initWithMPSGraphDevice:` itself (not yet attempted), so it
 remains the leading hypothesis, not a proven mechanism.
 
+**Confirmed, not just hypothesized: the real hardware genuinely has an MXU
+here — only `MPSGraphDeviceDescriptor`'s own answer is wrong.** This
+document already has independent ground truth for the real question, from
+`MTLDeviceFeatureQueries_initWithDevice_Full_Decompilation.md`: `supportsMXU`
+is directly overridden by every AGX driver class with a hardcoded
+`mov w0,#imm; ret`, and that per-generation answer is mirrored, unmodified,
+into the cached `_featureInfo[227]`/`familySupportsMXU` byte on the public
+`MTLDeviceFeatureQueries` object. Querying all three live, on the same
+iPhone 18 Pro / A20 Pro unit, in one run:
+
+```
+[SupportsMXUProbe] Device: Apple A20 Pro GPU
+[SupportsMXUProbe] [1] [device supportsMXU]=Optional(true) [device supportsFP8]=Optional(true)
+[SupportsMXUProbe] [2] featureQueries.familySupportsMXU=Optional(true) familySupportsFP8=Optional(true)
+[SupportsMXUProbe] [3] MPSGraphDeviceDescriptor: architecture=h19p supportsMXU=Optional(false) hasANE=Optional(true)
+```
+
+**[1]** the real AGX-driver-class override and **[2]** its cached mirror both
+agree: `YES`, consistent with every empirical FP8 result in this document.
+**[3]**, `MPSGraphDeviceDescriptor`'s independent string-reparse (Finding 1),
+is the only one of the three that says `NO` — isolating the discrepancy
+entirely to that one reimplementation, exactly as the `chipCode.length == 0`
+hypothesis above predicts, and ruling out any possibility that the real
+hardware itself lacks an MXU on this unit.
+
 **Practical upshot:** code that wants to ask "does *this* device have an
-MXU" by constructing a live `MPSGraphDeviceDescriptor` from the running
-`MTLDevice` and calling `-supportsMXU` gets a meaningless/always-`NO` answer
-on at least this construction path — reinforcing Finding 2's point that this
-property is an internal compiled-cache implementation detail, not a public
-capability query, and nothing in this document's findings should be read as
-"query `supportsMXU` at runtime to detect MXU hardware."
+MXU" should call `[device supportsMXU]` (or go through the public
+`MTLDeviceFeatureQueries`/`familySupportsMXU`) directly — both give the real,
+hardware-grounded answer. Constructing a live `MPSGraphDeviceDescriptor` from
+the running `MTLDevice` and calling its `-supportsMXU` gets a
+meaningless/always-`NO` answer on at least this construction path —
+reinforcing Finding 2's point that this property is an internal
+compiled-cache implementation detail, not a public capability query, and
+nothing in this document's findings should be read as "query
+`MPSGraphDeviceDescriptor.supportsMXU` at runtime to detect MXU hardware."
 
 ## Finding 3 — what "MXU" actually stands for: unresolved, likely an external borrowing
 
@@ -1993,16 +2021,16 @@ flowchart TB
 - Whether `MPSGraphDeviceDescriptor.supportsMXU` feeds any actual codegen/lowering
   decision inside MPSGraph's optimizer passes (as opposed to only the module
   cache-key role established in Finding 2) was not traced.
-- **New, from a live third-device test (Finding 2b):** calling
-  `-supportsMXU` on a `MPSGraphDeviceDescriptor` built from the live
-  `MTLDevice` (`initWithMPSGraphDevice:`) returns `NO` even on an A20 Pro
-  unit that passes FP8 GEMM/conv dispatch tests A18 Pro structurally
-  rejects. Leading hypothesis — not disassembly-confirmed — is that this
-  constructor never populates the private `_chipCodeName` ivar Finding 1's
-  parsing logic depends on, so it trivially always returns `NO` down the
-  `chipCode.length == 0` early-exit, independent of the real hardware.
-  Disassembling `-[MPSGraphDeviceDescriptor initWithMPSGraphDevice:]`
-  itself would confirm or refute this; not attempted.
+- ~~Whether `MPSGraphDeviceDescriptor.supportsMXU` returning `NO` on a live
+  A20 Pro unit means the hardware genuinely lacks an MXU, or the
+  reimplementation is just wrong...~~ **Resolved, Finding 2b:** cross-checked
+  live against the real `-[MTLDevice supportsMXU]` ground truth (per
+  `MTLDeviceFeatureQueries_initWithDevice_Full_Decompilation.md`) and its
+  cached `featureQueries.familySupportsMXU` mirror — both say `YES` on the
+  same unit. Only `MPSGraphDeviceDescriptor`'s independent string-reparse
+  says `NO`; the hardware really does have an MXU. Still open: which exact
+  line inside `-[MPSGraphDeviceDescriptor initWithMPSGraphDevice:]` fails to
+  populate `_chipCodeName` (leading hypothesis, not disassembly-confirmed).
 - ~~The compiled AIR/`.metallib` bytecode for `sdpa_tile_fwd_16x16x16_*` itself was
   not disassembled...~~ **Resolved by Finding 4d:** `metal-objdump --metallib
   --disassemble` against the physical device's `MPSNDArray.framework/default.metallib`

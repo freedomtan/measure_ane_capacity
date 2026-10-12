@@ -2,17 +2,51 @@ import Foundation
 import Metal
 import MetalPerformanceShadersGraph
 
-/// Live runtime check of `-[MPSGraphDeviceDescriptor supportsMXU]` on this
-/// device's actual MPSGraphDevice, as a cross-check against Findings 1/1b's
-/// static disassembly (which only establishes what the code *would* do for
-/// a given chip-codename string, not that this device's codename actually
-/// parses the way assumed).
+/// Live runtime comparison of the three places `supportsMXU` can be
+/// answered, per docs/MTLDeviceFeatureQueries_initWithDevice_Full_Decompilation.md
+/// and Findings 1/1b/2/2b:
+///   1. `[device supportsMXU]` -- the real per-AGX-generation-driver-class
+///      hardcoded override (ground truth: "mov w0,#imm; ret").
+///   2. `[[device featureQueries] familySupportsMXU]` -- the cached byte on
+///      the public `MTLDeviceFeatureQueries` object, populated from (1).
+///   3. `[MPSGraphDeviceDescriptor supportsMXU]` -- MPSGraph's own
+///      independent chip-codename string-reparse (Finding 1), which Finding
+///      2b found returns NO when built via `initWithMPSGraphDevice:`.
 enum SupportsMXUProbe {
     static func run() {
         guard let device = MTLCreateSystemDefaultDevice() else {
             print("[SupportsMXUProbe] No Metal device"); return
         }
         print("[SupportsMXUProbe] Device: \(device.name)")
+
+        func rawBool(_ obj: AnyObject, _ selName: String) -> Bool? {
+            let sel = Selector((selName))
+            guard obj.responds(to: sel) else { return nil }
+            typealias Fn = @convention(c) (AnyObject, Selector) -> Bool
+            let imp = unsafeBitCast(class_getMethodImplementation(object_getClass(obj), sel), to: Fn.self)
+            return imp(obj, sel)
+        }
+        func rawObj(_ obj: AnyObject, _ selName: String) -> AnyObject? {
+            let sel = Selector((selName))
+            guard obj.responds(to: sel) else { return nil }
+            typealias Fn = @convention(c) (AnyObject, Selector) -> AnyObject?
+            let imp = unsafeBitCast(class_getMethodImplementation(object_getClass(obj), sel), to: Fn.self)
+            return imp(obj, sel)
+        }
+
+        // 1. Ground truth: the real AGX driver class's own hardcoded override.
+        let deviceSupportsMXU = rawBool(device as AnyObject, "supportsMXU")
+        let deviceSupportsFP8 = rawBool(device as AnyObject, "supportsFP8")
+        print("[SupportsMXUProbe] [1] [device supportsMXU]=\(String(describing: deviceSupportsMXU)) [device supportsFP8]=\(String(describing: deviceSupportsFP8))")
+
+        // 2. The cached byte on the public MTLDeviceFeatureQueries object.
+        if let fq = rawObj(device as AnyObject, "featureQueries") {
+            let familySupportsMXU = rawBool(fq, "familySupportsMXU")
+            let familySupportsFP8 = rawBool(fq, "familySupportsFP8")
+            print("[SupportsMXUProbe] [2] featureQueries.familySupportsMXU=\(String(describing: familySupportsMXU)) familySupportsFP8=\(String(describing: familySupportsFP8))")
+        } else {
+            print("[SupportsMXUProbe] [2] -featureQueries not available on this device")
+        }
 
         let gDevice = MPSGraphDevice(mtlDevice: device)
 
@@ -52,6 +86,6 @@ enum SupportsMXUProbe {
         let arch = stringProp("architecture") ?? "<unavailable>"
         let supportsMXU = boolProp("supportsMXU")
         let hasANE = boolProp("hasANE")
-        print("[SupportsMXUProbe] architecture=\(arch) supportsMXU=\(String(describing: supportsMXU)) hasANE=\(String(describing: hasANE))")
+        print("[SupportsMXUProbe] [3] MPSGraphDeviceDescriptor: architecture=\(arch) supportsMXU=\(String(describing: supportsMXU)) hasANE=\(String(describing: hasANE))")
     }
 }
