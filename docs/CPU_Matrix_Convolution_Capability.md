@@ -250,6 +250,81 @@ Final results table, all platforms and both ops:
 | Matmul 1024³×L20 | A20 Pro (iPhone 18 Pro) | 17.93 TOPS | 9.20 TOPS | 3.89 TOPS |
 | Conv 256²/128ch/3×3×L20 | M4 Pro (Mac) | — | — | 3.09 TOPS |
 
+## Finding 6 — does the CoreML CPU matmul path use AMX, SME2, or plain NEON?
+
+(There is no SSE2 on Apple Silicon at all — that's an x86 Intel ISA. The real question is whether
+the CPU GEMM reaches Apple's private AMX matrix coprocessor, ARM's newer official SME/SME2
+extension, or falls back to plain NEON SIMD loops.)
+
+**Confirmed the call path with `sample`:** ran `measure_matmul_coreml --units cpu` with a long
+iteration count in the background and sampled the live process for 3 seconds. Every hot-path
+stack bottoms out at:
+
+```
+main -> runBenchmark -> ... -> E5RT::Ops::BnnsCpuInferenceOperation::...
+       -> BNNSGraphContextExecute_v2 (libBNNS.dylib) -> ??? (stripped, in libBNNS.dylib)
+```
+
+So CoreML's CPU compute unit, for this workload, really does go through Accelerate's BNNS
+(Basic Neural Network Subroutines), not a generic/naive loop. The deepest frames inside
+`libBNNS.dylib` are stripped of symbol names (`???` in the sample output), so the exact leaf
+kernel wasn't directly visible this way.
+
+**Found the real answer in `libBNNS.dylib`'s own string literals.** Disassembled the library
+(the standalone, non-shared-cache copy at
+`.../ios-hacking/disassm/extracted/.../vecLib.framework/Versions/A/libBNNS.dylib`, via
+`otool -tv`, ~4.5M lines) and grepped for every `"KERNEL_..."` string — these are BNNS's internal
+kernel-selection enum names, baked in as literal strings for logging/error messages. For
+GEMM/MatMul specifically:
+
+```
+KERNEL_GEMM_NEON / KERNEL_GEMM_NEON_DYNAMIC
+KERNEL_GEMM_MLA1 / MLA1_DYNAMIC
+KERNEL_GEMM_MLA2 / MLA2_DYNAMIC
+KERNEL_GEMM_MLA3 / MLA3_DYNAMIC
+KERNEL_GEMM_SME2 / SME2_DYNAMIC
+KERNEL_GEMM_INTEL64 / INTEL64_DYNAMIC        (Rosetta/x86 fallback, irrelevant here)
+KERNEL_MATMUL_{NEON,MLA1,MLA2,MLA3,SME2,SME2P1,INTEL64}[_DYNAMIC]
+KERNEL_SPARSE_MATMUL_{NEON,AMX2,AMX3,SME2P1}[_DYNAMIC]
+```
+
+The sparse-matmul family names its matrix-coprocessor tiers **`AMX2`/`AMX3`** explicitly; other
+strings elsewhere in the binary reference `"combo_dodge_v2_amx3"`,
+`"BNNS transpose2d_amx1/2/3, unsupported data types"`, and
+`"dynamic_prep_and_execute_copy ... dispatching of AMX copies"`. The dense GEMM/MatMul family uses
+a **different label, `MLA1`/`MLA2`/`MLA3`**, for what is almost certainly the same hardware
+block under a different internal name (the numbering lines up with the sparse path's `AMX2`/`AMX3`,
+and `MLA1` for an even older/first-generation tier) — not confirmed by name alone, but strongly
+suggested by the parallel structure. **So: yes, BNNS has a real, named, non-NEON matrix-coprocessor
+kernel tier for GEMM — it isn't just NEON SIMD loops.**
+
+**This chip (M4 Pro) also exposes ARM's official SME/SME2 extension, confirmed via `sysctl`:**
+
+```
+hw.optional.arm.FEAT_SME: 1
+hw.optional.arm.FEAT_SME2: 1
+hw.optional.arm.FEAT_SME2p1: 0
+hw.optional.neon: 1
+```
+
+No equivalent public sysctl exists for AMX (expected — Apple has never documented or exposed it,
+consistent with the entire private-SPI theme of this repo's other findings). Given `KERNEL_GEMM_SME2`
+exists as a named tier and this hardware genuinely has `FEAT_SME2`, the most likely real answer for
+this specific chip is that dense FP16 GEMM here runs through the **public SME2** path rather than
+the private legacy AMX tiers (`MLA1`/`MLA2`/`MLA3` plausibly exist for M1–M3-era chips that predate
+SME2 silicon) — but this is an informed inference from kernel-naming conventions and hardware
+capability bits, **not a direct runtime observation of which kernel actually got dispatched**.
+
+**What would close this out, not attempted:** `bnns_graph.h` exposes a public
+`BNNSGraphContextSetMessageLogCallback`/`SetMessageLogMask` API (default mask is
+`Unsupported|Warning|Error`, excluding `Info`) that could, in principle, surface the selected
+kernel name directly if raised to `Info` and wired into a standalone BNNS test harness built
+outside CoreML (CoreML's own `E5RT` context isn't ours to configure this way). Also not attempted:
+single-stepping into the stripped leaf kernel via `lldb` while the benchmark runs, to directly
+observe AMX/SME instruction encodings (ARM disassemblers typically don't have AMX mnemonics at
+all, since it's unofficial silicon, so this would mean recognizing raw opcode byte patterns by
+hand). Both are flagged as follow-ups, not done here.
+
 ## Not pursued here
 
 - Disassembling `applyOptimizationPassesWithDevice:` to confirm the nil-`metalDeviceName`
