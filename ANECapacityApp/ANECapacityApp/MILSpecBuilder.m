@@ -12,6 +12,7 @@
 NSString *const MILSpecBuilderErrorDomain = @"MILSpecBuilder";
 
 // MIL Data Types
+static const uint32_t kMIL_BOOL = 1;
 static const uint32_t kMIL_STRING = 2;
 static const uint32_t kMIL_FLOAT16 = 10;
 static const uint32_t kMIL_INT8 = 21;
@@ -181,6 +182,24 @@ static ProtoWriter *makeInt32Value(NSArray<NSNumber *> *vals, BOOL scalar) {
     [val writeMessageField:2 message:makeTensorType(kMIL_INT32, shape)];
     [val writeMessageField:3 message:iv];
     return val;
+}
+
+static ProtoWriter *makeBoolScalarValue(BOOL val) {
+    ProtoWriter *packedBools = [[ProtoWriter alloc] init];
+    [packedBools writeVarint:val ? 1 : 0];
+    ProtoWriter *repBools = [[ProtoWriter alloc] init];
+    [repBools writeBytesField:1 bytes:packedBools.data];
+
+    ProtoWriter *tv = [[ProtoWriter alloc] init];
+    [tv writeMessageField:3 message:repBools]; // bools = 3
+
+    ProtoWriter *iv = [[ProtoWriter alloc] init];
+    [iv writeMessageField:1 message:tv];
+
+    ProtoWriter *valProto = [[ProtoWriter alloc] init];
+    [valProto writeMessageField:2 message:makeTensorType(kMIL_BOOL, @[])];
+    [valProto writeMessageField:3 message:iv];
+    return valProto;
 }
 
 static ProtoWriter *makeFloat16ScalarValue(uint16_t bits) {
@@ -401,6 +420,42 @@ static NSData *generateWeightsFP16(MILConvChainConfig config) {
     return data;
 }
 
+static NSData *generateWeightsMatmulFP16(MILMatmulChainConfig config) {
+    size_t count = config.batch * config.K * config.N;
+    NSMutableData *data = [NSMutableData dataWithLength:count * sizeof(uint16_t)];
+    uint16_t *p = (uint16_t *)data.mutableBytes;
+
+    double weightMag = 0.96 / sqrt((double)(config.K > 0 ? config.K : 1));
+
+    if (config.weightMode == MILWeightModeRepeat) {
+        _Float16 p0 = (_Float16)(weightMag * 0.85);
+        _Float16 p1 = (_Float16)(-weightMag * 0.95);
+        _Float16 p2 = (_Float16)(weightMag * 1.05);
+        _Float16 p3 = (_Float16)(-weightMag * 1.15);
+        uint16_t pattern[4];
+        memcpy(&pattern[0], &p0, sizeof(uint16_t));
+        memcpy(&pattern[1], &p1, sizeof(uint16_t));
+        memcpy(&pattern[2], &p2, sizeof(uint16_t));
+        memcpy(&pattern[3], &p3, sizeof(uint16_t));
+        for (size_t i = 0; i < count; i++) p[i] = pattern[i % 4];
+    } else {
+        uint64_t state = kWeightSeed;
+        for (size_t i = 0; i < count; i++) {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            float tier = (float)((state >> 1) & 3);
+            float mag = (float)(weightMag * (0.85 + tier * 0.10));
+            _Float16 val = (_Float16)mag;
+            uint16_t posBits = 0;
+            memcpy(&posBits, &val, sizeof(uint16_t));
+            uint16_t negBits = posBits | 0x8000;
+            p[i] = (state & 1) ? negBits : posBits;
+        }
+    }
+    return data;
+}
+
 static NSData *generateWeightsINT8(MILConvChainConfig config) {
     size_t count = config.channelsOut * config.channelsIn * config.kernel * config.kernel;
     NSMutableData *data = [NSMutableData dataWithLength:count * sizeof(int8_t)];
@@ -591,6 +646,142 @@ NSData *MILBuildConvChainSpec(MILConvChainConfig config, NSError **error) {
         @"workload.kernel": [NSString stringWithFormat:@"%lu", (unsigned long)config.kernel],
         @"workload.layers": [NSString stringWithFormat:@"%lu", (unsigned long)config.layers],
         @"workload.precision": MILPrecisionName(config.precision),
+        @"builder": @"MILSpecBuilder (native Objective-C, zero-dependency)"
+    };
+    for (NSString *key in userDefined) {
+        ProtoWriter *entry = [[ProtoWriter alloc] init];
+        [entry writeStringField:1 string:key];
+        [entry writeStringField:2 string:userDefined[key]];
+        [metadata writeMessageField:100 message:entry];
+    }
+    [desc writeMessageField:100 message:metadata];
+
+    // Model
+    ProtoWriter *model = [[ProtoWriter alloc] init];
+    [model writeVarintField:1 val:specVersion];
+    [model writeMessageField:2 message:desc];
+    [model writeMessageField:502 message:program];
+
+    return model.data;
+}
+
+#pragma mark - Matmul chain (ported from the repo-root MILSpecBuilder.mm)
+
+NSString *MILMatmulChainInputName(void) { return @"x"; }
+
+NSString *MILMatmulChainOutputName(MILMatmulChainConfig config) {
+    return [NSString stringWithFormat:@"matmul_%lu", (unsigned long)(config.layers - 1)];
+}
+
+NSData *MILBuildMatmulChainSpec(MILMatmulChainConfig config, NSError **error) {
+    if (config.batch == 0 || config.M == 0 || config.K == 0 || config.N == 0 || config.layers == 0) {
+        if (error) {
+            *error = [NSError errorWithDomain:MILSpecBuilderErrorDomain code:1 userInfo:@{NSLocalizedDescriptionKey: @"Dimensions must be greater than zero."}];
+        }
+        return nil;
+    }
+    if (config.layers > 1 && config.K != config.N) {
+        if (error) {
+            *error = [NSError errorWithDomain:MILSpecBuilderErrorDomain code:2 userInfo:@{NSLocalizedDescriptionKey: @"chained layers require k == n."}];
+        }
+        return nil;
+    }
+
+    NSString *opset = @"CoreML8";
+    int32_t specVersion = 9;
+
+    NSString *finalOut = MILMatmulChainOutputName(config);
+    NSArray *inShape = @[@(config.batch), @1, @(config.M), @(config.K)];
+    NSArray *wShape = @[@(config.batch), @1, @(config.K), @(config.N)];
+    NSArray *outShape = @[@(config.batch), @1, @(config.M), @(config.N)];
+
+    ProtoWriter *block = [[ProtoWriter alloc] init];
+    [block writeStringField:2 string:finalOut]; // outputs = 2
+
+    NSData *wData = generateWeightsMatmulFP16(config);
+    ProtoWriter *wVal = makeBytesTensorValue(kMIL_FLOAT16, wShape, wData);
+    [block writeMessageField:3 message:makeConstOp(@"weights", makeTensorType(kMIL_FLOAT16, wShape), wVal)];
+
+    // matmul's transpose_x/transpose_y are "optional, default False" only at
+    // coremltools' Python mb.matmul() builder level -- the compiled
+    // MLProgram itself requires them present (confirmed via the repo-root
+    // test harness: the compiler otherwise rejects the op with "Required
+    // param 'transpose_y' is missing").
+    [block writeMessageField:3 message:makeConstOp(@"no_transpose", makeTensorType(kMIL_BOOL, @[]), makeBoolScalarValue(NO))];
+
+    ProtoWriter *outType = makeTensorType(kMIL_FLOAT16, outShape);
+
+    NSString *curr = MILMatmulChainInputName();
+    for (NSUInteger i = 0; i < config.layers; i++) {
+        NSString *mName = [NSString stringWithFormat:@"matmul_%lu", (unsigned long)i];
+        NSDictionary *inputs = @{
+            @"x": curr,
+            @"y": @"weights",
+            @"transpose_x": @"no_transpose",
+            @"transpose_y": @"no_transpose"
+        };
+        [block writeMessageField:3 message:makeNonConstOp(@"matmul", mName, outType, inputs)];
+        curr = mName;
+    }
+
+    // Function
+    ProtoWriter *function = [[ProtoWriter alloc] init];
+    [function writeMessageField:1 message:makeNamedValueType(MILMatmulChainInputName(), makeTensorType(kMIL_FLOAT16, inShape))];
+    [function writeStringField:2 string:opset];
+
+    ProtoWriter *bsEntry = [[ProtoWriter alloc] init];
+    [bsEntry writeStringField:1 string:opset];
+    [bsEntry writeMessageField:2 message:block];
+    [function writeMessageField:3 message:bsEntry];
+
+    // Program
+    ProtoWriter *program = [[ProtoWriter alloc] init];
+    [program writeVarintField:1 val:1];
+
+    ProtoWriter *fnEntry = [[ProtoWriter alloc] init];
+    [fnEntry writeStringField:1 string:@"main"];
+    [fnEntry writeMessageField:2 message:function];
+    [program writeMessageField:2 message:fnEntry];
+
+    // ModelDescription
+    ProtoWriter *desc = [[ProtoWriter alloc] init];
+    {
+        ProtoWriter *fd = [[ProtoWriter alloc] init];
+        [fd writeStringField:1 string:MILMatmulChainInputName()];
+        ProtoWriter *aft = [[ProtoWriter alloc] init];
+        for (NSNumber *d in inShape) [aft writeVarintField:1 val:d.longLongValue];
+        [aft writeVarintField:2 val:65552]; // FLOAT16
+        ProtoWriter *ft = [[ProtoWriter alloc] init];
+        [ft writeMessageField:5 message:aft];
+        [fd writeMessageField:3 message:ft];
+        [desc writeMessageField:1 message:fd];
+    }
+    {
+        ProtoWriter *fd = [[ProtoWriter alloc] init];
+        [fd writeStringField:1 string:finalOut];
+        ProtoWriter *aft = [[ProtoWriter alloc] init];
+        for (NSNumber *d in outShape) [aft writeVarintField:1 val:d.longLongValue];
+        [aft writeVarintField:2 val:65552]; // FLOAT16
+        ProtoWriter *ft = [[ProtoWriter alloc] init];
+        [ft writeMessageField:5 message:aft];
+        [fd writeMessageField:3 message:ft];
+        [desc writeMessageField:10 message:fd];
+    }
+
+    // Metadata
+    ProtoWriter *metadata = [[ProtoWriter alloc] init];
+    NSString *summary = [NSString stringWithFormat:@"%lux matmul [%lu, 1, %lu, %lu] x [%lu, 1, %lu, %lu]",
+                         (unsigned long)config.layers, (unsigned long)config.batch,
+                         (unsigned long)config.M, (unsigned long)config.K,
+                         (unsigned long)config.batch, (unsigned long)config.K, (unsigned long)config.N];
+    [metadata writeStringField:1 string:summary];
+
+    NSDictionary<NSString *, NSString *> *userDefined = @{
+        @"workload.batch": [NSString stringWithFormat:@"%lu", (unsigned long)config.batch],
+        @"workload.m": [NSString stringWithFormat:@"%lu", (unsigned long)config.M],
+        @"workload.k": [NSString stringWithFormat:@"%lu", (unsigned long)config.K],
+        @"workload.n": [NSString stringWithFormat:@"%lu", (unsigned long)config.N],
+        @"workload.layers": [NSString stringWithFormat:@"%lu", (unsigned long)config.layers],
         @"builder": @"MILSpecBuilder (native Objective-C, zero-dependency)"
     };
     for (NSString *key in userDefined) {

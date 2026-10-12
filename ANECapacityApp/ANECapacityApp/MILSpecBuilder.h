@@ -50,4 +50,25 @@ FOUNDATION_EXPORT BOOL MILBuildNativeModelPackage(MILConvChainConfig config, NSU
 /// with MILBlob DataType 16, constexpr_blockwise_shift_scale, and activation QDQ.
 FOUNDATION_EXPORT BOOL MILBuildNativeFP8ModelPackage(MILConvChainConfig config, NSURL *outputDirectoryURL, NSError **error);
 
+/// A chain of `layers` [batch,1,M,K] x [batch,1,K,N] -> [batch,1,M,N] matmuls
+/// sharing one dense-mode weight constant, mirroring the C++
+/// MILSpecBuilder.mm's MILMatmulChainConfig (see the main repo's
+/// docs/CPU_Matrix_Convolution_Capability.md). FP16 only. Chaining requires
+/// K == N, same reasoning as the conv chain's channelsIn == channelsOut.
+typedef struct {
+    NSUInteger batch;
+    NSUInteger M;
+    NSUInteger K;
+    NSUInteger N;
+    NSUInteger layers;
+    MILWeightMode weightMode;
+} MILMatmulChainConfig;
+
+FOUNDATION_EXPORT NSString *MILMatmulChainInputName(void);
+FOUNDATION_EXPORT NSString *MILMatmulChainOutputName(MILMatmulChainConfig config);
+
+/// Emits the raw bytes of a CoreML Model specification (.mlmodel) dynamically.
+/// Returns nil and fills `error` if any dimension is zero, or if K != N.
+FOUNDATION_EXPORT NSData *_Nullable MILBuildMatmulChainSpec(MILMatmulChainConfig config, NSError **error);
+
 NS_ASSUME_NONNULL_END

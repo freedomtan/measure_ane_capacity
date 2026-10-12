@@ -178,6 +178,55 @@ Updated results table (both ops, all three CoreML compute units, this M4 Pro):
 MPSGraph ANE/GPU numbers from the main table earlier in this doc are the trustworthy ones for
 those two cells.)
 
+## Finding 5 — the CoreML/MIL matmul path works on real iPhones too, both chips
+
+Ported the matmul chain builder into `ANECapacityApp`'s own, independent `MILSpecBuilder.m` — a
+pure-Objective-C, zero-dependency reimplementation that hand-encodes the protobuf wire format
+directly (no C++ protobuf library, which can't go into an iOS app bundle the way the repo-root
+`MILSpecBuilder.mm` does). Added `MILMatmulChainConfig`/`MILBuildMatmulChainSpec`/
+`MILMatmulChainInputName`/`OutputName`, mirroring the C++ version field-for-field (same MIL.proto
+schema, so the same `const`/`matmul` op structure, the same `no_transpose` `BOOL` const
+work-around from Finding 4). A new `NativeCoreMLMatmulProbe.swift`
+(`--native-coreml-matmul`) builds the spec, compiles it via `MLModel.compileModel(at:)`, and
+benchmarks all three CoreML compute units in one run — unlike the `MPSGraphDevice.CPUDevice`
+probes, CoreML doesn't crash on any of them, so no per-target process isolation is needed here.
+
+Ran on both physical iPhones:
+
+```
+# iPhone 16 Pro (A18 Pro)
+[CoreML ANE FP16] Load: 14077.23 ms, Avg: 3.35 ms,  Speed: 12.8122 TOPS (298.3 FPS)
+[CoreML GPU FP16] Load: 9336.53 ms,  Avg: 28.61 ms, Speed: 1.5013 TOPS (35.0 FPS)
+[CoreML CPU FP16] Load: 2645.87 ms,  Avg: 15.60 ms, Speed: 2.7526 TOPS (64.1 FPS)
+
+# iPhone 18 Pro (A20 Pro)
+[CoreML ANE FP16] Load: 13374.08 ms, Avg: 2.40 ms,  Speed: 17.9289 TOPS (417.4 FPS)
+[CoreML GPU FP16] Load: 6157.91 ms,  Avg: 4.67 ms,  Speed: 9.2017 TOPS (214.2 FPS)
+[CoreML CPU FP16] Load: 1759.73 ms,  Avg: 11.05 ms, Speed: 3.8883 TOPS (90.5 FPS)
+```
+
+All six runs (two chips × three compute units) report finite, non-degenerate output (`--check`-
+equivalent output-range logging built into the probe). **First real CPU matmul numbers on actual
+iPhone silicon: 2.75 TOPS (A18 Pro), 3.89 TOPS (A20 Pro).**
+
+Notably, the M4 Pro's "CPU beats GPU at matmul" surprise from Finding 4 does **not** reproduce on
+either phone — on both iPhones, GPU and CPU are much closer to the M4 Pro's conv-case ordering
+(ANE > GPU > CPU on A20 Pro; on A18 Pro, GPU is unusually slow — 1.50 TOPS, even behind CPU's 2.75
+TOPS, which does partially echo the M4 Pro pattern but for a different, memory/load-time-shaped
+reason that wasn't investigated: A18 Pro's GPU load time, 9.3s, is disproportionately long relative
+to its own avg latency, hinting at compile/specialization overhead rather than genuine compute
+throughput — not confirmed). The M4 Pro result should be treated as a Mac-specific or small-sample
+artifact, not a general "CoreML CPU matmul beats GPU matmul" rule.
+
+Final results table, all platforms and both ops:
+
+| Workload | Platform | ANE FP16 | GPU FP16 | CPU FP16 |
+|---|---|---|---|---|
+| Matmul 1024³×L20 | M4 Pro (Mac) | 15.11 TOPS | 6.13 TOPS | 6.62 TOPS |
+| Matmul 1024³×L20 | A18 Pro (iPhone 16 Pro) | 12.81 TOPS | 1.50 TOPS | 2.75 TOPS |
+| Matmul 1024³×L20 | A20 Pro (iPhone 18 Pro) | 17.93 TOPS | 9.20 TOPS | 3.89 TOPS |
+| Conv 256²/128ch/3×3×L20 | M4 Pro (Mac) | — | — | 3.09 TOPS |
+
 ## Not pursued here
 
 - Disassembling `applyOptimizationPassesWithDevice:` to confirm the nil-`metalDeviceName`

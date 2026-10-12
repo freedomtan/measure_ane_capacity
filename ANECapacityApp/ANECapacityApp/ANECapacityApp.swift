@@ -33,6 +33,12 @@ struct ANECapacityApp: App {
                 exit(0)
             }
         }
+        if ProcessInfo.processInfo.arguments.contains("--native-coreml-matmul") {
+            DispatchQueue.global().async {
+                NativeCoreMLMatmulProbe.run()
+                exit(0)
+            }
+        }
     }
 
     var body: some Scene {
