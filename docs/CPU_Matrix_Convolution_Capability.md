@@ -618,6 +618,78 @@ have an INT8-weight variant exposed on this path at all, while the older AMX-bas
 constant) and reach a faster, modern quantized kernel is the natural next question — not attempted
 here.
 
+## Finding 12 — BNNSGraphCompileFromFile, the modern API, reaches the real SME2 kernel even with a genuinely non-foldable INT8 weight
+
+Finding 11's natural follow-up: `BNNSGraphCompileFromFile` is the modern graph-execution API (macOS
+15/iOS 18+) CoreML's own `E5RT` backend calls internally — the exact function Finding 6 traced the
+live call chain into. It takes a compiled `.mlmodelc`, not raw MIL text, so the plan is: build a MIL
+spec whose weight is a genuine function **input** (not a `const`, unlike Finding 10's folded-away
+`INT8WeightOnly`), compile it with the normal CoreML compiler (`MLModel.compileModelAtURL:` — still
+needed just to produce the `.mlmodelc` artifact), then execute that artifact directly through
+`BNNSGraphCompileFromFile` + `BNNSGraphContextExecute`, with no `MLModel`/`MLFeatureProvider`
+anywhere in the execution path at all. New builder function `MILBuildMatmulWeightInputSpec` and
+harness `bnns_graph_matmul_probe.m`.
+
+**Hit CoreML's top-level I/O type restriction immediately.** `FeatureTypes.proto`'s
+`ArrayFeatureType.ArrayDataType` only has `FLOAT32`/`DOUBLE`/`INT32`/`FLOAT16` — there is no `INT8`
+option at the model-boundary level, confirmed by the compiler rejecting a declared-INT8 model input
+("Model input ... has a different type than its corresponding parameter to main") even though INT8
+is completely normal as an *internal* MIL tensor type (used throughout Findings 7/8/10's
+constexpr/dequantize ops). **Worked around it**: declare the weight as an `INT32` model input, and
+make `cast(x=weights_in, dtype="int8")` the function's first op — genuinely non-constant (there is
+still nothing here for the compiler to fold; it's a real runtime input) but legal at the model
+boundary. `dequantize` then runs on that cast INT8 tensor, same as before, feeding `matmul`.
+
+**Two debugging dead ends worth recording**, both of which produced *wrong output with no error*,
+not a clean failure:
+- The naive "copy the compiled model to a stable path" step (mirroring every other CLI in this
+  repo) silently self-destructed: `MLModel.compileModelAtURL:`'s default output path and this
+  probe's own computed "destination" path both land in `NSTemporaryDirectory()` with the same
+  name-derivation rule, so `removeItemAtURL:` on the "destination" deletes the compiler's own
+  output *before* the copy runs. Fix: skip the copy, use the compiler's own output URL directly.
+- `BNNSGraphContextExecute` silently produced `inf` in every output element with `rc == 0` (no
+  error) when given a `malloc()`-returned workspace buffer — the API requires a **page-aligned**
+  workspace (documented, easy to miss) and apparently doesn't validate alignment before using it.
+  Fix: `posix_memalign(&workspace, 16384, workspaceSize)`. Caught the *other* half of this bug
+  class (wrong argument count/size instead of alignment) by wiring
+  `BNNSGraphContextSetMessageLogCallback`/`SetMessageLogMask` — raising the mask to include
+  `BNNSGraphMessageLevelInfo` surfaced `"BNNS: Provided workspace is not page-aligned"` directly,
+  which is how the alignment requirement was found at all.
+- **Correctness confirmed by hand** on tiny cases afterward: `M=1,K=8,N=1` all-ones input/weight
+  gives exactly `8`; `M=K=N=2` all-ones gives exactly `2` everywhere; the INT8-via-cast path with
+  weight values of `32` (scale `1/32` → real value `1.0`) and `K=4` ones-input gives exactly `4`.
+
+**Results (1024³, single matmul call, no chaining, averaged over 2000 iterations, no concurrent
+profiling — an initial 8000-iteration trial run *while* `sample` was concurrently profiling the same
+process skewed the INT8 number to looking 2.2× slower; these numbers are from clean, unprofiled
+runs and were reproduced three times):**
+
+| | Avg | TOPS |
+|---|---|---|
+| BNNSGraph, FP16 weight-input | 0.321 ms | 6.68 |
+| BNNSGraph, INT8 weight-input (cast+dequantize) | 0.394 ms | 5.46 |
+
+**Only ~22% slower than FP16** — nowhere near Finding 11's legacy `BNNSFilterCreateLayerFullyConnected`
+path, which was over 2× slower for the equivalent comparison. Sampling a sustained run and resolving
+the hottest address (`libBNNS.dylib + 0xa74b60`, 3167 of ~4400 total samples) against the
+function-start table from Finding 6 confirms it lands inside **the exact same function**
+(`libBNNS.dylib + 0xa73ca4`/static address `0x18f6e0ca4`) already identified there as the real SME2
+kernel (`smstart za`, `ldr zt0`, `luti4`, `fmopa`). **The INT8-weight-input case reaches the same
+modern SME2 kernel as the plain FP16 case** — the ~22% gap is the cost of the `cast`+`dequantize`
+preprocessing passes over the 1M-element weight tensor, not a different, slower kernel the way
+Finding 11's legacy AMX path was.
+
+**Net result: `BNNSGraphCompileFromFile` is a materially better way to reach BNNS with a genuinely
+non-foldable low-precision weight than either of Finding 11's legacy `bnns.h` entry points.**
+`BNNSMatMul` rejected INT8 outright; `BNNSFilterCreateLayerFullyConnected` accepted it but paid for
+it with a 2×+ regression into a pre-SME2 AMX microkernel. The modern graph API accepts a genuinely
+runtime-variable INT8 (via the INT32-boundary/cast workaround) and dispatches the *same* fast SME2
+kernel the FP16 case uses, paying only the dequantize preprocessing cost — the smallest, most
+honest "quantization overhead" number found anywhere in this investigation. This also means
+Finding 10's constant-folding result and Finding 11's legacy-AMX result were both, in their own
+way, artifacts of *which API* was used to reach BNNS, not fundamental limits on what the hardware
+or BNNS's modern kernel set can do with INT8.
+
 ## Not pursued here
 
 - Disassembling `applyOptimizationPassesWithDevice:` to confirm the nil-`metalDeviceName`

@@ -118,3 +118,28 @@ FOUNDATION_EXPORT NSData *MILBuildMatmulChainSpec(MILMatmulChainConfig config,
 /// MIL-text-style dump of the program that MILBuildMatmulChainSpec emits, for
 /// eyeballing the graph without a protobuf decoder.
 FOUNDATION_EXPORT NSString *MILMatmulChainText(MILMatmulChainConfig config);
+
+/// A single `[M, K] x [K, N] -> [M, N]` matmul whose *weight* is a genuine
+/// function **input**, not a `const`/`constexpr_*` -- unlike
+/// MILMatmulChainConfig's INT8/FP8 modes, there is nothing here for the MIL
+/// compiler to constant-fold (see docs/CPU_Matrix_Convolution_Capability.md
+/// Finding 10). If `weightIsInt8` is true, the weight input is INT8 and is
+/// `dequantize`d (scale 1/32) before the matmul; otherwise the weight input
+/// is FP16 and feeds the matmul directly. Built for use with
+/// `BNNSGraphCompileFromFile` (Finding 11's natural follow-up): compile the
+/// resulting spec's `.mlmodelc` and execute it directly through BNNSGraph,
+/// supplying the weight tensor at call time so no compiler or loader ever
+/// sees it as fixed data.
+typedef struct {
+  NSUInteger M;
+  NSUInteger K;
+  NSUInteger N;
+  BOOL weightIsInt8;
+} MILMatmulWeightInputConfig;
+
+FOUNDATION_EXPORT NSString *MILMatmulWeightInputXName(void);
+FOUNDATION_EXPORT NSString *MILMatmulWeightInputWeightName(void);
+FOUNDATION_EXPORT NSString *MILMatmulWeightInputOutputName(void);
+
+FOUNDATION_EXPORT NSData *_Nullable MILBuildMatmulWeightInputSpec(
+    MILMatmulWeightInputConfig config, NSError **error);

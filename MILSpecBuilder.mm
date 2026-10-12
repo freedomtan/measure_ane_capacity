@@ -908,3 +908,92 @@ NSString *MILMatmulChainText(MILMatmulChainConfig config) {
   [text appendFormat:@"  -> %@\n", current];
   return text;
 }
+
+NSString *MILMatmulWeightInputXName(void) { return @"x"; }
+NSString *MILMatmulWeightInputWeightName(void) { return @"weights_in"; }
+NSString *MILMatmulWeightInputOutputName(void) { return @"y"; }
+
+NSData *MILBuildMatmulWeightInputSpec(MILMatmulWeightInputConfig config, NSError **error) {
+  if (config.M == 0 || config.K == 0 || config.N == 0) {
+    if (error) *error = MILError(1, @"M, K, and N must be non-zero");
+    return nil;
+  }
+
+  const std::vector<uint64_t> xShape = {1, 1, config.M, config.K};
+  const std::vector<uint64_t> weightShape = {1, 1, config.K, config.N};
+  const std::vector<uint64_t> outputShape = {1, 1, config.M, config.N};
+  const std::string xName = MILMatmulWeightInputXName().UTF8String;
+  const std::string weightName = MILMatmulWeightInputWeightName().UTF8String;
+  const std::string outputName = MILMatmulWeightInputOutputName().UTF8String;
+
+  ms::Model model;
+  model.set_specificationversion(kSpecificationVersion);
+
+  ms::ModelDescription *description = model.mutable_description();
+  SetArrayFeature(description->add_input(), xName, xShape);
+  // CoreML's top-level ModelDescription I/O contract (FeatureTypes.proto's
+  // ArrayFeatureType.ArrayDataType) only supports FLOAT32/DOUBLE/INT32/FLOAT16
+  // -- there is no INT8 option at this boundary, confirmed by the compiler
+  // rejecting a declared-INT8 model input ("Model input ... has a different
+  // type than its corresponding parameter to main") even though INT8 is a
+  // perfectly normal *internal* MIL tensor type (used throughout Finding
+  // 7/8/10's constexpr/dequantize ops). So the INT8 case declares an INT32
+  // model input and `cast`s it to INT8 as the function's first op --
+  // genuinely non-constant (nothing to fold) but legal at the model boundary.
+  {
+    ms::FeatureDescription *weightFeature = description->add_input();
+    weightFeature->set_name(weightName);
+    ms::ArrayFeatureType *array = weightFeature->mutable_type()->mutable_multiarraytype();
+    array->set_datatype(config.weightIsInt8 ? ms::ArrayFeatureType::INT32
+                                            : ms::ArrayFeatureType::FLOAT16);
+    for (uint64_t dim : weightShape) array->add_shape((int64_t)dim);
+  }
+  SetArrayFeature(description->add_output(), outputName, outputShape);
+
+  mil::Program *program = model.mutable_mlprogram();
+  program->set_version(1);
+
+  mil::Function &function = (*program->mutable_functions())["main"];
+  function.set_opset(kOpset);
+
+  mil::NamedValueType *xInput = function.add_inputs();
+  xInput->set_name(xName);
+  SetTensorType(xInput->mutable_type(), mil::FLOAT16, xShape);
+
+  mil::NamedValueType *weightInput = function.add_inputs();
+  weightInput->set_name(weightName);
+  SetTensorType(weightInput->mutable_type(), config.weightIsInt8 ? mil::INT32 : mil::FLOAT16,
+               weightShape);
+
+  mil::Block &block = (*function.mutable_block_specializations())[kOpset];
+  block.add_outputs(outputName);
+
+  AddConstOp(&block, "no_transpose", TensorValueType(mil::BOOL, {}), BoolScalarValue(false));
+
+  std::string matmulWeight = weightName;
+  if (config.weightIsInt8) {
+    AddConstOp(&block, "cast_dtype_int8", StringScalarType(), StringValue("int8"));
+    AddOp(&block, "cast", {{"x", weightName}, {"dtype", "cast_dtype_int8"}}, "weights_int8",
+          TensorValueType(mil::INT8, weightShape));
+
+    AddConstOp(&block, "weight_scale", TensorValueType(mil::FLOAT16, {}),
+               Float16ScalarValue(kFP16PlusOneThirtySecond));
+    AddOp(&block, "dequantize", {{"input", "weights_int8"}, {"scale", "weight_scale"}}, "weights",
+          TensorValueType(mil::FLOAT16, weightShape));
+    matmulWeight = "weights";
+  }
+
+  AddOp(&block, "matmul",
+       {{"x", xName},
+        {"y", matmulWeight},
+        {"transpose_x", "no_transpose"},
+        {"transpose_y", "no_transpose"}},
+       outputName, TensorValueType(mil::FLOAT16, outputShape));
+
+  std::string serialized;
+  if (!model.SerializeToString(&serialized)) {
+    if (error) *error = MILError(3, @"failed to serialize the model spec");
+    return nil;
+  }
+  return [NSData dataWithBytes:serialized.data() length:serialized.size()];
+}
