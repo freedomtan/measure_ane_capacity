@@ -427,17 +427,24 @@ reverse-engineering of the dispatcher instead.)
 directly) and re-ran the live `lldb` dual-breakpoint check from Finding 12/the correction above,
 breakpoints on both the AMX kernel (`0x18f0623a4`) and the SME2 wrapper (`0x18f6f8128`,
 single-caller-confirmed) simultaneously. Result: **298 hits on the AMX breakpoint, 0 hits on the
-SME2 breakpoint** — the fused graph takes the exact same AMX path as the bare matmul. Most likely
-explanation: CoreML's optimizer doesn't actually *fuse* a plain MIL `matmul` immediately followed
-by a plain `relu` into one combined BNNS op at all — they probably stay two separate ops/BNNS
-calls (an unfused matmul, then a separate elementwise relu pass), so the matmul node BNNS sees is
-identical to the bare case and gets classified into the same `w25` routine type. Not confirmed via
-`--dump-mil`/`MLComputePlan` whether fusion happened at all; this is inferred from the clean
-behavioral result, not verified at the IR level.
+SME2 breakpoint** — the fused graph takes the exact same AMX path as the bare matmul.
+
+**Confirmed why, via `MLComputePlan`**: loaded the compiled `.mlmodelc`'s `MLComputePlan` and
+walked `modelStructure.program.functions["main"].block.operations` directly. The compiled program
+contains two separate operations, not one:
+
+```
+op: ios18.matmul   -> output: matmul_raw
+op: ios18.relu     -> output: y
+```
+
+So CoreML's optimizer does **not** fuse a plain MIL `matmul` immediately followed by a plain
+`relu` into a single combined op — they stay two independent program operations, each presumably
+lowered to its own separate BNNS call. The `matmul` node BNNS actually receives is therefore
+byte-for-byte identical to the bare, unfused case, which fully explains the 0-hits result above:
+there was never a different "fused" node for BNNS to classify differently in the first place.
 
 **Candidate next experiments, not attempted:**
-- Confirm (or rule out) the fusion assumption above directly, e.g. via `MLComputePlan` on the
-  compiled model to see whether `matmul` and `relu` show up as one program operation or two.
 - Build a genuine attention-shaped pattern (`matmul` → `softmax` → `matmul`, or try CoreML's
   native `scaled_dot_product_attention` MIL op directly if the opset supports it) to target
   `KERNEL_MATMUL_SOFTMAX_MATMUL_SME` specifically — a real multi-op fused primitive, not a
