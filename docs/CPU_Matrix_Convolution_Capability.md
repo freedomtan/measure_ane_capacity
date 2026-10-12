@@ -315,15 +315,54 @@ the private legacy AMX tiers (`MLA1`/`MLA2`/`MLA3` plausibly exist for M1–M3-e
 SME2 silicon) — but this is an informed inference from kernel-naming conventions and hardware
 capability bits, **not a direct runtime observation of which kernel actually got dispatched**.
 
-**What would close this out, not attempted:** `bnns_graph.h` exposes a public
-`BNNSGraphContextSetMessageLogCallback`/`SetMessageLogMask` API (default mask is
-`Unsupported|Warning|Error`, excluding `Info`) that could, in principle, surface the selected
-kernel name directly if raised to `Info` and wired into a standalone BNNS test harness built
-outside CoreML (CoreML's own `E5RT` context isn't ours to configure this way). Also not attempted:
-single-stepping into the stripped leaf kernel via `lldb` while the benchmark runs, to directly
-observe AMX/SME instruction encodings (ARM disassemblers typically don't have AMX mnemonics at
-all, since it's unofficial silicon, so this would mean recognizing raw opcode byte patterns by
-hand). Both are flagged as follow-ups, not done here.
+**Closed out: confirmed SME2 is genuinely dispatched, both statically and live via `lldb`.**
+
+Took a `sample` capture of a sustained `measure_matmul_coreml --units cpu` run (3000 iterations,
+6 s sampling window) and walked the full stack past the stripped `???` frames by resolving file
+offsets against the standalone `libBNNS.dylib` copy's own function-start table (scanned for
+`pacibsp` prologues, since `nm`'s exported-symbol table is too sparse — most of these are static
+functions with no exported name at all). The hot leaf stack bottoms out in one ~19 KB unnamed
+function (`libBNNS.dylib + 0xa73ca4`, called from a small dispatcher at `+0xa7330c`, itself called
+from `BNNSGraphContextExecute_v2` through a `dispatch_apply`-parallelized chain). Disassembling
+that function directly shows:
+
+```
+smstart za / smstop za        -- enables the SME matrix-accumulator (ZA) state
+ldr  zt0, [...]                -- loads the SME2-only ZT0 lookup-table register
+luti4 { z8.h - z11.h }, zt0, ...  -- SME2 lookup-table instruction (476 occurrences)
+fmopa / bfmopa                 -- outer-product accumulate into ZA (64 occurrences)
+```
+
+`ZT0` and `luti4` are **SME2-exclusive** — that register and instruction don't exist in baseline
+SME1 at all — so this isn't just "SME-capable hardware, possibly running an older path"; the
+compiled code itself is SME2 code.
+
+Then confirmed this is actually reached at runtime, not just present-but-dead code: set an `lldb`
+breakpoint directly on that function's address (`breakpoint set --shlib libBNNS.dylib --address
+0x18f6e0ca4`), launched the real benchmark under the debugger, and hit it immediately with a full,
+unbroken backtrace from CoreML's prediction call down through BNNS:
+
+```
+measure_matmul_coreml`runBenchmark -> ... -> -[MLE5Engine predictionFromFeatures:...]
+  -> Espresso::E5RT::Ops::BnnsCpuInferenceOperation::ExecuteSync()
+  -> BNNSGraphContextExecute_v2 (libBNNS.dylib)
+  -> ___lldb_unnamed_symbol_18f2dc0c8 -> ... -> dispatch_apply_with_attr (parallelized)
+  -> ___lldb_unnamed_symbol_18ee1a55c -> ___lldb_unnamed_symbol_18f6e030c (dispatcher)
+  -> ___lldb_unnamed_symbol_18f6e0ca4   <- breakpoint hit here, the SME2 kernel above
+```
+
+(An earlier attempt — breaking on `__bnns_hgemm`'s own entry point and on 32 addresses chosen by
+raw proximity to it — never hit, at all, across either run. That ruled those specific guesses out
+but didn't answer the question; the fix was finding the real callee via `sample`-derived file
+offsets and the function-start table, rather than guessing by address proximity.)
+
+**Net result: yes, SME2 is used** for this CPU FP16 matmul workload on this M4 Pro, confirmed both
+statically (SME2-exclusive instructions in the actual hot function) and dynamically (`lldb`
+breakpoint hit on that exact function during a real benchmark run, with a clean backtrace up
+through BNNS and CoreML). Not confirmed/out of scope: whether the private legacy AMX tiers
+(`MLA1`/`MLA2`/`MLA3`) are ever selected on this chip for other shapes/dtypes, or whether older
+chips without `FEAT_SME2` (pre-M4-generation) fall back to those AMX tiers instead — this was only
+checked for the FP16 dense path on this specific chip.
 
 ## Finding 7 — matmul now supports INT8 and FP8, matching the conv chain's QDQ pattern, on all three CoreML compute units
 
@@ -411,5 +450,7 @@ actual activation dtype flowing through the op, not just the weight storage form
 - Accelerate (BLAS `cblas_sgemm` / BNNS convolution) as a lower-level alternative CPU baseline,
   independent of both MPSGraph and CoreML — explicitly deferred per discussion in favor of trying
   the two existing frameworks first.
-- AMX detection/dispatch investigation (whether Accelerate's CPU GEMM actually reaches Apple
-  Silicon's CPU-side matrix coprocessor) — out of scope until a CPU GEMM path exists at all.
+- Confirming whether the legacy AMX tiers (`MLA1`/`MLA2`/`MLA3`) are ever actually selected on this
+  chip (vs. always SME2) for other shapes/dtypes, or on older chips lacking `FEAT_SME2` — Finding 6
+  confirmed SME2 dispatch for the FP16 dense path on this M4 Pro, but didn't check the full matrix
+  of shapes/precisions/chips.
