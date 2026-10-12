@@ -456,6 +456,46 @@ static NSData *generateWeightsMatmulFP16(MILMatmulChainConfig config) {
     return data;
 }
 
+static NSData *generateWeightsMatmulINT8(MILMatmulChainConfig config) {
+    size_t count = config.batch * config.K * config.N;
+    NSMutableData *data = [NSMutableData dataWithLength:count * sizeof(int8_t)];
+    int8_t *p = (int8_t *)data.mutableBytes;
+
+    if (config.weightMode == MILWeightModeRepeat) {
+        static const int8_t pattern[4] = {1, -1, 2, -2};
+        for (size_t i = 0; i < count; i++) p[i] = pattern[i % 4];
+    } else {
+        uint64_t state = kWeightSeed;
+        for (size_t i = 0; i < count; i++) {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            p[i] = (state & 1) ? -1 : 1;
+        }
+    }
+    return data;
+}
+
+static NSData *generateWeightsMatmulFP8(MILMatmulChainConfig config) {
+    size_t count = config.batch * config.K * config.N;
+    NSMutableData *data = [NSMutableData dataWithLength:count];
+    uint8_t *p = (uint8_t *)data.mutableBytes;
+
+    if (config.weightMode == MILWeightModeRepeat) {
+        static const uint8_t pattern[4] = {0x30, 0xB0, 0x38, 0xB8};
+        for (size_t i = 0; i < count; i++) p[i] = pattern[i % 4];
+    } else {
+        uint64_t state = kWeightSeed;
+        for (size_t i = 0; i < count; i++) {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            p[i] = (state & 1) ? 0xB0 : 0x30; // ±0.5 in FP8 E4M3
+        }
+    }
+    return data;
+}
+
 static NSData *generateWeightsINT8(MILConvChainConfig config) {
     size_t count = config.channelsOut * config.channelsIn * config.kernel * config.kernel;
     NSMutableData *data = [NSMutableData dataWithLength:count * sizeof(int8_t)];
@@ -698,9 +738,21 @@ NSData *MILBuildMatmulChainSpec(MILMatmulChainConfig config, NSError **error) {
     ProtoWriter *block = [[ProtoWriter alloc] init];
     [block writeStringField:2 string:finalOut]; // outputs = 2
 
-    NSData *wData = generateWeightsMatmulFP16(config);
-    ProtoWriter *wVal = makeBytesTensorValue(kMIL_FLOAT16, wShape, wData);
-    [block writeMessageField:3 message:makeConstOp(@"weights", makeTensorType(kMIL_FLOAT16, wShape), wVal)];
+    if (config.precision == MILPrecisionINT8) {
+        NSData *wData = generateWeightsMatmulINT8(config);
+        [block writeMessageField:3 message:makeConstexprShiftScaleOp(@"weights", wShape, wData, kFP16PlusOneThirtySecond)];
+
+        [block writeMessageField:3 message:makeConstOp(@"act_scale", makeTensorType(kMIL_FLOAT16, @[]), makeFloat16ScalarValue(kFP16PlusOneThirtySecond))];
+        [block writeMessageField:3 message:makeConstOp(@"dtype_int8", makeStringScalarType(), makeStringValue(@"int8"))];
+    } else if (config.precision == MILPrecisionFP8) {
+        NSData *wData = generateWeightsMatmulFP8(config);
+        NSData *lutData = [NSData dataWithBytes:kFP8E4M3ScaledToFP16LUT length:sizeof(kFP8E4M3ScaledToFP16LUT)];
+        [block writeMessageField:3 message:makeConstexprLUTToDenseOp(@"weights", wShape, wData, lutData)];
+    } else {
+        NSData *wData = generateWeightsMatmulFP16(config);
+        ProtoWriter *wVal = makeBytesTensorValue(kMIL_FLOAT16, wShape, wData);
+        [block writeMessageField:3 message:makeConstOp(@"weights", makeTensorType(kMIL_FLOAT16, wShape), wVal)];
+    }
 
     // matmul's transpose_x/transpose_y are "optional, default False" only at
     // coremltools' Python mb.matmul() builder level -- the compiled
@@ -710,12 +762,22 @@ NSData *MILBuildMatmulChainSpec(MILMatmulChainConfig config, NSError **error) {
     [block writeMessageField:3 message:makeConstOp(@"no_transpose", makeTensorType(kMIL_BOOL, @[]), makeBoolScalarValue(NO))];
 
     ProtoWriter *outType = makeTensorType(kMIL_FLOAT16, outShape);
+    ProtoWriter *int8OutType = makeTensorType(kMIL_INT8, outShape);
 
     NSString *curr = MILMatmulChainInputName();
     for (NSUInteger i = 0; i < config.layers; i++) {
+        NSString *matmulIn = curr;
+        if (config.precision == MILPrecisionINT8) {
+            NSString *qName = [NSString stringWithFormat:@"quant_%lu", (unsigned long)i];
+            [block writeMessageField:3 message:makeNonConstOp(@"quantize", qName, int8OutType, @{@"input": curr, @"scale": @"act_scale", @"output_dtype": @"dtype_int8"})];
+            NSString *dqName = [NSString stringWithFormat:@"dequant_%lu", (unsigned long)i];
+            [block writeMessageField:3 message:makeNonConstOp(@"dequantize", dqName, outType, @{@"input": qName, @"scale": @"act_scale"})];
+            matmulIn = dqName;
+        }
+
         NSString *mName = [NSString stringWithFormat:@"matmul_%lu", (unsigned long)i];
         NSDictionary *inputs = @{
-            @"x": curr,
+            @"x": matmulIn,
             @"y": @"weights",
             @"transpose_x": @"no_transpose",
             @"transpose_y": @"no_transpose"
@@ -782,6 +844,7 @@ NSData *MILBuildMatmulChainSpec(MILMatmulChainConfig config, NSError **error) {
         @"workload.k": [NSString stringWithFormat:@"%lu", (unsigned long)config.K],
         @"workload.n": [NSString stringWithFormat:@"%lu", (unsigned long)config.N],
         @"workload.layers": [NSString stringWithFormat:@"%lu", (unsigned long)config.layers],
+        @"workload.precision": MILPrecisionName(config.precision),
         @"builder": @"MILSpecBuilder (native Objective-C, zero-dependency)"
     };
     for (NSString *key in userDefined) {

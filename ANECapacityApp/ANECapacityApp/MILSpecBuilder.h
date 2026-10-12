@@ -53,8 +53,11 @@ FOUNDATION_EXPORT BOOL MILBuildNativeFP8ModelPackage(MILConvChainConfig config, 
 /// A chain of `layers` [batch,1,M,K] x [batch,1,K,N] -> [batch,1,M,N] matmuls
 /// sharing one dense-mode weight constant, mirroring the C++
 /// MILSpecBuilder.mm's MILMatmulChainConfig (see the main repo's
-/// docs/CPU_Matrix_Convolution_Capability.md). FP16 only. Chaining requires
-/// K == N, same reasoning as the conv chain's channelsIn == channelsOut.
+/// docs/CPU_Matrix_Convolution_Capability.md). Chaining requires K == N,
+/// same reasoning as the conv chain's channelsIn == channelsOut.
+/// `precision` mirrors the conv chain's QDQ pattern (see MILConvChainConfig
+/// above): INT8 quantizes/dequantizes activations around an FP16 matmul;
+/// FP8 dequantizes FP8-E4M3 weights but does not quantize activations.
 typedef struct {
     NSUInteger batch;
     NSUInteger M;
@@ -62,6 +65,7 @@ typedef struct {
     NSUInteger N;
     NSUInteger layers;
     MILWeightMode weightMode;
+    MILPrecision precision;
 } MILMatmulChainConfig;
 
 FOUNDATION_EXPORT NSString *MILMatmulChainInputName(void);

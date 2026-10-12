@@ -10,7 +10,15 @@ import CoreML
 /// since (unlike MPSGraphDevice.CPUDevice) CoreML doesn't crash on any of them.
 enum NativeCoreMLMatmulProbe {
     static func run() {
-        let config = MILMatmulChainConfig(batch: 1, M: 1024, K: 1024, N: 1024, layers: 20, weightMode: .dense)
+        for precision in [MILPrecision.FP16, .INT8, .FP8] {
+            runOne(precision: precision)
+        }
+    }
+
+    private static func runOne(precision: MILPrecision) {
+        let config = MILMatmulChainConfig(batch: 1, M: 1024, K: 1024, N: 1024, layers: 20, weightMode: .dense, precision: precision)
+        let precisionName = MILPrecisionName(precision)
+        print("[CoreMLMatmulProbe] === precision: \(precisionName) ===")
 
         var buildError: NSError?
         guard let specData = MILBuildMatmulChainSpec(config, &buildError) else {
@@ -19,7 +27,7 @@ enum NativeCoreMLMatmulProbe {
         }
         print("[CoreMLMatmulProbe] Spec built: \(specData.count) bytes")
 
-        let tempPath = NSTemporaryDirectory() + "matmul_spec_\(ProcessInfo.processInfo.processIdentifier).mlmodel"
+        let tempPath = NSTemporaryDirectory() + "matmul_spec_\(precisionName)_\(ProcessInfo.processInfo.processIdentifier).mlmodel"
         do {
             try specData.write(to: URL(fileURLWithPath: tempPath))
         } catch {
@@ -34,7 +42,7 @@ enum NativeCoreMLMatmulProbe {
         MLModel.compileModel(at: URL(fileURLWithPath: tempPath)) { result in
             switch result {
             case .success(let url):
-                let dest = NSTemporaryDirectory() + "compiled_matmul_\(ProcessInfo.processInfo.processIdentifier).mlmodelc"
+                let dest = NSTemporaryDirectory() + "compiled_matmul_\(precisionName)_\(ProcessInfo.processInfo.processIdentifier).mlmodelc"
                 let destURL = URL(fileURLWithPath: dest)
                 try? FileManager.default.removeItem(at: destURL)
                 do {
@@ -123,8 +131,8 @@ enum NativeCoreMLMatmulProbe {
             let avg = Date().timeIntervalSince(start) / Double(iterations)
             let tops = (totalOps / 1e12) / avg
 
-            print(String(format: "[CoreML %@ FP16] Load: %.2f ms, Avg: %.2f ms, Speed: %.4f TOPS (%.1f FPS)",
-                         label, loadMs, avg * 1000.0, tops, 1.0 / avg))
+            print(String(format: "[CoreML %@ %@] Load: %.2f ms, Avg: %.2f ms, Speed: %.4f TOPS (%.1f FPS)",
+                         label, precisionName, loadMs, avg * 1000.0, tops, 1.0 / avg))
 
             if let out = result?.featureValue(for: outputName)?.multiArrayValue {
                 let outPtr = out.dataPointer.bindMemory(to: UInt16.self, capacity: out.count)

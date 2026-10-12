@@ -361,9 +361,47 @@ something real to do. INT8 CPU is the only precision where CPU meaningfully regr
 real per-layer overhead on CPU that the other compute units absorb better; not investigated
 further.
 
-Not yet done: running INT8/FP8 matmul on the three iPhones (would need porting the same QDQ
-pattern into `ANECapacityApp`'s independent `MILSpecBuilder.m`, same as Finding 5 did for the
-plain FP16 case).
+## Finding 8 — INT8/FP8 matmul ported to all three iPhones; the INT8-CPU-regression pattern is Mac-specific
+
+Ported the same QDQ pattern into `ANECapacityApp`'s independent `MILSpecBuilder.m` (new
+`generateWeightsMatmulINT8`/`generateWeightsMatmulFP8`, and precision branching in
+`MILBuildMatmulChainSpec` mirroring the root `.mm`'s exactly), and extended
+`NativeCoreMLMatmulProbe.swift` to loop over all three precisions. One Swift/ObjC-bridging
+surprise along the way: `MILPrecisionFP16`/`INT8`/`FP8` import into Swift not as the usual
+lowercased-prefix-stripped `.fp16`/`.int8`/`.fp8` (which is what `MILWeightModeDense` becomes —
+`.dense`), but as **`.FP16`/`.INT8`/`.FP8`**, fully uppercase — plausibly because Swift's import
+heuristic, when the remaining suffix is *entirely* uppercase letters/digits, treats it as an
+all-caps acronym and leaves the case alone rather than lowercasing it the way it does for a
+mixed-case remainder like `Dense`. Confirmed empirically via a `swiftc -typecheck` throwaway
+rather than guessed.
+
+Ran all 27 combinations (3 chips × 3 precisions × ANE/GPU/CPU) across the three iPhones, all
+finite/non-degenerate:
+
+| Precision | A18 Pro ANE | A18 Pro GPU | A18 Pro CPU | A19 Pro ANE | A19 Pro GPU | A19 Pro CPU | A20 Pro ANE | A20 Pro GPU | A20 Pro CPU |
+|---|---|---|---|---|---|---|---|---|---|
+| FP16 | 13.01 | 1.51 | 3.13 | 13.02 | 6.35 | 3.19 | 16.96 | 9.28 | 4.04 |
+| INT8 | 17.69 | 1.50 | 3.00 | 20.43 | 6.17 | 2.93 | 21.06 | 9.23 | 3.55 |
+| FP8  | 12.76 | 1.58 | 3.16 | 13.04 | 5.96 | 3.32 | 18.16 | 8.82 | 4.06 |
+
+(All TOPS. GPU numbers are flat across precision on each chip, as expected — GPU compute doesn't
+change between FP16/INT8/FP8 here any more than it did on the Mac, since the dequantize-then-FP16
+pattern means the GPU's actual matmul is always FP16 regardless of precision label.)
+
+**The headline cross-platform finding: the M4 Pro's INT8-CPU-regression result (4.89 vs ~6.6 TOPS
+for FP16/FP8) does not reproduce on any of the three iPhones.** CPU INT8 is close to CPU FP16/FP8
+on every phone — a small dip (A18 Pro: 3.13→3.00, A19 Pro: 3.19→2.93) or a mild dip (A20 Pro:
+4.04→3.55), nothing like the Mac's ~26% drop. Combined with Finding 5's earlier observation that
+the Mac's "CPU beats GPU at matmul" result also doesn't reproduce on iPhones, this is now the
+**second** CPU-matmul anomaly specific to the M4 Pro/macOS CoreML CPU path rather than a property
+of the underlying arithmetic — consistent with Finding 6's finding that BNNS's CPU GEMM dispatch
+has multiple real hardware-tiered kernels (`MLA1/2/3`, `SME2`) whose selection logic could very
+plausibly behave differently for the QDQ-wrapped INT8 case specifically on macOS vs iOS, though
+this wasn't traced further.
+
+**ANE INT8 pulling ahead of FP16/FP8 reproduces cleanly on every chip** (consistent with Finding
+7's Mac result and the explanation given there — INT8 is the only precision that changes the
+actual activation dtype flowing through the op, not just the weight storage format).
 
 ## Not pursued here
 
