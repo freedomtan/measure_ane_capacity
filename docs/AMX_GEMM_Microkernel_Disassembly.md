@@ -444,15 +444,41 @@ lowered to its own separate BNNS call. The `matmul` node BNNS actually receives 
 byte-for-byte identical to the bare, unfused case, which fully explains the 0-hits result above:
 there was never a different "fused" node for BNNS to classify differently in the first place.
 
+**Tried: coremltools 9.0's native, single-op `scaled_dot_product_attention` (iOS18 opset). Result:
+still AMX, not SME2 — but a *different* AMX kernel.** New `MILAttentionConfig`/
+`MILBuildAttentionSpec` and `bnns_graph_attention_probe.m` build `query`/`key`/`value` as genuine
+function inputs (not consts) feeding one `scaled_dot_product_attention` op, 1024×1024 per tensor.
+Confirmed via `MLComputePlan` that this compiles to exactly one program operation
+(`ios18.scaled_dot_product_attention`), not three chained ones — a real single fused primitive
+this time, unlike the `relu` case above.
+
+Ran the same live `lldb` dual-breakpoint check (AMX kernel at `0x18f0623a4`, SME2 wrapper at
+`0x18f6f8128`) against it: **neither breakpoint fired at all.** The op runs to completion without
+ever touching either known address — a third, previously-unseen code path. `sample`-profiling a
+sustained run and resolving the hottest addresses shows two *new* AMX-opcode-based functions
+(`libBNNS.dylib + 0x8f1a3c`×`region, + 0x1087b48`-region; same `ldx`/`ldy`/`stz`/op-15 instruction
+family as every other AMX kernel found in this investigation, decoded the same way) plus two
+functions with neither AMX nor SME2 content at all (plausibly the softmax reduction itself, running
+on plain NEON scalar/vector instructions — not confirmed in detail).
+
+So `scaled_dot_product_attention`, even as a genuinely fused single MIL op with its own dedicated,
+differently-specialized kernel implementations for its two internal matmuls (QK^T and attn·V),
+**still lands on AMX**, not SME2 — just a different-shaped AMX kernel than the plain-matmul one,
+tuned for attention's specific access pattern. Two fusion-based attempts (`relu`, and now a real
+attention primitive) have both failed to reach `KERNEL_MATMUL_SOFTMAX_MATMUL_SME`; whether that
+kernel tier is reachable through CoreML/MIL at all — as opposed to only through BNNS's own
+lower-level C API directly, bypassing CoreML's compiler and op-selection logic entirely — is now
+the live open question.
+
 **Candidate next experiments, not attempted:**
-- Build a genuine attention-shaped pattern (`matmul` → `softmax` → `matmul`, or try CoreML's
-  native `scaled_dot_product_attention` MIL op directly if the opset supports it) to target
-  `KERNEL_MATMUL_SOFTMAX_MATMUL_SME` specifically — a real multi-op fused primitive, not a
-  generic activation tacked onto a vanilla GEMM, which `relu` evidently isn't enough to trigger.
+- Call BNNS's own lower-level APIs directly for a real attention-shaped workload (mirroring
+  Finding 11's direct `bnns.h` approach, but reaching for `BNNSLayerParametersMultiheadAttention`
+  specifically, which exists in the legacy API) rather than going through CoreML/MIL's compiler and
+  its own op-dispatch heuristics at all.
 - For genuine FP8 compute specifically (`FEAT_SME_F8F16`/`FEAT_SME_F8F32`, confirmed present on
   A20 Pro per the user's own `sysctl` check — also `FEAT_FP8`, the baseline NEON/SVE FP8
-  conversion-instruction feature, not previously checked in this repo): the dtype-hash gate above
-  means even reaching the right routine type isn't enough without the matmul's operand type tag
-  also matching the FP8 hash specifically — which likely requires a genuinely FP8-typed `matmul`
+  conversion-instruction feature, not previously checked in this repo): the dtype-hash gate found
+  earlier means even reaching the right routine type isn't enough without the matmul's operand type
+  tag also matching the FP8 hash specifically — which likely requires a genuinely FP8-typed `matmul`
   input, not today's dequantize-to-FP16-before-matmul pattern (Finding 7/9's limitation), compounding
   with the routine-type requirement above.

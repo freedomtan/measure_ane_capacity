@@ -152,3 +152,28 @@ FOUNDATION_EXPORT NSString *MILMatmulWeightInputOutputName(void);
 
 FOUNDATION_EXPORT NSData *_Nullable MILBuildMatmulWeightInputSpec(
     MILMatmulWeightInputConfig config, NSError **error);
+
+/// `scaled_dot_product_attention(query, key, value)` -- coremltools 9.0's
+/// single native MIL op (iOS18 opset), computing
+/// `softmax(Q @ K^T / sqrt(E)) @ V` as one op, not three chained ones.
+/// Candidate for reaching BNNS's `KERNEL_MATMUL_SOFTMAX_MATMUL_SME` tier
+/// (see docs/AMX_GEMM_Microkernel_Disassembly.md's "Clues toward actually
+/// reaching the SME2 path" -- the fused `matmul`+`relu` experiment there
+/// didn't trigger it because CoreML never actually fused those two ops;
+/// this op is a genuine single fused primitive from the start).
+/// query: [B, L, E], key/value: [B, S, E] (value's last dim EV == E here,
+/// kept square for simplicity). All three are genuine function inputs, not
+/// consts, same non-foldable-weight design as MILMatmulWeightInputConfig.
+typedef struct {
+  NSUInteger B;
+  NSUInteger L;
+  NSUInteger S;
+  NSUInteger E;
+} MILAttentionConfig;
+
+FOUNDATION_EXPORT NSString *MILAttentionQueryName(void);
+FOUNDATION_EXPORT NSString *MILAttentionKeyName(void);
+FOUNDATION_EXPORT NSString *MILAttentionValueName(void);
+FOUNDATION_EXPORT NSString *MILAttentionOutputName(void);
+
+FOUNDATION_EXPORT NSData *_Nullable MILBuildAttentionSpec(MILAttentionConfig config, NSError **error);

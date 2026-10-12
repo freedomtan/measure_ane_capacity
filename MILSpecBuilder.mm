@@ -1008,3 +1008,63 @@ NSData *MILBuildMatmulWeightInputSpec(MILMatmulWeightInputConfig config, NSError
   }
   return [NSData dataWithBytes:serialized.data() length:serialized.size()];
 }
+
+NSString *MILAttentionQueryName(void) { return @"query"; }
+NSString *MILAttentionKeyName(void) { return @"key"; }
+NSString *MILAttentionValueName(void) { return @"value"; }
+NSString *MILAttentionOutputName(void) { return @"attn_out"; }
+
+NSData *MILBuildAttentionSpec(MILAttentionConfig config, NSError **error) {
+  if (config.B == 0 || config.L == 0 || config.S == 0 || config.E == 0) {
+    if (error) *error = MILError(1, @"B, L, S, and E must be non-zero");
+    return nil;
+  }
+
+  const std::vector<uint64_t> queryShape = {config.B, config.L, config.E};
+  const std::vector<uint64_t> keyShape = {config.B, config.S, config.E};
+  const std::vector<uint64_t> valueShape = {config.B, config.S, config.E};
+  const std::vector<uint64_t> outputShape = {config.B, config.L, config.E};
+  const std::string queryName = MILAttentionQueryName().UTF8String;
+  const std::string keyName = MILAttentionKeyName().UTF8String;
+  const std::string valueName = MILAttentionValueName().UTF8String;
+  const std::string outputName = MILAttentionOutputName().UTF8String;
+
+  ms::Model model;
+  model.set_specificationversion(kSpecificationVersion);
+
+  ms::ModelDescription *description = model.mutable_description();
+  SetArrayFeature(description->add_input(), queryName, queryShape);
+  SetArrayFeature(description->add_input(), keyName, keyShape);
+  SetArrayFeature(description->add_input(), valueName, valueShape);
+  SetArrayFeature(description->add_output(), outputName, outputShape);
+
+  mil::Program *program = model.mutable_mlprogram();
+  program->set_version(1);
+
+  mil::Function &function = (*program->mutable_functions())["main"];
+  function.set_opset(kOpset);
+
+  mil::NamedValueType *qInput = function.add_inputs();
+  qInput->set_name(queryName);
+  SetTensorType(qInput->mutable_type(), mil::FLOAT16, queryShape);
+  mil::NamedValueType *kInput = function.add_inputs();
+  kInput->set_name(keyName);
+  SetTensorType(kInput->mutable_type(), mil::FLOAT16, keyShape);
+  mil::NamedValueType *vInput = function.add_inputs();
+  vInput->set_name(valueName);
+  SetTensorType(vInput->mutable_type(), mil::FLOAT16, valueShape);
+
+  mil::Block &block = (*function.mutable_block_specializations())[kOpset];
+  block.add_outputs(outputName);
+
+  AddOp(&block, "scaled_dot_product_attention",
+       {{"query", queryName}, {"key", keyName}, {"value", valueName}},
+       outputName, TensorValueType(mil::FLOAT16, outputShape));
+
+  std::string serialized;
+  if (!model.SerializeToString(&serialized)) {
+    if (error) *error = MILError(3, @"failed to serialize the model spec");
+    return nil;
+  }
+  return [NSData dataWithBytes:serialized.data() length:serialized.size()];
+}
