@@ -690,6 +690,41 @@ Finding 10's constant-folding result and Finding 11's legacy-AMX result were bot
 way, artifacts of *which API* was used to reach BNNS, not fundamental limits on what the hardware
 or BNNS's modern kernel set can do with INT8.
 
+## Finding 13 — Finding 12 ported to all three iPhones: the modern BNNSGraph path's small INT8 overhead reproduces everywhere, and shrinks on newer chips
+
+Ported `MILBuildMatmulWeightInputSpec` into `ANECapacityApp`'s independent, pure-Objective-C
+`MILSpecBuilder.m` (same hand-rolled-protobuf approach as every other on-device port in this repo),
+plus a new `BNNSGraphMatmulProbe.m`/`.h` that reimplements `bnns_graph_matmul_probe.m`'s
+`BNNSGraphCompileFromFile`/`BNNSGraphContext*` logic natively in Objective-C (triggered by
+`--native-bnns-graph-matmul`). `bnns_graph.h` is available on iOS 18+ same as macOS 15+, so this
+needed no API substitutions — only the same CoreML top-level-INT8-type workaround (INT32 model
+input, `cast` to INT8) carried over unchanged from Finding 12.
+
+Ran on all three iPhones, same 1024³ single-matmul workload, 2000 iterations each:
+
+| | FP16 weight-input | INT8 weight-input | Overhead |
+|---|---|---|---|
+| M4 Pro (Mac) | 0.321 ms / 6.68 TOPS | 0.394 ms / 5.46 TOPS | +23% |
+| A18 Pro | 0.582 ms / 3.69 TOPS | 0.656 ms / 3.27 TOPS | +13% |
+| A19 Pro | 0.652 ms / 3.29 TOPS | 0.703 ms / 3.05 TOPS | +8% |
+| A20 Pro | 0.531 ms / 4.04 TOPS | 0.586 ms / 3.66 TOPS | +10% |
+
+**Output bits are identical across all four chips** (`y[0] = 0xaf00`, `y[mid] = 0xa000` for FP16;
+`0x3250`/`0xba44` for INT8, on every chip) — the same deterministic xorshift fill producing
+bit-for-bit identical results everywhere is a correctness cross-check in its own right, independent
+of the small hand-verified cases from Finding 12.
+
+**The small INT8 overhead from Finding 12 reproduces on every chip, and is smaller on every
+iPhone than on the Mac** — in fact A19 Pro's gap (+8%, confirmed by repeating the run twice) is
+barely above run-to-run noise. None of the iPhones show anything resembling Finding 11's 2×+
+legacy-AMX regression. This is consistent with (though doesn't by itself prove) the modern
+`BNNSGraph` path dispatching the same real SME2-class kernel on every one of these chips that
+Finding 6 traced on the Mac, with the `cast`+`dequantize` preprocessing cost shrinking relative to
+the matmul itself as each generation's SME2 throughput improves — the newest chips absorb the
+quantization bookkeeping almost for free, in sharp contrast to the Mac's `MLModel`-based INT8 path
+(Finding 7/8), where the *same kind* of overhead was large enough to make CPU INT8 regress below
+CPU FP16/FP8, a result that itself never reproduced on any iPhone either (Finding 8).
+
 ## Not pursued here
 
 - Disassembling `applyOptimizationPassesWithDevice:` to confirm the nil-`metalDeviceName`

@@ -45,6 +45,12 @@ struct ANECapacityApp: App {
                 exit(0)
             }
         }
+        if ProcessInfo.processInfo.arguments.contains("--native-bnns-graph-matmul") {
+            DispatchQueue.global().async {
+                BNNSGraphMatmulProbeRun()
+                exit(0)
+            }
+        }
         if let idx = ProcessInfo.processInfo.arguments.firstIndex(of: "--native-coreml-matmul-single"),
            idx + 1 < ProcessInfo.processInfo.arguments.count {
             let precisionArg = ProcessInfo.processInfo.arguments[idx + 1]

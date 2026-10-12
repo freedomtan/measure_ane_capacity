@@ -75,4 +75,25 @@ FOUNDATION_EXPORT NSString *MILMatmulChainOutputName(MILMatmulChainConfig config
 /// Returns nil and fills `error` if any dimension is zero, or if K != N.
 FOUNDATION_EXPORT NSData *_Nullable MILBuildMatmulChainSpec(MILMatmulChainConfig config, NSError **error);
 
+/// A single `[M, K] x [K, N] -> [M, N]` matmul whose weight is a genuine
+/// function **input**, not a `const`/`constexpr_*` -- mirrors the root
+/// repo's MILMatmulWeightInputConfig (see
+/// docs/CPU_Matrix_Convolution_Capability.md Finding 12). If `weightIsInt8`
+/// is true, the weight is declared as an INT32 model input (CoreML's
+/// top-level ArrayFeatureType has no INT8 option) and `cast` to INT8 as the
+/// function's first op, then `dequantize`d (scale 1/32) before the matmul;
+/// otherwise the weight input is FP16 and feeds the matmul directly.
+typedef struct {
+    NSUInteger M;
+    NSUInteger K;
+    NSUInteger N;
+    BOOL weightIsInt8;
+} MILMatmulWeightInputConfig;
+
+FOUNDATION_EXPORT NSString *MILMatmulWeightInputXName(void);
+FOUNDATION_EXPORT NSString *MILMatmulWeightInputWeightName(void);
+FOUNDATION_EXPORT NSString *MILMatmulWeightInputOutputName(void);
+
+FOUNDATION_EXPORT NSData *_Nullable MILBuildMatmulWeightInputSpec(MILMatmulWeightInputConfig config, NSError **error);
+
 NS_ASSUME_NONNULL_END

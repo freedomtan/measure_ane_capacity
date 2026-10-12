@@ -4,5 +4,6 @@
 #import "ANEClientBridge.h"
 #import "MILCapacityEngineBridge.h"
 #import "MILSpecBuilder.h"
+#import "BNNSGraphMatmulProbe.h"
 
 #endif /* ANECapacityApp_Bridging_Header_h */
