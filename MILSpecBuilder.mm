@@ -137,6 +137,13 @@ static mil::Value Float16ScalarValue(uint16_t rawBits) {
   return value;
 }
 
+static mil::Value BoolScalarValue(bool val) {
+  mil::Value value;
+  *value.mutable_type() = TensorValueType(mil::BOOL, {});
+  value.mutable_immediatevalue()->mutable_tensor()->mutable_bools()->add_values(val);
+  return value;
+}
+
 static mil::Value Int8ScalarValue(int8_t val) {
   mil::Value value;
   *value.mutable_type() = TensorValueType(mil::INT8, {});
@@ -329,6 +336,31 @@ static std::string WeightBytesFP8(MILConvChainConfig config) {
     state ^= state >> 7;
     state ^= state << 17;
     p[i] = (state & 1) ? 0xB0 : 0x30;
+  }
+  return bytes;
+}
+
+// Same reasoning as WeightBytes() above, sized for a [batch, 1, K, N] matmul
+// weight tensor instead of a conv kernel.
+static std::string WeightBytesMatmul(MILMatmulChainConfig config) {
+  size_t count = (size_t)config.batch * config.K * config.N;
+  std::string bytes(count * sizeof(uint16_t), '\0');
+  uint16_t *p = (uint16_t *)bytes.data();
+
+  if (config.weightMode == MILWeightModeRepeat) {
+    static const uint16_t pattern[4] = {
+        kFP16PlusOneSixteenth, kFP16MinusOneSixteenth,
+        kFP16PlusOneThirtySecond, kFP16MinusOneThirtySecond};
+    for (size_t i = 0; i < count; i++) p[i] = pattern[i % 4];
+    return bytes;
+  }
+
+  uint64_t state = kWeightSeed;
+  for (size_t i = 0; i < count; i++) {
+    state ^= state << 13;
+    state ^= state >> 7;
+    state ^= state << 17;
+    p[i] = (state & 1) ? kFP16MinusOneThirtySecond : kFP16PlusOneThirtySecond;
   }
   return bytes;
 }
@@ -620,6 +652,152 @@ NSString *MILConvChainText(MILConvChainConfig config) {
                          convName, current];
     }
     current = convName;
+  }
+  [text appendFormat:@"  -> %@\n", current];
+  return text;
+}
+
+#pragma mark - Matmul chain
+
+static void SetMetadataMatmul(ms::Metadata *metadata,
+                              MILMatmulChainConfig config) {
+  NSString *summary = [NSString
+      stringWithFormat:@"%lux matmul [%lu, 1, %lu, %lu] x [%lu, 1, %lu, %lu], "
+                       @"weights=%@",
+                       (unsigned long)config.layers, (unsigned long)config.batch,
+                       (unsigned long)config.M, (unsigned long)config.K,
+                       (unsigned long)config.batch, (unsigned long)config.K,
+                       (unsigned long)config.N,
+                       MILWeightModeName(config.weightMode)];
+  metadata->set_shortdescription(summary.UTF8String);
+
+  auto &userDefined = *metadata->mutable_userdefined();
+  userDefined["workload.batch"] = std::to_string(config.batch);
+  userDefined["workload.m"] = std::to_string(config.M);
+  userDefined["workload.k"] = std::to_string(config.K);
+  userDefined["workload.n"] = std::to_string(config.N);
+  userDefined["workload.layers"] = std::to_string(config.layers);
+  userDefined["workload.weights"] =
+      MILWeightModeName(config.weightMode).UTF8String;
+  userDefined["builder"] = "MILSpecBuilder (native, no coremltools)";
+}
+
+NSString *MILMatmulChainInputName(void) { return @"x"; }
+
+NSString *MILMatmulChainOutputName(MILMatmulChainConfig config) {
+  return [NSString stringWithFormat:@"matmul_%lu",
+                                    (unsigned long)(config.layers - 1)];
+}
+
+static BOOL MILValidateMatmul(MILMatmulChainConfig config, NSError **error) {
+  const struct {
+    const char *name;
+    NSUInteger value;
+  } dims[] = {
+      {"batch", config.batch}, {"m", config.M},
+      {"k", config.K},         {"n", config.N},
+      {"layers", config.layers},
+  };
+  for (const auto &dim : dims) {
+    if (dim.value == 0) {
+      if (error) {
+        *error = MILError(1, [NSString stringWithFormat:
+                                           @"%s must be greater than zero",
+                                           dim.name]);
+      }
+      return NO;
+    }
+  }
+  // Each layer's output is [batch, 1, M, N]; chaining into another matmul
+  // against the same [batch, 1, K, N] weight requires N == K, same reasoning
+  // as the conv chain's channelsIn == channelsOut requirement.
+  if (config.layers > 1 && config.K != config.N) {
+    if (error) {
+      *error = MILError(2, @"chained layers require k == n");
+    }
+    return NO;
+  }
+  return YES;
+}
+
+NSData *MILBuildMatmulChainSpec(MILMatmulChainConfig config, NSError **error) {
+  if (!MILValidateMatmul(config, error)) return nil;
+
+  const std::vector<uint64_t> inputShape = {config.batch, 1, config.M, config.K};
+  const std::vector<uint64_t> weightShape = {config.batch, 1, config.K, config.N};
+  const std::vector<uint64_t> outputShape = {config.batch, 1, config.M, config.N};
+  const std::string outputName = MILMatmulChainOutputName(config).UTF8String;
+
+  ms::Model model;
+  model.set_specificationversion(kSpecificationVersion);
+
+  ms::ModelDescription *description = model.mutable_description();
+  SetArrayFeature(description->add_input(),
+                  MILMatmulChainInputName().UTF8String, inputShape);
+  SetArrayFeature(description->add_output(), outputName, outputShape);
+  SetMetadataMatmul(description->mutable_metadata(), config);
+
+  mil::Program *program = model.mutable_mlprogram();
+  program->set_version(1);
+
+  mil::Function &function = (*program->mutable_functions())["main"];
+  function.set_opset(kOpset);
+  mil::NamedValueType *functionInput = function.add_inputs();
+  functionInput->set_name(MILMatmulChainInputName().UTF8String);
+  SetTensorType(functionInput->mutable_type(), mil::FLOAT16, inputShape);
+
+  mil::Block &block = (*function.mutable_block_specializations())[kOpset];
+  block.add_outputs(outputName);
+
+  // One weight constant shared by every layer, as in the MPSGraph version.
+  mil::Value weights;
+  weights.mutable_immediatevalue()->mutable_tensor()->mutable_bytes()->set_values(
+      WeightBytesMatmul(config));
+  AddConstOp(&block, "weights", TensorValueType(mil::FLOAT16, weightShape),
+             std::move(weights));
+
+  // matmul's transpose_x/transpose_y are "optional, default False" only at
+  // the Python mb.matmul() builder level -- the compiled MLProgram itself
+  // requires them present, confirmed by the compiler otherwise rejecting the
+  // op with "Required param 'transpose_y' is missing".
+  AddConstOp(&block, "no_transpose", TensorValueType(mil::BOOL, {}),
+             BoolScalarValue(false));
+
+  const mil::ValueType activationType = TensorValueType(mil::FLOAT16, outputShape);
+  std::string current = MILMatmulChainInputName().UTF8String;
+  for (NSUInteger i = 0; i < config.layers; i++) {
+    std::string name = "matmul_" + std::to_string(i);
+    AddOp(&block, "matmul",
+          {{"x", current},
+           {"y", "weights"},
+           {"transpose_x", "no_transpose"},
+           {"transpose_y", "no_transpose"}},
+          name, activationType);
+    current = std::move(name);
+  }
+
+  std::string serialized;
+  if (!model.SerializeToString(&serialized)) {
+    if (error) *error = MILError(3, @"failed to serialize the model spec");
+    return nil;
+  }
+  return [NSData dataWithBytes:serialized.data() length:serialized.size()];
+}
+
+NSString *MILMatmulChainText(MILMatmulChainConfig config) {
+  NSMutableString *text = [NSMutableString string];
+  [text appendFormat:@"function main (opset %s):\n", kOpset];
+  [text appendFormat:@"  x: fp16[%lu, 1, %lu, %lu]\n", (unsigned long)config.batch,
+                     (unsigned long)config.M, (unsigned long)config.K];
+  [text appendFormat:@"  weights = const(fp16[%lu, 1, %lu, %lu])  // %@, %lu bytes inline\n",
+                     (unsigned long)config.batch, (unsigned long)config.K,
+                     (unsigned long)config.N, MILWeightModeName(config.weightMode),
+                     (unsigned long)(config.batch * config.K * config.N * 2)];
+  NSString *current = MILMatmulChainInputName();
+  for (NSUInteger i = 0; i < config.layers; i++) {
+    NSString *name = [NSString stringWithFormat:@"matmul_%lu", (unsigned long)i];
+    [text appendFormat:@"  %@ = matmul(x=%@, y=weights, transpose_x=False, transpose_y=False)\n", name, current];
+    current = name;
   }
   [text appendFormat:@"  -> %@\n", current];
   return text;

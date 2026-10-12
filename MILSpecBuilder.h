@@ -74,3 +74,33 @@ FOUNDATION_EXPORT NSData *MILBuildConvChainSpec(MILConvChainConfig config,
 /// MIL-text-style dump of the program that MILBuildConvChainSpec emits, for
 /// eyeballing the graph without a protobuf decoder.
 FOUNDATION_EXPORT NSString *MILConvChainText(MILConvChainConfig config);
+
+/// The workload: `layers` chained GEMMs, each `[batch, 1, M, K] x [batch, 1,
+/// K, N] -> [batch, 1, M, N]`, matching measure_matmul_universal.m's tensor
+/// shapes exactly. FP16 only for now (no quantized variants yet, unlike the
+/// conv chain above). Chaining requires K == N, same as the conv chain
+/// requires channelsIn == channelsOut: each layer's output becomes the next
+/// layer's input, so the shape must be self-consistent across layers.
+typedef struct {
+  NSUInteger batch;
+  NSUInteger M;
+  NSUInteger K;
+  NSUInteger N;
+  NSUInteger layers;
+  MILWeightMode weightMode;
+} MILMatmulChainConfig;
+
+/// Name of the single model input ("x").
+FOUNDATION_EXPORT NSString *MILMatmulChainInputName(void);
+
+/// Name of the single model output (the last matmul's result).
+FOUNDATION_EXPORT NSString *MILMatmulChainOutputName(MILMatmulChainConfig config);
+
+/// Serialize a complete CoreML `Model` protobuf for `config`.
+/// Returns nil and fills `error` if any dimension is zero, or if K != N.
+FOUNDATION_EXPORT NSData *MILBuildMatmulChainSpec(MILMatmulChainConfig config,
+                                                  NSError **error);
+
+/// MIL-text-style dump of the program that MILBuildMatmulChainSpec emits, for
+/// eyeballing the graph without a protobuf decoder.
+FOUNDATION_EXPORT NSString *MILMatmulChainText(MILMatmulChainConfig config);
