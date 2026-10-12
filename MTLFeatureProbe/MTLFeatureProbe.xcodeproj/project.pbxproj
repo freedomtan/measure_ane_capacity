@@ -1,0 +1,250 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 56;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		F00DF00DF00DF00DF00D0001 /* MTLFeatureProbeApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = F00DF00DF00DF00DF00D0004 /* MTLFeatureProbeApp.swift */; };
+		F00DF00DF00DF00DF00D0002 /* ContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = F00DF00DF00DF00DF00D0005 /* ContentView.swift */; };
+		F00DF00DF00DF00DF00D0003 /* FeatureProbe.swift in Sources */ = {isa = PBXBuildFile; fileRef = F00DF00DF00DF00DF00D0006 /* FeatureProbe.swift */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXFileReference section */
+		F00DF00DF00DF00DF00D0004 /* MTLFeatureProbeApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MTLFeatureProbeApp.swift; sourceTree = "<group>"; };
+		F00DF00DF00DF00DF00D0005 /* ContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContentView.swift; sourceTree = "<group>"; };
+		F00DF00DF00DF00DF00D0006 /* FeatureProbe.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FeatureProbe.swift; sourceTree = "<group>"; };
+		F00DF00DF00DF00DF00D0008 /* MTLFeatureProbe.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = MTLFeatureProbe.app; sourceTree = BUILT_PRODUCTS_DIR; };
+/* End PBXFileReference section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		F00DF00DF00DF00DF00D000F /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXGroup section */
+		F00DF00DF00DF00DF00D0009 /* MTLFeatureProbe (project root) */ = {
+			isa = PBXGroup;
+			children = (
+				F00DF00DF00DF00DF00D000A /* MTLFeatureProbe */,
+				F00DF00DF00DF00DF00D000B /* Products */,
+			);
+			sourceTree = "<group>";
+		};
+		F00DF00DF00DF00DF00D000A /* MTLFeatureProbe */ = {
+			isa = PBXGroup;
+			children = (
+				F00DF00DF00DF00DF00D0004 /* MTLFeatureProbeApp.swift */,
+				F00DF00DF00DF00DF00D0005 /* ContentView.swift */,
+				F00DF00DF00DF00DF00D0006 /* FeatureProbe.swift */,
+			);
+			path = MTLFeatureProbe;
+			sourceTree = "<group>";
+		};
+		F00DF00DF00DF00DF00D000B /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				F00DF00DF00DF00DF00D0008 /* MTLFeatureProbe.app */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		F00DF00DF00DF00DF00D000C /* MTLFeatureProbe */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = F00DF00DF00DF00DF00D0016 /* Build configuration list for PBXNativeTarget "MTLFeatureProbe" */;
+			buildPhases = (
+				F00DF00DF00DF00DF00D000E /* Sources */,
+				F00DF00DF00DF00DF00D000F /* Frameworks */,
+				F00DF00DF00DF00DF00D0010 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = MTLFeatureProbe;
+			productName = MTLFeatureProbe;
+			productReference = F00DF00DF00DF00DF00D0008 /* MTLFeatureProbe.app */;
+			productType = "com.apple.product-type.application";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		F00DF00DF00DF00DF00D000D /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				BuildIndependentTargetsInParallel = 1;
+				LastSwiftUpdateCheck = 1620;
+				LastUpgradeCheck = 1620;
+				TargetAttributes = {
+					F00DF00DF00DF00DF00D000C = {
+						CreatedOnToolsVersion = 16.2;
+					};
+				};
+			};
+			buildConfigurationList = F00DF00DF00DF00DF00D0015 /* Build configuration list for PBXProject "MTLFeatureProbe" */;
+			compatibilityVersion = "Xcode 14.0";
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				en,
+				Base,
+			);
+			mainGroup = F00DF00DF00DF00DF00D0009 /* MTLFeatureProbe (project root) */;
+			productRefGroup = F00DF00DF00DF00DF00D000B /* Products */;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				F00DF00DF00DF00DF00D000C /* MTLFeatureProbe */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXResourcesBuildPhase section */
+		F00DF00DF00DF00DF00D0010 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXResourcesBuildPhase section */
+
+/* Begin PBXSourcesBuildPhase section */
+		F00DF00DF00DF00DF00D000E /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				F00DF00DF00DF00DF00D0001 /* MTLFeatureProbeApp.swift in Sources */,
+				F00DF00DF00DF00DF00D0002 /* ContentView.swift in Sources */,
+				F00DF00DF00DF00DF00D0003 /* FeatureProbe.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin XCBuildConfiguration section */
+		F00DF00DF00DF00DF00D0011 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = dwarf;
+				ENABLE_TESTABILITY = YES;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_OPTIMIZATION_LEVEL = 0;
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
+				ONLY_ACTIVE_ARCH = YES;
+				SDKROOT = iphoneos;
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = DEBUG;
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+				SWIFT_VERSION = 5.0;
+			};
+			name = Debug;
+		};
+		F00DF00DF00DF00DF00D0012 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+				ENABLE_NS_ASSERTIONS = NO;
+				GCC_NO_COMMON_BLOCKS = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				MTL_ENABLE_DEBUG_INFO = NO;
+				SDKROOT = iphoneos;
+				SWIFT_COMPILATION_MODE = wholemodule;
+				SWIFT_VERSION = 5.0;
+				VALIDATE_PRODUCT = YES;
+			};
+			name = Release;
+		};
+		F00DF00DF00DF00DF00D0013 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_GENERATE_SWIFT_ASSET_SYMBOL_EXTENSIONS = YES;
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				ENABLE_PREVIEWS = YES;
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
+				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
+				INFOPLIST_KEY_UISupportedInterfaceOrientations = "UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
+				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad = "UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = "com.measure-ane-capacity.MTLFeatureProbe";
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Debug;
+		};
+		F00DF00DF00DF00DF00D0014 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_GENERATE_SWIFT_ASSET_SYMBOL_EXTENSIONS = YES;
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				ENABLE_PREVIEWS = YES;
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
+				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
+				INFOPLIST_KEY_UISupportedInterfaceOrientations = "UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
+				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad = "UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = "com.measure-ane-capacity.MTLFeatureProbe";
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Release;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		F00DF00DF00DF00DF00D0015 /* Build configuration list for PBXProject "MTLFeatureProbe" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				F00DF00DF00DF00DF00D0011 /* Debug */,
+				F00DF00DF00DF00DF00D0012 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		F00DF00DF00DF00DF00D0016 /* Build configuration list for PBXNativeTarget "MTLFeatureProbe" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				F00DF00DF00DF00DF00D0013 /* Debug */,
+				F00DF00DF00DF00DF00D0014 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+/* End XCConfigurationList section */
+	};
+	rootObject = F00DF00DF00DF00DF00D000D /* Project object */;
+}
