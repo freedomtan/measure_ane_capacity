@@ -135,6 +135,15 @@ typedef struct {
   NSUInteger K;
   NSUInteger N;
   BOOL weightIsInt8;
+  /// If true, appends `relu` immediately after `matmul` as the function's
+  /// real output, instead of returning the matmul's result directly.
+  /// Probes whether BNNS's compiler fuses the pair into a single
+  /// "elementwise_activation_matmul" op -- a different "kernel_routine
+  /// type" than bare matmul (see
+  /// docs/AMX_GEMM_Microkernel_Disassembly.md's "Clues toward actually
+  /// reaching the SME2 path" section) that may dispatch to the real SME2
+  /// kernel instead of the AMX one every bare matmul in this repo reaches.
+  BOOL fuseRelu;
 } MILMatmulWeightInputConfig;
 
 FOUNDATION_EXPORT NSString *MILMatmulWeightInputXName(void);

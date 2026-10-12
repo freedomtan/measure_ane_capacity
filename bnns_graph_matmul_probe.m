@@ -221,20 +221,31 @@ cleanup:
 int main(int argc, const char *argv[]) {
   size_t M = 1024, K = 1024, N = 1024;
   int iterations = 20;
+  const char *only = NULL;
   for (int i = 1; i < argc; i++) {
     if (strcmp(argv[i], "--size") == 0 && i + 1 < argc) {
       M = K = N = (size_t)atoi(argv[++i]);
     } else if (strcmp(argv[i], "--iterations") == 0 && i + 1 < argc) {
       iterations = atoi(argv[++i]);
+    } else if (strcmp(argv[i], "--only") == 0 && i + 1 < argc) {
+      only = argv[++i];
     }
   }
   printf("BNNSGraphCompileFromFile direct probe: M=K=N=%zu, %d iterations\n", (size_t)M, iterations);
 
   MILMatmulWeightInputConfig fp16Config = {.M = M, .K = K, .N = N, .weightIsInt8 = NO};
-  RunViaBNNSGraph("BNNSGraph FP16 weight-input", fp16Config, iterations);
-
   MILMatmulWeightInputConfig int8Config = {.M = M, .K = K, .N = N, .weightIsInt8 = YES};
-  RunViaBNNSGraph("BNNSGraph INT8 weight-input", int8Config, iterations);
+  MILMatmulWeightInputConfig reluConfig = {.M = M, .K = K, .N = N, .fuseRelu = YES};
+
+  if (!only || strcmp(only, "fp16") == 0) {
+    RunViaBNNSGraph("BNNSGraph FP16 weight-input", fp16Config, iterations);
+  }
+  if (!only || strcmp(only, "int8") == 0) {
+    RunViaBNNSGraph("BNNSGraph INT8 weight-input", int8Config, iterations);
+  }
+  if (!only || strcmp(only, "relu") == 0) {
+    RunViaBNNSGraph("BNNSGraph FP16+ReLU fused", reluConfig, iterations);
+  }
 
   return 0;
 }

@@ -422,13 +422,26 @@ every MIL graph in this repo has built so far. (Also tried: raising
 selected kernel/routine name directly — it stayed silent, so this had to come from static
 reverse-engineering of the dispatcher instead.)
 
+**Tried: fused `matmul` → `relu`. Result: still AMX, not SME2.** Added `fuseRelu` to
+`MILMatmulWeightInputConfig` (`relu(x=matmul(...))` instead of returning the matmul's result
+directly) and re-ran the live `lldb` dual-breakpoint check from Finding 12/the correction above,
+breakpoints on both the AMX kernel (`0x18f0623a4`) and the SME2 wrapper (`0x18f6f8128`,
+single-caller-confirmed) simultaneously. Result: **298 hits on the AMX breakpoint, 0 hits on the
+SME2 breakpoint** — the fused graph takes the exact same AMX path as the bare matmul. Most likely
+explanation: CoreML's optimizer doesn't actually *fuse* a plain MIL `matmul` immediately followed
+by a plain `relu` into one combined BNNS op at all — they probably stay two separate ops/BNNS
+calls (an unfused matmul, then a separate elementwise relu pass), so the matmul node BNNS sees is
+identical to the bare case and gets classified into the same `w25` routine type. Not confirmed via
+`--dump-mil`/`MLComputePlan` whether fusion happened at all; this is inferred from the clean
+behavioral result, not verified at the IR level.
+
 **Candidate next experiments, not attempted:**
-- Append a fused activation (e.g. MIL's `relu`) immediately after `matmul` in the graph and check
-  whether CoreML's optimizer fuses the two into a single BNNS op, changing which `w25` routine
-  type gets selected.
+- Confirm (or rule out) the fusion assumption above directly, e.g. via `MLComputePlan` on the
+  compiled model to see whether `matmul` and `relu` show up as one program operation or two.
 - Build a genuine attention-shaped pattern (`matmul` → `softmax` → `matmul`, or try CoreML's
   native `scaled_dot_product_attention` MIL op directly if the opset supports it) to target
-  `KERNEL_MATMUL_SOFTMAX_MATMUL_SME` specifically.
+  `KERNEL_MATMUL_SOFTMAX_MATMUL_SME` specifically — a real multi-op fused primitive, not a
+  generic activation tacked onto a vanilla GEMM, which `relu` evidently isn't enough to trigger.
 - For genuine FP8 compute specifically (`FEAT_SME_F8F16`/`FEAT_SME_F8F32`, confirmed present on
   A20 Pro per the user's own `sysctl` check — also `FEAT_FP8`, the baseline NEON/SVE FP8
   conversion-instruction feature, not previously checked in this repo): the dtype-hash gate above

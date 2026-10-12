@@ -983,12 +983,23 @@ NSData *MILBuildMatmulWeightInputSpec(MILMatmulWeightInputConfig config, NSError
     matmulWeight = "weights";
   }
 
-  AddOp(&block, "matmul",
-       {{"x", xName},
-        {"y", matmulWeight},
-        {"transpose_x", "no_transpose"},
-        {"transpose_y", "no_transpose"}},
-       outputName, TensorValueType(mil::FLOAT16, outputShape));
+  if (config.fuseRelu) {
+    AddOp(&block, "matmul",
+         {{"x", xName},
+          {"y", matmulWeight},
+          {"transpose_x", "no_transpose"},
+          {"transpose_y", "no_transpose"}},
+         "matmul_raw", TensorValueType(mil::FLOAT16, outputShape));
+    AddOp(&block, "relu", {{"x", "matmul_raw"}}, outputName,
+         TensorValueType(mil::FLOAT16, outputShape));
+  } else {
+    AddOp(&block, "matmul",
+         {{"x", xName},
+          {"y", matmulWeight},
+          {"transpose_x", "no_transpose"},
+          {"transpose_y", "no_transpose"}},
+         outputName, TensorValueType(mil::FLOAT16, outputShape));
+  }
 
   std::string serialized;
   if (!model.SerializeToString(&serialized)) {
