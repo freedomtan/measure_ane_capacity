@@ -16,8 +16,9 @@
 // memory via MLModelAsset for the conv benchmark; assumed to hold here too),
 // then the temp file is deleted.
 //
-// FP16 only: MILSpecBuilder's matmul chain builder has no INT8/FP8 quantized
-// variant yet, unlike its conv chain counterpart.
+// --precision fp16 (default), int8 (W8A8 QDQ), or fp8 (Float8E4M3 QDQ) --
+// MILSpecBuilder's matmul chain builder mirrors its conv chain counterpart's
+// quantize/dequantize pattern for all three.
 
 #import <locale.h>
 #import <time.h>
@@ -35,6 +36,7 @@ typedef struct {
   MLComputeUnits units;
   NSString *unitsName;
   MILWeightMode weightMode;
+  MILPrecision precision;
   BOOL showPlan;
   BOOL showMIL;
   BOOL checkOutput;
@@ -189,6 +191,7 @@ static void printUsage(const char *argv0) {
   printf("process at runtime, so every dimension below is just a flag.\n\n");
   printf("Options:\n");
   printf("  --units <target>   ane | gpu | cpu | all (default: ane)\n");
+  printf("  --precision <mode> fp16 (default), int8 (W8A8 QDQ), or fp8 (Float8E4M3 QDQ)\n");
   printf("  --batch <B>        batch dimension (default: 1)\n");
   printf("  --size <N>         square M=K=N matmul dimension (default: 1024)\n");
   printf("  --layers <L>       number of chained matmul layers (default: 20)\n\n");
@@ -210,7 +213,7 @@ static BOOL runBenchmark(BenchConfig cfg) {
 
     MILMatmulChainConfig spec = {
         .batch = cfg.B, .M = cfg.M, .K = cfg.K, .N = cfg.N, .layers = cfg.L,
-        .weightMode = cfg.weightMode,
+        .weightMode = cfg.weightMode, .precision = cfg.precision,
     };
     if (cfg.showMIL) printf("\n%s\n", MILMatmulChainText(spec).UTF8String);
 
@@ -349,9 +352,10 @@ static BOOL runBenchmark(BenchConfig cfg) {
     double totalOps = 2.0 * cfg.B * cfg.M * cfg.K * cfg.N * cfg.L;
     double tops = (totalOps / 1e12) / avg;
 
-    printf("[CoreML %s FP16] Compile: %.2f ms, Load: %.2f ms, Avg: %.2f ms, "
+    printf("[CoreML %s %s] Compile: %.2f ms, Load: %.2f ms, Avg: %.2f ms, "
            "Speed: %.4f TOPS (%.1f FPS)\n",
-           cfg.unitsName.UTF8String, prepMs, loadMs, avg * 1000.0, tops, 1.0 / avg);
+           cfg.unitsName.UTF8String, MILPrecisionName(cfg.precision).UTF8String,
+           prepMs, loadMs, avg * 1000.0, tops, 1.0 / avg);
 
     if (cfg.checkOutput) {
       MLMultiArray *out = [result featureValueForName:outputName].multiArrayValue;
@@ -406,6 +410,7 @@ int main(int argc, char *argv[]) {
       .units = MLComputeUnitsCPUAndNeuralEngine,
       .unitsName = @"ANE",
       .weightMode = MILWeightModeDense,
+      .precision = MILPrecisionFP16,
       .showPlan = NO,
       .showMIL = NO,
       .checkOutput = NO,
@@ -414,7 +419,19 @@ int main(int argc, char *argv[]) {
 
   for (int i = 1; i < argc; i++) {
     NSString *arg = [NSString stringWithUTF8String:argv[i]];
-    if ([arg isEqualToString:@"--units"] && i + 1 < argc) {
+    if ([arg isEqualToString:@"--precision"] && i + 1 < argc) {
+      NSString *v = [[NSString stringWithUTF8String:argv[++i]] lowercaseString];
+      if ([v isEqualToString:@"fp16"]) {
+        cfg.precision = MILPrecisionFP16;
+      } else if ([v isEqualToString:@"int8"]) {
+        cfg.precision = MILPrecisionINT8;
+      } else if ([v isEqualToString:@"fp8"]) {
+        cfg.precision = MILPrecisionFP8;
+      } else {
+        fprintf(stderr, "error: unknown --precision value '%s' (expected fp16, int8, or fp8)\n", v.UTF8String);
+        return 1;
+      }
+    } else if ([arg isEqualToString:@"--units"] && i + 1 < argc) {
       NSString *u = [[NSString stringWithUTF8String:argv[++i]] lowercaseString];
       if ([u isEqualToString:@"ane"]) {
         cfg.units = MLComputeUnitsCPUAndNeuralEngine;
@@ -477,7 +494,7 @@ int main(int argc, char *argv[]) {
     return 1;
   }
 
-  printf("CoreML Matmul Capacity Benchmark (FP16)\n");
+  printf("CoreML Matmul Capacity Benchmark (%s)\n", MILPrecisionName(cfg.precision).UTF8String);
   printf("Model: built at runtime by MILSpecBuilder (weights=%s)\n",
          MILWeightModeName(cfg.weightMode).UTF8String);
 

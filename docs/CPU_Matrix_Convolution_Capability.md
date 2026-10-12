@@ -325,6 +325,46 @@ observe AMX/SME instruction encodings (ARM disassemblers typically don't have AM
 all, since it's unofficial silicon, so this would mean recognizing raw opcode byte patterns by
 hand). Both are flagged as follow-ups, not done here.
 
+## Finding 7 — matmul now supports INT8 and FP8, matching the conv chain's QDQ pattern, on all three CoreML compute units
+
+Extended `MILMatmulChainConfig` with the same `precision` field the conv chain already has, and
+mirrored its QDQ (quantize/dequantize) pattern exactly for `matmul`:
+
+- **INT8**: weights stored via `constexpr_blockwise_shift_scale` (INT8 inline bytes + FP16
+  per-channel scale), activations `quantize`d to INT8 and `dequantize`d back to FP16 around each
+  `matmul`, same `act_scale = 1/32` constant the conv chain uses.
+- **FP8**: weights stored via `constexpr_lut_to_dense` (FP8-E4M3 inline indices + the same
+  256-entry IEEE-Float8-to-FP16 lookup table the conv chain uses), dequantized once to FP16 — like
+  the conv chain, activations are **not** quantized for FP8, only the weights.
+
+Added `--precision fp16|int8|fp8` to `measure_matmul_coreml.m`, matching `measure_conv_coreml.m`'s
+flag exactly. Ran all 9 combinations (3 precisions × ANE/GPU/CPU) on this M4 Pro, `--check`-verified
+finite/non-degenerate output on every one:
+
+| Precision | ANE | GPU | CPU |
+|---|---|---|---|
+| FP16 | 15.11 TOPS | 6.13 TOPS | 6.62 TOPS |
+| INT8 | 18.51 TOPS | 6.17 TOPS | 4.89 TOPS |
+| FP8  | 15.94 TOPS | 6.51 TOPS | 6.63 TOPS |
+
+**FP8's output is numerically identical to FP16's** (same sample values down to the printed
+digits) — expected, not a bug: like the conv chain, FP8 here only changes how the *weights* are
+stored on disk (`constexpr_lut_to_dense` dequantizes them to FP16 immediately), and the actual
+`matmul` still executes in FP16. This measures "FP8-compressed-weights overhead," not a native
+FP8 compute path — same caveat the conv chain's FP8 mode has always had, now true for matmul too.
+
+**INT8 is the only precision where ANE pulls meaningfully ahead of FP16/FP8** (18.51 vs ~15.5
+TOPS) — consistent with INT8 being the one case here that changes the actual *activation* dtype
+flowing through the op, not just the weight storage format, giving the ANE's integer path
+something real to do. INT8 CPU is the only precision where CPU meaningfully regresses (4.89 vs
+~6.6 TOPS for FP16/FP8) — plausibly the `quantize`/`dequantize` ops around every layer adding
+real per-layer overhead on CPU that the other compute units absorb better; not investigated
+further.
+
+Not yet done: running INT8/FP8 matmul on the three iPhones (would need porting the same QDQ
+pattern into `ANECapacityApp`'s independent `MILSpecBuilder.m`, same as Finding 5 did for the
+plain FP16 case).
+
 ## Not pursued here
 
 - Disassembling `applyOptimizationPassesWithDevice:` to confirm the nil-`metalDeviceName`

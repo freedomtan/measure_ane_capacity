@@ -365,6 +365,48 @@ static std::string WeightBytesMatmul(MILMatmulChainConfig config) {
   return bytes;
 }
 
+static std::string WeightBytesMatmulINT8(MILMatmulChainConfig config) {
+  size_t count = (size_t)config.batch * config.K * config.N;
+  std::string bytes(count * sizeof(int8_t), '\0');
+  int8_t *p = (int8_t *)bytes.data();
+
+  if (config.weightMode == MILWeightModeRepeat) {
+    static const int8_t pattern[4] = {1, -1, 2, -2};
+    for (size_t i = 0; i < count; i++) p[i] = pattern[i % 4];
+    return bytes;
+  }
+
+  uint64_t state = kWeightSeed;
+  for (size_t i = 0; i < count; i++) {
+    state ^= state << 13;
+    state ^= state >> 7;
+    state ^= state << 17;
+    p[i] = (state & 1) ? -1 : 1;
+  }
+  return bytes;
+}
+
+static std::string WeightBytesMatmulFP8(MILMatmulChainConfig config) {
+  size_t count = (size_t)config.batch * config.K * config.N;
+  std::string bytes(count, '\0');
+  uint8_t *p = (uint8_t *)bytes.data();
+
+  if (config.weightMode == MILWeightModeRepeat) {
+    static const uint8_t pattern[4] = {0x30, 0xB0, 0x38, 0xB8};
+    for (size_t i = 0; i < count; i++) p[i] = pattern[i % 4];
+    return bytes;
+  }
+
+  uint64_t state = kWeightSeed;
+  for (size_t i = 0; i < count; i++) {
+    state ^= state << 13;
+    state ^= state >> 7;
+    state ^= state << 17;
+    p[i] = (state & 1) ? 0xB0 : 0x30;
+  }
+  return bytes;
+}
+
 #pragma mark - Model description
 
 static void SetArrayFeature(ms::FeatureDescription *desc,
@@ -677,6 +719,7 @@ static void SetMetadataMatmul(ms::Metadata *metadata,
   userDefined["workload.k"] = std::to_string(config.K);
   userDefined["workload.n"] = std::to_string(config.N);
   userDefined["workload.layers"] = std::to_string(config.layers);
+  userDefined["workload.precision"] = MILPrecisionName(config.precision).UTF8String;
   userDefined["workload.weights"] =
       MILWeightModeName(config.weightMode).UTF8String;
   userDefined["builder"] = "MILSpecBuilder (native, no coremltools)";
@@ -749,12 +792,27 @@ NSData *MILBuildMatmulChainSpec(MILMatmulChainConfig config, NSError **error) {
   mil::Block &block = (*function.mutable_block_specializations())[kOpset];
   block.add_outputs(outputName);
 
-  // One weight constant shared by every layer, as in the MPSGraph version.
-  mil::Value weights;
-  weights.mutable_immediatevalue()->mutable_tensor()->mutable_bytes()->set_values(
-      WeightBytesMatmul(config));
-  AddConstOp(&block, "weights", TensorValueType(mil::FLOAT16, weightShape),
-             std::move(weights));
+  if (config.precision == MILPrecisionINT8) {
+    // Weights: constexpr_blockwise_shift_scale with INT8 inline data
+    AddConstexprBlockwiseShiftScaleOp(&block, "weights", weightShape,
+                                      WeightBytesMatmulINT8(config), kFP16PlusOneThirtySecond);
+
+    // Activation scale const: scalar fp16 1/32
+    AddConstOp(&block, "act_scale", TensorValueType(mil::FLOAT16, {}),
+               Float16ScalarValue(kFP16PlusOneThirtySecond));
+    AddConstOp(&block, "dtype_int8", StringScalarType(), StringValue("int8"));
+  } else if (config.precision == MILPrecisionFP8) {
+    // Weights: constexpr_lut_to_dense with inline FP8 E4M3 indices and IEEE Float8 LUT
+    AddConstexprLUTToDenseOp(&block, "weights", weightShape,
+                             WeightBytesMatmulFP8(config), kFP8E4M3ScaledToFP16LUT);
+  } else {
+    // One weight constant shared by every layer, as in the MPSGraph version.
+    mil::Value weights;
+    weights.mutable_immediatevalue()->mutable_tensor()->mutable_bytes()->set_values(
+        WeightBytesMatmul(config));
+    AddConstOp(&block, "weights", TensorValueType(mil::FLOAT16, weightShape),
+               std::move(weights));
+  }
 
   // matmul's transpose_x/transpose_y are "optional, default False" only at
   // the Python mb.matmul() builder level -- the compiled MLProgram itself
@@ -764,11 +822,29 @@ NSData *MILBuildMatmulChainSpec(MILMatmulChainConfig config, NSError **error) {
              BoolScalarValue(false));
 
   const mil::ValueType activationType = TensorValueType(mil::FLOAT16, outputShape);
+  const mil::ValueType int8QuantizedType = TensorValueType(mil::INT8, outputShape);
   std::string current = MILMatmulChainInputName().UTF8String;
   for (NSUInteger i = 0; i < config.layers; i++) {
+    std::string matmulInput = current;
+    if (config.precision == MILPrecisionINT8) {
+      std::string qName = "quant_" + std::to_string(i);
+      AddOp(&block, "quantize",
+            {{"input", current},
+             {"scale", "act_scale"},
+             {"output_dtype", "dtype_int8"}},
+            qName, int8QuantizedType);
+
+      std::string dqName = "dequant_" + std::to_string(i);
+      AddOp(&block, "dequantize",
+            {{"input", qName},
+             {"scale", "act_scale"}},
+            dqName, activationType);
+      matmulInput = std::move(dqName);
+    }
+
     std::string name = "matmul_" + std::to_string(i);
     AddOp(&block, "matmul",
-          {{"x", current},
+          {{"x", matmulInput},
            {"y", "weights"},
            {"transpose_x", "no_transpose"},
            {"transpose_y", "no_transpose"}},
@@ -789,14 +865,36 @@ NSString *MILMatmulChainText(MILMatmulChainConfig config) {
   [text appendFormat:@"function main (opset %s):\n", kOpset];
   [text appendFormat:@"  x: fp16[%lu, 1, %lu, %lu]\n", (unsigned long)config.batch,
                      (unsigned long)config.M, (unsigned long)config.K];
-  [text appendFormat:@"  weights = const(fp16[%lu, 1, %lu, %lu])  // %@, %lu bytes inline\n",
-                     (unsigned long)config.batch, (unsigned long)config.K,
-                     (unsigned long)config.N, MILWeightModeName(config.weightMode),
-                     (unsigned long)(config.batch * config.K * config.N * 2)];
+  if (config.precision == MILPrecisionINT8) {
+    [text appendFormat:@"  weights_int8 = const(int8[%lu, 1, %lu, %lu])  // %@, %lu bytes inline\n",
+                       (unsigned long)config.batch, (unsigned long)config.K, (unsigned long)config.N,
+                       MILWeightModeName(config.weightMode),
+                       (unsigned long)(config.batch * config.K * config.N)];
+    [text appendFormat:@"  weights = dequantize(input=weights_int8, scale=1/32, zero_point=0)\n"];
+  } else if (config.precision == MILPrecisionFP8) {
+    [text appendFormat:@"  raw_weights = const(fp8e4m3fn[%lu, 1, %lu, %lu])  // %@, %lu bytes inline\n",
+                       (unsigned long)config.batch, (unsigned long)config.K, (unsigned long)config.N,
+                       MILWeightModeName(config.weightMode),
+                       (unsigned long)(config.batch * config.K * config.N)];
+    [text appendFormat:@"  weights = dequantize(input=raw_weights, scale=1/16, zero_point=0)\n"];
+  } else {
+    [text appendFormat:@"  weights = const(fp16[%lu, 1, %lu, %lu])  // %@, %lu bytes inline\n",
+                       (unsigned long)config.batch, (unsigned long)config.K, (unsigned long)config.N,
+                       MILWeightModeName(config.weightMode),
+                       (unsigned long)(config.batch * config.K * config.N * 2)];
+  }
   NSString *current = MILMatmulChainInputName();
   for (NSUInteger i = 0; i < config.layers; i++) {
     NSString *name = [NSString stringWithFormat:@"matmul_%lu", (unsigned long)i];
-    [text appendFormat:@"  %@ = matmul(x=%@, y=weights, transpose_x=False, transpose_y=False)\n", name, current];
+    if (config.precision == MILPrecisionINT8) {
+      NSString *qName = [NSString stringWithFormat:@"quant_%lu", (unsigned long)i];
+      NSString *dqName = [NSString stringWithFormat:@"dequant_%lu", (unsigned long)i];
+      [text appendFormat:@"  %@ = quantize(input=%@, scale=1/32, zero_point=0, output_dtype=\"int8\")\n", qName, current];
+      [text appendFormat:@"  %@ = dequantize(input=%@, scale=1/32, zero_point=0)\n", dqName, qName];
+      [text appendFormat:@"  %@ = matmul(x=%@, y=weights, transpose_x=False, transpose_y=False)\n", name, dqName];
+    } else {
+      [text appendFormat:@"  %@ = matmul(x=%@, y=weights, transpose_x=False, transpose_y=False)\n", name, current];
+    }
     current = name;
   }
   [text appendFormat:@"  -> %@\n", current];

@@ -77,10 +77,15 @@ FOUNDATION_EXPORT NSString *MILConvChainText(MILConvChainConfig config);
 
 /// The workload: `layers` chained GEMMs, each `[batch, 1, M, K] x [batch, 1,
 /// K, N] -> [batch, 1, M, N]`, matching measure_matmul_universal.m's tensor
-/// shapes exactly. FP16 only for now (no quantized variants yet, unlike the
-/// conv chain above). Chaining requires K == N, same as the conv chain
-/// requires channelsIn == channelsOut: each layer's output becomes the next
-/// layer's input, so the shape must be self-consistent across layers.
+/// shapes exactly. Chaining requires K == N, same as the conv chain requires
+/// channelsIn == channelsOut: each layer's output becomes the next layer's
+/// input, so the shape must be self-consistent across layers.
+///
+/// `precision` mirrors the conv chain's QDQ pattern: INT8 quantizes/
+/// dequantizes activations around an FP16 matmul (weights stored as
+/// constexpr_blockwise_shift_scale INT8); FP8 dequantizes FP8-E4M3 weights
+/// (constexpr_lut_to_dense) but, like the conv chain, does not quantize
+/// activations.
 typedef struct {
   NSUInteger batch;
   NSUInteger M;
@@ -88,6 +93,7 @@ typedef struct {
   NSUInteger N;
   NSUInteger layers;
   MILWeightMode weightMode;
+  MILPrecision precision;
 } MILMatmulChainConfig;
 
 /// Name of the single model input ("x").
