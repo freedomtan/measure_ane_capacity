@@ -394,3 +394,45 @@ a precision or hardware-engine switch.
   turn out to run on AMX. The real contrast Finding 11/12 established — modern API reaches a
   faster AMX kernel with far less quantization overhead than the legacy API's — still stands; only
   the "AMX vs SME2" explanation for *why* needs to be dropped.
+
+## Clues toward actually reaching the SME2 path (not attempted here)
+
+The real SME2 code is reachable from the same outer dispatcher (`0x18f0d7f68`) that leads to the
+AMX path, but gated by two conditions found by reading further up that function:
+
+1. **A 9-way dispatch on a "matmul kernel_routine type" value** (`w25`, compared against
+   `0x1a00`–`0x1a08`; the fallback case's error string literally reads `"matmul: kernel_routine
+   type not handled"`). Only **two** of those nine values (`0x1a07`/`0x1a08`) set a flag (`w20=1`)
+   that's required to reach the SME2 call at all — every other routine-type value falls through to
+   the generic AMX/`dispatch_apply` path traced above.
+2. **A dtype/type-tag hash check** gated behind that flag: `[x5]` (a pointer to some per-tensor
+   type descriptor) is compared against four magic 32-bit constants (`0x9f7728b9`, `0x66dff2e5`,
+   `0x59aa5615`, `0x2d7251cc`); only the last one falls through to the real `smstart`-wrapped SME2
+   call (`0x18f6f8128`, confirmed to have exactly one caller in the whole library). The other three
+   reach different, unexamined code paths.
+
+Nine "routine types" lines up suspiciously well with Finding 6's kernel-tier name list, which
+included not just plain `KERNEL_MATMUL_{NEON,MLA1,MLA2,MLA3,SME2,...}` but also
+`KERNEL_MATMUL_ELEMENTWISE_ACTIVATION_MATMUL_{MLA2,SME2}` and
+`KERNEL_MATMUL_SOFTMAX_MATMUL_{MLA,SME}` — i.e. BNNS appears to reserve its SME2 dense-GEMM
+kernel specifically for a **fused** matmul variant (matmul immediately followed by an activation,
+or a fused attention-shaped matmul→softmax→matmul pattern), not for the bare, unfused `matmul` op
+every MIL graph in this repo has built so far. (Also tried: raising
+`BNNSGraphContextSetMessageLogMask` to `BNNSGraphMessageLevelInfo` hoping BNNS would print the
+selected kernel/routine name directly — it stayed silent, so this had to come from static
+reverse-engineering of the dispatcher instead.)
+
+**Candidate next experiments, not attempted:**
+- Append a fused activation (e.g. MIL's `relu`) immediately after `matmul` in the graph and check
+  whether CoreML's optimizer fuses the two into a single BNNS op, changing which `w25` routine
+  type gets selected.
+- Build a genuine attention-shaped pattern (`matmul` → `softmax` → `matmul`, or try CoreML's
+  native `scaled_dot_product_attention` MIL op directly if the opset supports it) to target
+  `KERNEL_MATMUL_SOFTMAX_MATMUL_SME` specifically.
+- For genuine FP8 compute specifically (`FEAT_SME_F8F16`/`FEAT_SME_F8F32`, confirmed present on
+  A20 Pro per the user's own `sysctl` check — also `FEAT_FP8`, the baseline NEON/SVE FP8
+  conversion-instruction feature, not previously checked in this repo): the dtype-hash gate above
+  means even reaching the right routine type isn't enough without the matmul's operand type tag
+  also matching the FP8 hash specifically — which likely requires a genuinely FP8-typed `matmul`
+  input, not today's dequantize-to-FP16-before-matmul pattern (Finding 7/9's limitation), compounding
+  with the routine-type requirement above.

@@ -36,6 +36,11 @@ static double NowSeconds(void) {
   return (double)t * timebase.numer / timebase.denom / 1e9;
 }
 
+static void LogCallback(BNNSGraphMessageLevel level, const char *msg, const char *opInfo,
+                         bnns_user_message_data_t *extra) {
+  printf("   [bnns msg level=%u] %s%s%s\n", level, msg, opInfo ? " op_info=" : "", opInfo ?: "");
+}
+
 // The weight-input model declares its INT8 weight as an INT32 model input
 // (see MILBuildMatmulWeightInputSpec's comment on CoreML's I/O type
 // restriction) and `cast`s it to INT8 internally, so the caller fills an
@@ -121,6 +126,9 @@ static void RunViaBNNSGraph(const char *label, MILMatmulWeightInputConfig config
     [[NSFileManager defaultManager] removeItemAtPath:mlmodelcPath error:nil];
     return;
   }
+  BNNSGraphContextSetMessageLogCallback(context, LogCallback, NULL);
+  BNNSGraphContextSetMessageLogMask(context, BNNSGraphMessageLevelInfo | BNNSGraphMessageLevelUnsupported |
+                                                  BNNSGraphMessageLevelWarning | BNNSGraphMessageLevelError);
 
   size_t M = config.M, K = config.K, N = config.N;
   uint16_t *x = malloc(M * K * sizeof(uint16_t));
