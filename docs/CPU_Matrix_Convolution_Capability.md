@@ -364,6 +364,18 @@ through BNNS and CoreML). Not confirmed/out of scope: whether the private legacy
 chips without `FEAT_SME2` (pre-M4-generation) fall back to those AMX tiers instead — this was only
 checked for the FP16 dense path on this specific chip.
 
+> **Correction (see `docs/AMX_GEMM_Microkernel_Disassembly.md`):** the "SME2-exclusive
+> instructions in the actual hot function" claim above is wrong. It came from disassembling an
+> overly wide address window around the breakpoint-hit function, which pulled in a *different*,
+> later function's SME2 code and misattributed it. Properly bounded (via the function's own
+> `pacibsp`/`ret` pair) and traced live by stepping through its indirect calls, the breakpoint-hit
+> function dispatches to a different, genuinely AMX-based kernel (same undocumented
+> `0x00201000`-NOP-space encoding as Finding 11), not SME2. The `lldb` breakpoint-hit confirmation
+> itself was real and is not in question — only which instructions execute there. The real SME2
+> code does exist elsewhere in `libBNNS.dylib`; whether this repo's benchmarks ever reach it is now
+> open. See the linked doc for the full annotated disassembly and decompiled pseudocode of the
+> actual kernel.
+
 ## Finding 7 — matmul now supports INT8 and FP8, matching the conv chain's QDQ pattern, on all three CoreML compute units
 
 Extended `MILMatmulChainConfig` with the same `precision` field the conv chain already has, and
@@ -689,7 +701,7 @@ to auto-`bt 4`/`continue` (avoiding the interactive-hang mistake from Finding 6'
 and launched the real benchmark under it:
 
 ```
-* frame #0: libBNNS.dylib`___lldb_unnamed_symbol_18f6e0ca4            <- the SME2 kernel
+* frame #0: libBNNS.dylib`___lldb_unnamed_symbol_18f6e0ca4            <- breakpoint-hit function (see correction below)
   frame #1: libBNNS.dylib`___lldb_unnamed_symbol_18f6e030c + 2412     <- dispatcher
   frame #2: libBNNS.dylib`___lldb_unnamed_symbol_18ee1c2e8 + 348
   frame #3: libdispatch.dylib`_dispatch_client_callout3_a + 16
@@ -701,16 +713,26 @@ now proven to also be live-executed by the INT8-weight-input path specifically, 
 statistically likely from sampling. Reverted the temporary edit afterward (confirmed via `git diff`
 that the source file matches its committed state).
 
+> **Correction (see `docs/AMX_GEMM_Microkernel_Disassembly.md`):** the live backtrace above is a
+> real, reproducible hit on the breakpoint-hit function — that part stands. But "the SME2 kernel"
+> label on `frame #0` is wrong, for the same reason as Finding 6's correction: that function
+> (properly bounded by its own `pacibsp`/`ret`) contains no SME2 instructions at all. Stepping
+> through its indirect calls live resolves to a genuinely AMX-based microkernel instead (same
+> `0x00201000`-NOP-space encoding as Finding 11). The underlying claim this section exists to
+> support — that `BNNSGraphCompileFromFile` reaches the *same* fast kernel for both FP16 and
+> INT8-weight-input, confirmed live — is unaffected by this correction; only the "which hardware
+> engine" label was wrong.
+
 **Net result: `BNNSGraphCompileFromFile` is a materially better way to reach BNNS with a genuinely
 non-foldable low-precision weight than either of Finding 11's legacy `bnns.h` entry points.**
 `BNNSMatMul` rejected INT8 outright; `BNNSFilterCreateLayerFullyConnected` accepted it but paid for
-it with a 2×+ regression into a pre-SME2 AMX microkernel. The modern graph API accepts a genuinely
-runtime-variable INT8 (via the INT32-boundary/cast workaround) and dispatches the *same* fast SME2
-kernel the FP16 case uses, paying only the dequantize preprocessing cost — the smallest, most
-honest "quantization overhead" number found anywhere in this investigation. This also means
-Finding 10's constant-folding result and Finding 11's legacy-AMX result were both, in their own
-way, artifacts of *which API* was used to reach BNNS, not fundamental limits on what the hardware
-or BNNS's modern kernel set can do with INT8.
+it with a 2×+ regression into a different (slower-dispatching) AMX code path. The modern graph API
+accepts a genuinely runtime-variable INT8 (via the INT32-boundary/cast workaround) and dispatches
+the *same* fast kernel the FP16 case uses, paying only the dequantize preprocessing cost — the
+smallest, most honest "quantization overhead" number found anywhere in this investigation. This
+also means Finding 10's constant-folding result and Finding 11's legacy-kernel result were both,
+in their own way, artifacts of *which API* was used to reach BNNS, not fundamental limits on what
+the hardware or BNNS's modern kernel set can do with INT8.
 
 ## Finding 13 — Finding 12 ported to all three iPhones: the modern BNNSGraph path's small INT8 overhead reproduces everywhere, and shrinks on newer chips
 
@@ -739,13 +761,15 @@ of the small hand-verified cases from Finding 12.
 **The small INT8 overhead from Finding 12 reproduces on every chip, and is smaller on every
 iPhone than on the Mac** — in fact A19 Pro's gap (+8%, confirmed by repeating the run twice) is
 barely above run-to-run noise. None of the iPhones show anything resembling Finding 11's 2×+
-legacy-AMX regression. This is consistent with (though doesn't by itself prove) the modern
-`BNNSGraph` path dispatching the same real SME2-class kernel on every one of these chips that
-Finding 6 traced on the Mac, with the `cast`+`dequantize` preprocessing cost shrinking relative to
-the matmul itself as each generation's SME2 throughput improves — the newest chips absorb the
-quantization bookkeeping almost for free, in sharp contrast to the Mac's `MLModel`-based INT8 path
-(Finding 7/8), where the *same kind* of overhead was large enough to make CPU INT8 regress below
-CPU FP16/FP8, a result that itself never reproduced on any iPhone either (Finding 8).
+legacy-kernel regression. This is consistent with (though doesn't by itself prove) the modern
+`BNNSGraph` path dispatching the same real microkernel on every one of these chips that this
+investigation traced on the Mac (see `docs/AMX_GEMM_Microkernel_Disassembly.md` — it's AMX, not
+SME2, correcting Finding 6/12's original "SME2" label), with the `cast`+`dequantize` preprocessing
+cost shrinking relative to the matmul itself as each generation's AMX/CPU throughput improves — the
+newest chips absorb the quantization bookkeeping almost for free, in sharp contrast to the Mac's
+`MLModel`-based INT8 path (Finding 7/8), where the *same kind* of overhead was large enough to make
+CPU INT8 regress below CPU FP16/FP8, a result that itself never reproduced on any iPhone either
+(Finding 8).
 
 ## Not pursued here
 
