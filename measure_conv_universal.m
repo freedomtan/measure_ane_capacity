@@ -9,7 +9,10 @@
 // available.
 @interface MPSGraphDevice (ANE)
 + (instancetype)ANEDevice;
++ (instancetype)CPUDevice;
 @end
+
+typedef enum { kTargetGPU, kTargetANE, kTargetCPU } Target;
 
 // Private property on MPSGraphCompilationDescriptor to target ANE on modern macOS/iOS.
 @interface MPSGraphCompilationDescriptor (Private)
@@ -48,7 +51,7 @@ static void fillNonZeroData(void *buffer, size_t byteCount, MPSDataType dataType
 /**
  * Runs the Conv2D benchmark on the specified device with the given data type.
  */
-void run_bench(id<MTLDevice> device, bool useANE, MPSDataType dataType,
+void run_bench(id<MTLDevice> device, Target target, MPSDataType dataType,
                NSString *name) {
   @autoreleasepool {
     // Default device wrapper
@@ -108,18 +111,28 @@ void run_bench(id<MTLDevice> device, bool useANE, MPSDataType dataType,
 
     MPSGraphCompilationDescriptor *cd = [MPSGraphCompilationDescriptor new];
     cd.optimizationLevel =
-        useANE ? MPSGraphOptimizationLevel1 : MPSGraphOptimizationLevel0;
+        (target == kTargetGPU) ? MPSGraphOptimizationLevel0 : MPSGraphOptimizationLevel1;
 
     // Safe ANE device targeting across OS versions:
     // On macOS 15+ / 26+, preferredDevice = 2 targets ANE while retaining MTLDevice context.
     // On older platforms, fallback to [MPSGraphDevice ANEDevice].
-    if (useANE) {
+    if (target == kTargetANE) {
       if ([cd respondsToSelector:@selector(setPreferredDevice:)]) {
         cd.preferredDevice = 2; // MPSGraphDeviceTypeANE
       } else if ([MPSGraphDevice respondsToSelector:@selector(ANEDevice)]) {
         mDev = [MPSGraphDevice ANEDevice];
       } else {
         NSLog(@"[%@] Skipped: ANE device not supported on this platform/OS version.", name);
+        return;
+      }
+    } else if (target == kTargetCPU) {
+      // Private SPI, parallel to +[MPSGraphDevice ANEDevice]; no corresponding
+      // preferredDevice enum value is known, so route through the device
+      // object directly rather than guessing one.
+      if ([MPSGraphDevice respondsToSelector:@selector(CPUDevice)]) {
+        mDev = [MPSGraphDevice CPUDevice];
+      } else {
+        NSLog(@"[%@] Skipped: CPU device not supported on this platform/OS version.", name);
         return;
       }
     }
@@ -206,16 +219,31 @@ int main(int argc, char *argv[]) {
     return 1;
   }
 
-  // Benchmark FP16
-  run_bench(device, false, MPSDataTypeFloat16, @"GPU FP16");
-  run_bench(device, true, MPSDataTypeFloat16, @"ANE FP16");
+  // The CPU target's compile path has been observed to throw an
+  // NSInvalidArgumentException from a background GCD thread inside
+  // -[MPSGraphExecutable compileWithDevice:...] itself (see
+  // measure_matmul_universal.m for the full stack trace), which @try/@catch
+  // on the calling thread cannot intercept -- it aborts the whole process.
+  // Run each target as its own subprocess (via --target) so a CPU-target
+  // crash doesn't take out the GPU/ANE results in the same invocation.
+  NSString *onlyTarget = nil;
+  for (int i = 1; i < argc; i++) {
+    if (strcmp(argv[i], "--target") == 0 && i + 1 < argc) {
+      onlyTarget = [NSString stringWithUTF8String:argv[i + 1]];
+    }
+  }
 
-  // Benchmark INT8 (Signed Int 8)
-  // Check runtime environment or compile macros if specific GPU skipping is
-  // needed for iOS vs macOS. Generally, ANE supports INT8. GPU support depends
-  // on the specific GPU family. For safety, we keep the previous logic: GPU
-  // INT8 is likely unsupported on Apple GPUs for MPSGraph convolution.
+  if (!onlyTarget || [onlyTarget isEqualToString:@"gpu"]) {
+    run_bench(device, kTargetGPU, MPSDataTypeFloat16, @"GPU FP16");
+  }
+  if (!onlyTarget || [onlyTarget isEqualToString:@"ane"]) {
+    run_bench(device, kTargetANE, MPSDataTypeFloat16, @"ANE FP16");
+    run_bench(device, kTargetANE, MPSDataTypeInt8, @"ANE INT8");
+  }
+  if (!onlyTarget || [onlyTarget isEqualToString:@"cpu"]) {
+    run_bench(device, kTargetCPU, MPSDataTypeFloat16, @"CPU FP16");
+    run_bench(device, kTargetCPU, MPSDataTypeInt8, @"CPU INT8");
+  }
 
-  // run_bench(device, false, MPSDataTypeInt8, @"GPU INT8");
-  run_bench(device, true, MPSDataTypeInt8, @"ANE INT8");
+  return 0;
 }
