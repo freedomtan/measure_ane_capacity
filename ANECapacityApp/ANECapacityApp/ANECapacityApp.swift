@@ -15,6 +15,12 @@ struct ANECapacityApp: App {
                 exit(0)
             }
         }
+        if ProcessInfo.processInfo.arguments.contains("--supports-mxu") {
+            DispatchQueue.global().async {
+                SupportsMXUProbe.run()
+                exit(0)
+            }
+        }
     }
 
     var body: some Scene {

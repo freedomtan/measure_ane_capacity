@@ -210,6 +210,63 @@ feeds a codegen branch inside the graph optimizer/lowering passes themselves (e.
 internals, out of scope here. The cache-key role is solid; a direct codegen-dispatch
 role is plausible but unverified.
 
+## Finding 2b — live `supportsMXU()` on a real MXU-capable device returns `NO`, consistent with Finding 2's "cache key, not runtime check" framing
+
+Findings 1/1b's chip-codename string-parsing logic was reconstructed entirely
+from static disassembly. Tested live for the first time here, on a third
+physical device (an iPhone 18 Pro, `Apple A20 Pro GPU`, the same chip family
+as Finding 4o/4p's A20 Pro) via a small probe that constructs a live
+`MPSGraphDeviceDescriptor` the way application code actually would —
+`MPSGraphDevice(mtlDevice:)` → `-[MPSGraphDeviceDescriptor
+initWithMPSGraphDevice:]` — then calls `-supportsMXU`/`-hasANE`/`-architecture`
+directly via the same raw-`IMP` message-send pattern used throughout this
+document:
+
+```
+[SupportsMXUProbe] Device: Apple A20 Pro GPU
+[SupportsMXUProbe] architecture=h19p supportsMXU=Optional(false) hasANE=Optional(true)
+```
+
+**`supportsMXU` returns `NO` on hardware that unambiguously has a real MXU** —
+this exact chip family passed FP8 GEMM/conv dispatch tests that A18 Pro
+structurally rejects (Findings 4l, 4o). `hasANE` correctly reports `YES` on
+the same descriptor, so the message-send plumbing itself is not in question —
+only `supportsMXU`'s answer is surprising.
+
+The `architecture=h19p` string printed above is a red herring for explaining
+this, not evidence of it: it comes from the **ANE hardware-architecture
+code** (the `h13`/`h14`/`h17`/`h19` family documented in
+`convert_fp8_to_hwx.m`'s `kKnownArchs` table, where `h19` is literally
+annotated `"A20 Pro / H19"`), a completely different, independently-numbered
+scheme from the GPU-generation chip-codename string (something like `"A20"`)
+that Finding 1's disassembly shows `-supportsMXU` actually parses from a
+separate private ivar (`_chipCodeName`). The two are not interchangeable, and
+nothing here establishes what `_chipCodeName` actually contains for a
+descriptor built this way.
+
+**Most likely explanation, consistent with Finding 2's own conclusion:**
+Finding 1's pseudocode has an early-exit — `if (chipCode.length == 0) return
+NO;` — before any digit-parsing happens at all. Finding 2 already established
+that `supportsMXU` is designed as a **compiled-module cache-key field**,
+populated through the explicit cross-compilation constructor
+(`initMetalDeviceWithGPUCoreCount:architecture:`, the one `convert_fp8_to_hwx.m`
+actually uses to target a specific architecture string for ahead-of-time
+compilation) rather than through `initWithMPSGraphDevice:`, the constructor
+exercised here. If `initWithMPSGraphDevice:` simply never populates
+`_chipCodeName`, every live-device-constructed descriptor would trivially
+return `NO` from `supportsMXU` regardless of the actual hardware's real MXU
+capability — which is exactly what was observed. This has not been confirmed
+by disassembling `initWithMPSGraphDevice:` itself (not yet attempted), so it
+remains the leading hypothesis, not a proven mechanism.
+
+**Practical upshot:** code that wants to ask "does *this* device have an
+MXU" by constructing a live `MPSGraphDeviceDescriptor` from the running
+`MTLDevice` and calling `-supportsMXU` gets a meaningless/always-`NO` answer
+on at least this construction path — reinforcing Finding 2's point that this
+property is an internal compiled-cache implementation detail, not a public
+capability query, and nothing in this document's findings should be read as
+"query `supportsMXU` at runtime to detect MXU hardware."
+
 ## Finding 3 — what "MXU" actually stands for: unresolved, likely an external borrowing
 
 No literal expansion of the acronym exists anywhere in this macOS 27
@@ -1422,6 +1479,18 @@ all) or holds more generally wasn't tested further; given that shape is the
 currently no known configuration, dtype, or chip combination, reachable from
 app code via this class, that reaches a native `conv2d_a18/a20_*` kernel.
 
+**Third-device reproduction, bit-for-bit.** Re-ran both the plain-FP16 probe
+and this FP8-E4M3 in-range probe on an iPhone 18 Pro (`Apple A20 Pro GPU` —
+a different physical unit from the Mac used above, same chip family). Every
+number matched exactly: the FP16 GPU result
+(`[259.0, 194.0, -81.0, 120.0, ...]`), the FP8 decoded result
+(`[14.0, 16.0, 16.0, 18.0, 7.0, 8.0, 8.0, 9.0, ...]`), the best layout-sweep
+diffs (`1019.0` and `49.015625` respectively), and the full kernel-name
+sequence from `KernelNameLogger` for both. This is not new information, but
+it is a clean independent confirmation that the generic-plugin-fallback
+result is a property of the chip/driver, not an artifact of one specific
+physical part or one specific Mac.
+
 ## Finding 5 — `MPSNDArraySDPAA18Behavior::EncodeSDPA`, decompiled
 
 Address: `0x190c876d8` (`MPSNDArray.framework`, a sub-framework of
@@ -1924,6 +1993,16 @@ flowchart TB
 - Whether `MPSGraphDeviceDescriptor.supportsMXU` feeds any actual codegen/lowering
   decision inside MPSGraph's optimizer passes (as opposed to only the module
   cache-key role established in Finding 2) was not traced.
+- **New, from a live third-device test (Finding 2b):** calling
+  `-supportsMXU` on a `MPSGraphDeviceDescriptor` built from the live
+  `MTLDevice` (`initWithMPSGraphDevice:`) returns `NO` even on an A20 Pro
+  unit that passes FP8 GEMM/conv dispatch tests A18 Pro structurally
+  rejects. Leading hypothesis — not disassembly-confirmed — is that this
+  constructor never populates the private `_chipCodeName` ivar Finding 1's
+  parsing logic depends on, so it trivially always returns `NO` down the
+  `chipCode.length == 0` early-exit, independent of the real hardware.
+  Disassembling `-[MPSGraphDeviceDescriptor initWithMPSGraphDevice:]`
+  itself would confirm or refute this; not attempted.
 - ~~The compiled AIR/`.metallib` bytecode for `sdpa_tile_fwd_16x16x16_*` itself was
   not disassembled...~~ **Resolved by Finding 4d:** `metal-objdump --metallib
   --disassemble` against the physical device's `MPSNDArray.framework/default.metallib`
