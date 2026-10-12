@@ -33,9 +33,29 @@ struct ANECapacityApp: App {
                 exit(0)
             }
         }
+        if ProcessInfo.processInfo.arguments.contains("--sysctl-features") {
+            DispatchQueue.global().async {
+                SysctlFeatureProbe.run()
+                exit(0)
+            }
+        }
         if ProcessInfo.processInfo.arguments.contains("--native-coreml-matmul") {
             DispatchQueue.global().async {
                 NativeCoreMLMatmulProbe.run()
+                exit(0)
+            }
+        }
+        if let idx = ProcessInfo.processInfo.arguments.firstIndex(of: "--native-coreml-matmul-single"),
+           idx + 1 < ProcessInfo.processInfo.arguments.count {
+            let precisionArg = ProcessInfo.processInfo.arguments[idx + 1]
+            let precision: MILPrecision = precisionArg == "fp8" ? .FP8 : (precisionArg == "int8" ? .INT8 : .FP16)
+            let args = ProcessInfo.processInfo.arguments
+            var unitsFilter: String? = nil
+            if let uidx = args.firstIndex(of: "--units"), uidx + 1 < args.count {
+                unitsFilter = args[uidx + 1]
+            }
+            DispatchQueue.global().async {
+                NativeCoreMLMatmulProbe.runSingle(precision: precision, unitsFilter: unitsFilter)
                 exit(0)
             }
         }

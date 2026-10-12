@@ -442,6 +442,57 @@ this wasn't traced further.
 7's Mac result and the explanation given there — INT8 is the only precision that changes the
 actual activation dtype flowing through the op, not just the weight storage format).
 
+## Finding 9 — does FP8 take a different SME2 code path on iPhone 18 Pro (A20 Pro), which adds new SME2 FP8 extensions?
+
+A20 Pro is the first chip in this repo built on ARM's newer SME2.1 extensions, which add two new
+feature bits ARM calls `FEAT_SME_F8F16`/`FEAT_SME_F8F32` (dedicated FP8 outer-product instructions,
+accumulating into FP16/FP32 ZA state respectively — a genuine hardware FP8 matmul path, unlike
+plain SME2's FP16/BF16 `fmopa`). Checked whether this repo's own FP8 matmul benchmark actually
+reaches that new path on this chip.
+
+**Confirmed the hardware generational split with a small on-device `sysctlbyname` probe**
+(`SysctlFeatureProbe.swift`, new `--sysctl-features` launch arg), run on all four chips:
+
+| | M4 Pro (Mac) | A18 Pro | A19 Pro | A20 Pro |
+|---|---|---|---|---|
+| `FEAT_SME2p1` | 0 | 0 | 1 | 1 |
+| `FEAT_SME_F8F16` | 0 | 0 | 0 | **1** |
+| `FEAT_SME_F8F32` | 0 | 0 | 0 | **1** |
+
+A20 Pro is the only chip tested here with the new FP8-capable SME2 hardware at all — exactly the
+"new FP8 features for SME2" in question.
+
+**But the benchmark itself doesn't exercise it.** Three lines of evidence, all pointing the same
+way:
+
+1. **`libBNNS.dylib`'s own kernel-tier names are identical across chips.** The iPhone 18 Pro's copy
+   (pulled from the matching Xcode `iOS DeviceSupport` symbol cache, `iPhone19,2 27.0.1 (24A446)`)
+   has the exact same `KERNEL_GEMM_{NEON,MLA1,MLA2,MLA3,SME2}`/`KERNEL_MATMUL_{...,SME2P1}` string
+   set as Finding 6 found on the Mac — no distinct `KERNEL_GEMM_FP8`/`_F8F16` tier exists anywhere,
+   on any chip. BNNS's dense-GEMM kernel selector has no FP8-specific option to even pick.
+2. **On-device A/B timing on the A20 Pro itself is statistically identical between precisions**
+   (isolated via a new `--native-coreml-matmul-single <precision> --units <unit>` launch arg added
+   to avoid comparing across unrelated runs):
+   `[CoreML CPU FP16] Avg: 10.05 ms, Speed: 4.2722 TOPS` vs. `[CoreML CPU FP8] Avg: 10.07 ms, Speed:
+   4.2658 TOPS` — a 0.2% difference, well within run-to-run noise, not what a genuinely different
+   compute kernel would look like.
+3. **This is architecturally expected, not a surprise**, per Finding 7: this repo's FP8 mode
+   dequantizes FP8-E4M3 weights to FP16 via `constexpr_lut_to_dense` *before* the `matmul` op, so
+   the op BNNS actually receives is a plain FP16-input matmul regardless of the "FP8" label on the
+   weight constant. BNNS's dispatcher never sees a real FP8 tensor from this MIL graph, so it has
+   no reason to select a different kernel even on hardware that has one.
+
+**Net result: no, this benchmark does not take a different SME2 path for FP8 on iPhone 18 Pro** —
+it hits the identical SME2 FP16 kernel traced in Finding 6, on every chip, including this one. The
+new `FEAT_SME_F8F16`/`FEAT_SME_F8F32` hardware exists and is uniquely present on A20 Pro, but
+reaching it would require a MIL graph with a genuine FP8-typed `matmul` input (not just an FP8-
+compressed-then-dequantized weight constant) — CoreML/MIL's `matmul` op doesn't expose that today
+in the way this repo's builders construct it. Confirming whether *any* CoreML/MIL op can reach the
+true FP8 SME2 path at all is a candidate follow-up, not done here. (Also not pursued: pinpointing
+the exact code location that reads the `FEAT_SME_F8F16` sysctl inside `libBNNS.dylib` — a low-level
+string-cross-reference attempt hit a dead end, repeatedly landing on unrelated pointer-
+authentication trampoline code rather than the real reader.)
+
 ## Not pursued here
 
 - Disassembling `applyOptimizationPassesWithDevice:` to confirm the nil-`metalDeviceName`

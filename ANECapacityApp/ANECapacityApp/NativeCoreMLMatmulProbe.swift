@@ -15,7 +15,16 @@ enum NativeCoreMLMatmulProbe {
         }
     }
 
-    private static func runOne(precision: MILPrecision) {
+    /// Isolates a single precision's benchmark to one or more compute units, for
+    /// controlled lldb/sample comparison of the exact BNNS call path per precision
+    /// (see docs/CPU_Matrix_Convolution_Capability.md Finding 6's follow-up on whether
+    /// FP8 takes a different SME2 code path than FP16 on A20 Pro, which supports the
+    /// FEAT_SME_F8F16 ARM extension).
+    static func runSingle(precision: MILPrecision, unitsFilter: String? = nil) {
+        runOne(precision: precision, unitsFilter: unitsFilter)
+    }
+
+    private static func runOne(precision: MILPrecision, unitsFilter: String? = nil) {
         let config = MILMatmulChainConfig(batch: 1, M: 1024, K: 1024, N: 1024, layers: 20, weightMode: .dense, precision: precision)
         let precisionName = MILPrecisionName(precision)
         print("[CoreMLMatmulProbe] === precision: \(precisionName) ===")
@@ -64,11 +73,14 @@ enum NativeCoreMLMatmulProbe {
         }
         defer { try? FileManager.default.removeItem(at: compiledURL) }
 
-        let units: [(String, MLComputeUnits)] = [
+        var units: [(String, MLComputeUnits)] = [
             ("ANE", .cpuAndNeuralEngine),
             ("GPU", .cpuAndGPU),
             ("CPU", .cpuOnly),
         ]
+        if let unitsFilter {
+            units = units.filter { $0.0 == unitsFilter }
+        }
 
         let inputName = MILMatmulChainInputName()
         let outputName = MILMatmulChainOutputName(config)
