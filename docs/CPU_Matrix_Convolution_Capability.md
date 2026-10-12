@@ -135,13 +135,48 @@ CoreML/MIL route being the one that actually works).
 chips tested in this repo (M4 Pro, A18 Pro, A20 Pro) and both benchmark shapes (matmul, conv).**
 Finding 2's CoreML/MIL route remains the only working CPU path.
 
-## Open: no CoreML/MIL matmul equivalent exists yet
+## Finding 4 — resolved: `MILSpecBuilder.mm` now has a `matmul` chain builder, and `measure_matmul_coreml.m` gives a real CPU matmul number
 
-`MILSpecBuilder.mm` (the in-process MIL-program builder behind `measure_conv_coreml.m`) only emits
-`conv` ops — there is no `measure_matmul_coreml.m` and no `matmul`/`linear` op support in
-`MILSpecBuilder.mm`. Building one would be new work of comparable size to the existing conv
-builder (op descriptor, shape plumbing, `--units`/`--plan`/`--check` CLI surface matching
-`measure_conv_coreml.m`'s conventions), not attempted in this pass.
+Added `MILMatmulChainConfig`/`MILBuildMatmulChainSpec`/`MILMatmulChainText` to `MILSpecBuilder.mm`
+(FP16 only — no quantized variant yet, unlike the conv chain), and a new `measure_matmul_coreml.m`
+CLI matching `measure_conv_coreml.m`'s `--units`/`--plan`/`--check`/`--dump-mil`/`--save`
+conventions.
+
+**One real surprise building it:** `matmul`'s `transpose_x`/`transpose_y` parameters are documented
+as "optional, default `False`" — true only at coremltools' Python `mb.matmul()` builder level. The
+raw compiled `MLProgram` rejects the op outright without them: `Required param 'transpose_y' is
+missing`. Fixed with an explicit shared `no_transpose` `BOOL` const bound to both parameters.
+
+Verified correct with a standalone test harness (hand-computed a 2×2 single-layer matmul against
+the model's own deterministic weight-generation seed; result matched exactly, max diff `0.0`) before
+trusting it enough to benchmark. Then ran the real workload (`[1,1,1024,1024] x [1,1,1024,1024]`,
+20 layers, matching `measure_matmul_universal.m`'s shapes) across all three CoreML compute units on
+this M4 Pro, with `--check` confirming finite, non-degenerate output on each:
+
+```
+[CoreML ANE FP16] Compile: 122.01 ms, Load: 10606.14 ms, Avg: 2.84 ms, Speed: 15.1109 TOPS (351.8 FPS)
+[CoreML GPU FP16] Compile: 122.45 ms, Load: 5978.17 ms,  Avg: 7.01 ms, Speed: 6.1261 TOPS (142.6 FPS)
+[CoreML CPU FP16] Compile: 122.49 ms, Load: 2028.27 ms,  Avg: 6.49 ms, Speed: 6.6172 TOPS (154.1 FPS)
+```
+
+`--plan` confirms the ANE run genuinely places all 20/20 `matmul` ops on the Neural Engine, not a
+silent CPU/GPU fallback. **6.62 TOPS is this repo's first real CPU matmul baseline** — and,
+surprisingly, CoreML's CPU matmul here is *faster* than its GPU matmul (6.62 vs 6.13 TOPS), unlike
+the conv case where CPU (3.09 TOPS) was clearly slowest. Not investigated further; plausibly matmul
+being a much more regular, cache-friendly access pattern than a strided 3×3/128-channel convolution,
+favoring whatever CPU GEMM path CoreML dispatches to (Accelerate's BLAS/AMX path is the leading
+guess, not confirmed).
+
+Updated results table (both ops, all three CoreML compute units, this M4 Pro):
+
+| Workload | ANE FP16 | GPU FP16 | CPU FP16 |
+|---|---|---|---|
+| Matmul 1024³×L20 | 15.11 TOPS | 6.13 TOPS | **6.62 TOPS** |
+| Conv 256²/128ch/3×3×L20 | — | — | 3.09 TOPS |
+
+(ANE/GPU conv-via-CoreML cells intentionally left blank — not re-measured in this pass; the
+MPSGraph ANE/GPU numbers from the main table earlier in this doc are the trustworthy ones for
+those two cells.)
 
 ## Not pursued here
 

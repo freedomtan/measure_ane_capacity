@@ -28,7 +28,7 @@ PROTOBUF_LIB = $(shell pkg-config --libs protobuf-lite 2>/dev/null || \
 	echo -L/opt/homebrew/lib -L/opt/local/lib -L/usr/local/lib -lprotobuf-lite)
 # protobuf 33's generated code trips absl's own deprecation attributes.
 PROTO_CXXFLAGS = -std=c++17 -O2 -Wno-deprecated-declarations
-TARGETS  = measure_conv_fp16 measure_conv measure_conv_universal measure_matmul_universal measure_conv_qdq measure_conv_swift measure_ane_pmu measure_conv_coreml measure_conv_fp8 measure_matmul_fp8 convert_fp8_to_hwx
+TARGETS  = measure_conv_fp16 measure_conv measure_conv_universal measure_matmul_universal measure_conv_qdq measure_conv_swift measure_ane_pmu measure_conv_coreml measure_matmul_coreml measure_conv_fp8 measure_matmul_fp8 convert_fp8_to_hwx
 
 all: ${TARGETS}
 
@@ -78,10 +78,15 @@ measure_conv_coreml: measure_conv_coreml.m MILSpecBuilder.o $(PROTO_OBJS)
 		measure_conv_coreml.m MILSpecBuilder.o $(PROTO_OBJS) \
 		-o measure_conv_coreml
 
+measure_matmul_coreml: measure_matmul_coreml.m MILSpecBuilder.o $(PROTO_OBJS)
+	$(CC) $(CFLAGS) $(COREML_FRAMEWORKS) $(PROTOBUF_LIB) -lc++ \
+		measure_matmul_coreml.m MILSpecBuilder.o $(PROTO_OBJS) \
+		-o measure_matmul_coreml
+
 .PHONY: all clean app
 
 clean:
-	rm -f ${TARGETS} measure_conv_ios MILSpecBuilder.o
+	rm -f ${TARGETS} measure_matmul_coreml measure_conv_ios MILSpecBuilder.o
 	rm -rf packages/ models/ build/
 
 app:
