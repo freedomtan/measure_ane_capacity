@@ -8,20 +8,26 @@ This document presents a comprehensive technical breakdown of Apple's Scaled Mat
 
 Apple Silicon CPU matrix acceleration has evolved through three distinct eras:
 1. **AMX (Apple Matrix Coprocessor)**: Proprietary, register-driven coprocessor instructions (`arm64_amx`, MLA1/MLA2/MLA3), accessible primarily via `vecLib` and Accelerate.
-2. **SME1 & SME2 (A18 Pro / M4, A19 Pro)**: Standardized ARMv9.2-A architectural matrix state (`ZA` tiles, `SVCR.SM`, Streaming SVE 512-bit vectors).
-3. **SME2.1 & FP8 (A20 Pro / iPhone 18 Pro)**: Introduction of `FEAT_SME2p1` and native widening byte-level floating point outer products (`FEAT_SME_F8F16`).
+2. **SME1 & SME2 (A18 Pro / M4)**: Standardized ARMv9.2-A architectural matrix state (`ZA` tiles, `SVCR.SM`, Streaming SVE 512-bit vectors). Lacks `FEAT_SME2p1`, `FEAT_CSSC`, and `FEAT_SME_F16F16`.
+3. **SME2.1 & 16-bit Non-Widening (A19 Pro / iPhone 17 Pro)**: Upgraded to ARMv9.4-A. Implements `FEAT_SME2p1`, `FEAT_CSSC`, and `FEAT_SME_F16F16` / `FEAT_SME_B16B16` (4.30 TOPS peak).
+4. **FP8 Native Outer Products (A20 Pro / iPhone 18 Pro)**: First architecture to implement native byte-level floating point outer products (`FEAT_SME_F8F16`, `FEAT_SME_F8F32`, `FEAT_FP8`, and `FEAT_SME_LUTv2`), delivering 9.69 TOPS.
 
-### Hardware Capabilities Across Generations
+### Hardware Capabilities Across Generations (Empirically Verified via sysctl)
 
-| Architecture Feature | sysctl Key | M4 Pro (Mac) | A19 Pro (iPhone 17 Pro) | A20 Pro (iPhone 18 Pro) |
-| :--- | :--- | :---: | :---: | :---: |
-| **SME Base** | `hw.optional.arm.FEAT_SME` | **1** | **1** | **1** |
-| **SME2** | `hw.optional.arm.FEAT_SME2` | **1** | **1** | **1** |
-| **SME2.1** | `hw.optional.arm.FEAT_SME2p1` | **1** | **1** | **1** |
-| **FP16 Tile Accumulation** | `FEAT_SME_F16F16` | **1** | **1** | **1** |
-| **BF16 Tile Accumulation** | `FEAT_SME_B16B16` | **1** | **1** | **1** |
-| **Native FP8 Outer Product** | `hw.optional.arm.FEAT_SME_F8F16` | **0** | **0** | **1** |
-| **SME2 Microbench Peak** | Assembly `FMOPA` | 4.30 TOPS | 4.30 TOPS | **9.69 TOPS** (FP8) |
+| Architecture Feature | sysctl Key | M4 Pro (Mac host) | A18 Pro (iPhone 16 Pro) | A19 Pro (iPhone 17 Pro) | A20 Pro (iPhone 18 Pro) |
+| :--- | :--- | :---: | :---: | :---: | :---: |
+| **Core Architecture** | ARM ISA Tier | ARMv9.2-A | ARMv9.2-A | ARMv9.4-A | ARMv9.4-A+ |
+| **SME Base** | `hw.optional.arm.FEAT_SME` | **1** | **1** | **1** | **1** |
+| **SME2** | `hw.optional.arm.FEAT_SME2` | **1** | **1** | **1** | **1** |
+| **SME2.1** | `hw.optional.arm.FEAT_SME2p1` | **0** | **0** | **1** | **1** |
+| **FEAT_CSSC** (`umin`, `abs`) | `hw.optional.arm.FEAT_CSSC` | **0** | **0** | **1** | **1** |
+| **FP16 Non-Widening** | `hw.optional.arm.FEAT_SME_F16F16` | **0** | **0** | **1** | **1** |
+| **BF16 Non-Widening** | `hw.optional.arm.FEAT_SME_B16B16` | **0** | **0** | **1** | **1** |
+| **LUTv2** | `hw.optional.arm.FEAT_SME_LUTv2` | **0** | **0** | **0** | **1** |
+| **Native FP8 Outer Product** | `hw.optional.arm.FEAT_SME_F8F16` | **0** | **0** | **0** | **1** |
+| **Native FP8 to FP32** | `hw.optional.arm.FEAT_SME_F8F32` | **0** | **0** | **0** | **1** |
+| **Base FP8 ISA** | `hw.optional.arm.FEAT_FP8` | **0** | **0** | **0** | **1** |
+| **SME Microbench Peak** | Assembly `FMOPA` | 4.30 TOPS | 2.75 TOPS | 4.30 TOPS | **9.69 TOPS** (FP8) |
 
 ---
 
@@ -186,14 +192,13 @@ You can steer kernel selection for debugging or benchmarking via internal enviro
 
 ### Why `KERNEL_MATMUL_SME2P1` is NOT Used by Apple M4
 
-Although the Apple M4 family (M4, M4 Pro, M4 Max) reports `hw.optional.arm.FEAT_SME = 1`, `hw.optional.arm.FEAT_SME2 = 1`, and `hw.optional.arm.FEAT_SME2p1 = 1`, BNNS Graph **never** selects `KERNEL_MATMUL_SME2P1` on M4. Instead, M4 executes `KERNEL_MATMUL_MLA3` (AMX).
+The Apple M4 family (M4, M4 Pro, M4 Max) reports `hw.optional.arm.FEAT_SME = 1` and `hw.optional.arm.FEAT_SME2 = 1`, but **`hw.optional.arm.FEAT_SME2p1 = 0`**. BNNS Graph **never** selects `KERNEL_MATMUL_SME2P1` on M4. Instead, M4 executes `KERNEL_MATMUL_MLA3` (AMX).
 
-Through disassembly and crash diagnosis of `libBNNS.dylib`, we identified the exact two architectural reasons for this separation:
+Through disassembly, sysctl hardware probing, and crash diagnosis of `libBNNS.dylib`, we identified the exact architectural reasons for this separation:
 
-#### Reason 1: The `FEAT_CSSC` Hardware Dependency
-In `libBNNS.dylib`, the SME2.1 kernel generation (`0x21000000`) is compiled assuming the host microarchitecture is ARMv9.4-A (chipset IDs `0xbbd`, `0xbbe`, `0xbbf`, representing A19/A20).
-
-Crucially, Apple's SME2.1 tiling loop prologue uses ARMv8.9-A / ARMv9.4-A **`FEAT_CSSC`** (Common Short Sequence Compression) scalar instructions to compute tile boundary clamp bounds:
+#### Reason 1: The Lack of `FEAT_SME2p1` and `FEAT_CSSC` Hardware Features
+- **SME2.1 is absent on M4 and A18 Pro**: Both chips are built on the ARMv9.2-A baseline and report `hw.optional.arm.FEAT_SME2p1: 0`. SME2.1 hardware support (`FEAT_SME2p1: 1`) was only introduced starting with the **A19 Pro (iPhone 17 Pro)** and **A20 Pro (iPhone 18 Pro)** (ARMv9.4-A).
+- **Instruction-level incompatibility via `FEAT_CSSC`**: In `libBNNS.dylib`, the SME2.1 kernel generation (`0x21000000`) is compiled assuming the host microarchitecture is ARMv9.4-A (chipset IDs `0xbbd`, `0xbbe`, `0xbbf`, representing A19/A20). Apple's SME2.1 tiling loop prologue uses ARMv8.9-A / ARMv9.4-A **`FEAT_CSSC`** (Common Short Sequence Compression) scalar instructions to compute tile boundary clamp bounds:
 ```assembly
 // From libBNNS.dylib at 0x18eccc954 (tiling prologue right before smstart):
 0x18eccc950  sub   x9, x10, x22
