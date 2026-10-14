@@ -250,11 +250,18 @@ Final results table, all platforms and both ops:
 | Matmul 1024³×L20 | A20 Pro (iPhone 18 Pro) | 17.93 TOPS | 9.20 TOPS | 3.89 TOPS |
 | Conv 256²/128ch/3×3×L20 | M4 Pro (Mac) | — | — | 3.09 TOPS |
 
-## Finding 6 — does the CoreML CPU matmul path use AMX, SME2, or plain NEON?
+## Finding 6 — does the CoreML CPU matmul path use AMX, SME2, or plain NEON? It uses Apple AMX
 
 (There is no SSE2 on Apple Silicon at all — that's an x86 Intel ISA. The real question is whether
 the CPU GEMM reaches Apple's private AMX matrix coprocessor, ARM's newer official SME/SME2
 extension, or falls back to plain NEON SIMD loops.)
+
+> **Executive Conclusion (see [`docs/AMX_GEMM_Microkernel_Disassembly.md`](AMX_GEMM_Microkernel_Disassembly.md)):**
+> CoreML CPU matmul (`MLComputeUnitsCPUOnly`) executes on **Apple AMX**, not SME2. While `libBNNS.dylib`
+> contains genuine SME2 instructions (`smstart za`, `zt0`, `luti4`, `fmopa`), the actual compute kernel
+> dispatched by BNNS for this workload (`0x18f0623a4`) consists entirely of Apple's private AMX
+> NOP-space instructions (`ldx`, `ldy`, `ldz`, and op-19 outer-product accumulators). See the detailed
+> disassembly document for the exact live call chain and instruction-by-instruction breakdown.
 
 **Confirmed the call path with `sample`:** ran `measure_matmul_coreml --units cpu` with a long
 iteration count in the background and sampled the live process for 3 seconds. Every hot-path
@@ -297,6 +304,7 @@ block under a different internal name (the numbering lines up with the sparse pa
 and `MLA1` for an even older/first-generation tier) — not confirmed by name alone, but strongly
 suggested by the parallel structure. **So: yes, BNNS has a real, named, non-NEON matrix-coprocessor
 kernel tier for GEMM — it isn't just NEON SIMD loops.**
+
 
 **This chip (M4 Pro) also exposes ARM's official SME/SME2 extension, confirmed via `sysctl`:**
 
@@ -630,7 +638,7 @@ have an INT8-weight variant exposed on this path at all, while the older AMX-bas
 constant) and reach a faster, modern quantized kernel is the natural next question — not attempted
 here.
 
-## Finding 12 — BNNSGraphCompileFromFile, the modern API, reaches the real SME2 kernel even with a genuinely non-foldable INT8 weight
+## Finding 12 — BNNSGraphCompileFromFile, the modern API, reaches the fast AMX kernel even with a genuinely non-foldable INT8 weight
 
 Finding 11's natural follow-up: `BNNSGraphCompileFromFile` is the modern graph-execution API (macOS
 15/iOS 18+) CoreML's own `E5RT` backend calls internally — the exact function Finding 6 traced the
@@ -641,6 +649,7 @@ needed just to produce the `.mlmodelc` artifact), then execute that artifact dir
 `BNNSGraphCompileFromFile` + `BNNSGraphContextExecute`, with no `MLModel`/`MLFeatureProvider`
 anywhere in the execution path at all. New builder function `MILBuildMatmulWeightInputSpec` and
 harness `bnns_graph_matmul_probe.m`.
+
 
 **Hit CoreML's top-level I/O type restriction immediately.** `FeatureTypes.proto`'s
 `ArrayFeatureType.ArrayDataType` only has `FLOAT32`/`DOUBLE`/`INT32`/`FLOAT16` — there is no `INT8`
@@ -763,13 +772,27 @@ iPhone than on the Mac** — in fact A19 Pro's gap (+8%, confirmed by repeating 
 barely above run-to-run noise. None of the iPhones show anything resembling Finding 11's 2×+
 legacy-kernel regression. This is consistent with (though doesn't by itself prove) the modern
 `BNNSGraph` path dispatching the same real microkernel on every one of these chips that this
-investigation traced on the Mac (see `docs/AMX_GEMM_Microkernel_Disassembly.md` — it's AMX, not
+investigation traced on the Mac (see [`docs/AMX_GEMM_Microkernel_Disassembly.md`](AMX_GEMM_Microkernel_Disassembly.md) — it's AMX, not
 SME2, correcting Finding 6/12's original "SME2" label), with the `cast`+`dequantize` preprocessing
 cost shrinking relative to the matmul itself as each generation's AMX/CPU throughput improves — the
 newest chips absorb the quantization bookkeeping almost for free, in sharp contrast to the Mac's
 `MLModel`-based INT8 path (Finding 7/8), where the *same kind* of overhead was large enough to make
 CPU INT8 regress below CPU FP16/FP8, a result that itself never reproduced on any iPhone either
 (Finding 8).
+
+## Finding 14 — Direct SME & SME2 benchmarking resolves hardware capability (bypassing BNNS)
+
+While BNNS dispatches to AMX for the CoreML and graph-level matmul workloads evaluated above,
+hardware-level SME and SME2 microkernels were subsequently verified directly using hand-written
+assembly routines executed in streaming mode (`smstart`/`smstop`).
+
+Key findings documented across [`docs/AMX_GEMM_Microkernel_Disassembly.md`](AMX_GEMM_Microkernel_Disassembly.md),
+[`docs/SME_SME2_Generational_Benchmark_Report.md`](SME_SME2_Generational_Benchmark_Report.md),
+and the comprehensive catalogue [`docs/SME_Kernels_and_Usage_Guide.md`](SME_Kernels_and_Usage_Guide.md):
+- **SME Hardware is Real and Accessible**: Direct assembly microkernels achieve **2.43 TOPS** (FP32/FP16), **4.85 TOPS** (INT8 `SMOPA`), and **9.69 TOPS** (SME2 FP8 `F8F16`) on a single CPU core on the A20 Pro.
+- **`FEAT_SME_F16F16` & `FEAT_SME_B16B16`** were introduced on **iPhone 17 Pro (A19 Pro)**, doubling non-widening half-precision throughput to **4.30 TOPS**.
+- **`FEAT_SME_F8F16` & `FEAT_SME_F8F32`** were introduced on **iPhone 18 Pro (A20 Pro)**, delivering up to **9.69 TOPS** for low-precision matrix multiply.
+- **Kernel Dispatch Mechanics**: While M4 Pro CPU BNNS compiler defaults to AMX (`KERNEL_MATMUL_MLA3`, 6.71 TOPS across clusters) due to missing `FEAT_CSSC` (`umin`), mobile chips like iPhone 17 Pro (A19 Pro) with `FEAT_CSSC` natively dispatch `KERNEL_MATMUL_SME2P1` (3.30 TOPS).
 
 ## Not pursued here
 
@@ -779,7 +802,5 @@ CPU INT8 regress below CPU FP16/FP8, a result that itself never reproduced on an
 - Accelerate (BLAS `cblas_sgemm` / BNNS convolution) as a lower-level alternative CPU baseline,
   independent of both MPSGraph and CoreML — explicitly deferred per discussion in favor of trying
   the two existing frameworks first.
-- Confirming whether the legacy AMX tiers (`MLA1`/`MLA2`/`MLA3`) are ever actually selected on this
-  chip (vs. always SME2) for other shapes/dtypes, or on older chips lacking `FEAT_SME2` — Finding 6
-  confirmed SME2 dispatch for the FP16 dense path on this M4 Pro, but didn't check the full matrix
-  of shapes/precisions/chips.
+- Identifying whether any specific CoreML/MIL graph pattern (e.g. attention, custom fusions) can force BNNS to select its `KERNEL_MATMUL_SME2` or `KERNEL_MATMUL_SOFTMAX_MATMUL_SME` paths rather than default AMX (tested matmul+relu and scaled_dot_product_attention; both still routed to AMX).
+
