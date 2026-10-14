@@ -210,15 +210,15 @@ Crucially, Apple's SME2.1 tiling loop prologue uses ARMv8.9-A / ARMv9.4-A **`FEA
   - **A19 Pro (iPhone 17 Pro) / A20 Pro**: ARMv9.4-A+ core architecture. Implements `FEAT_CSSC` (`sysctl hw.optional.arm.FEAT_CSSC: 1`).
 - If SME2.1 is forced on M4 via environment override `ACCELERATE_C3AB8FF13720=0x21000000`, the M4 immediately crashes with `EXC_BAD_INSTRUCTION` (`SIGILL`) on `umin` before reaching the `smstart` instruction.
 
-#### Reason 2: Asymmetric Compute Balance (AMX is Wider on Mac M-Series)
+#### Reason 2: Asymmetric Compute Balance (AMX on Mac vs SME2 on Mobile)
 On mobile chips (A18/A19 Pro), CPU core counts are small (2 P-cores, 4 E-cores), and the SME2 cluster co-processor provides the primary matrix throughput.
 
 On Mac desktop chips (M4 Pro / M4 Max):
-- M4 contains wide, dedicated **AMX (Apple Matrix Coprocessor)** units integrated tightly into each Performance core cluster with dedicated L1/L2 streaming buses.
-- Measuring pure matrix compute on M4 Pro:
-  - **M4 Pro AMX FP16 (`KERNEL_MATMUL_MLA3`)**: **~6.7 to 17+ TFLOPS** across multiple threads.
-  - **M4 Pro SME2 FP16 (`fmopa za.h`)**: **~4.3 TFLOPS** per cluster.
-- In macOS BNNS graph compiler heuristics, AMX (`MLA3`) ranks higher in performance tier for M4 desktop silicon, whereas A19 Pro mobile silicon prioritizes `KERNEL_MATMUL_SME2P1`.
+- M4 Pro features multiple Performance core clusters, each equipped with dedicated **AMX (Apple Matrix Coprocessor)** units (`MLA3`) connected directly to L1/L2 caches.
+- Measuring pure CPU matrix compute on the host M4 Pro:
+  - **M4 Pro CPU AMX FP16 (`KERNEL_MATMUL_MLA3`)**: **6.71 TOPS** (sustained across M4 Pro Performance clusters at $2048 \times 2048$, 2.56 ms).
+  - **M4 Pro SME2 FP16 (`fmopa za.h`)**: **4.30 TOPS** (single-cluster peak limit).
+- Because M4 Pro's multi-cluster AMX provides higher aggregate CPU throughput (**6.71 TOPS** vs. single-cluster SME2's **4.30 TOPS**), BNNS Graph's compiler heuristics on macOS naturally prefer `KERNEL_MATMUL_MLA3` (AMX). On mobile A19 Pro, where core counts are low, BNNS selects `KERNEL_MATMUL_SME2P1`.
 
 ---
 
