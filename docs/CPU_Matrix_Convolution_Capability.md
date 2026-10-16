@@ -792,7 +792,7 @@ and the comprehensive catalogue [`docs/SME_Kernels_and_Usage_Guide.md`](SME_Kern
 - **SME Hardware is Real and Accessible**: Direct assembly microkernels achieve **2.43 TOPS** (FP32/FP16), **4.85 TOPS** (INT8 `SMOPA`), and **9.69 TOPS** (SME2 FP8 `F8F16`) on a single CPU core on the A20 Pro.
 - **`FEAT_SME_F16F16` & `FEAT_SME_B16B16`** were introduced on **iPhone 17 Pro (A19 Pro)**, doubling non-widening half-precision throughput to **4.30 TOPS**.
 - **`FEAT_SME_F8F16` & `FEAT_SME_F8F32`** were introduced on **iPhone 18 Pro (A20 Pro)**, delivering up to **9.69 TOPS** for low-precision matrix multiply.
-- **Kernel Dispatch Mechanics**: While M4 Pro CPU BNNS compiler defaults to AMX (`KERNEL_MATMUL_MLA3`, 6.71 TOPS across clusters) due to missing `FEAT_CSSC` (`umin`), mobile chips like iPhone 17 Pro (A19 Pro) with `FEAT_CSSC` natively dispatch `KERNEL_MATMUL_SME2P1` (3.30 TOPS).
+- **Kernel Dispatch Mechanics**: While ARMv9.2-A silicon (M4 Pro and A18 Pro) defaults to AMX (`KERNEL_MATMUL_MLA3`, 3.48–6.71 TOPS) because baseline SME2 lacks `FEAT_SME2p1`, `FEAT_CSSC`, and non-widening `FEAT_SME_F16F16`, ARMv9.4-A chips with those extensions (iPhone 17 Pro / 18 Pro) natively dispatch `KERNEL_MATMUL_SME2P1` (3.30 TOPS). See Section 4 of `docs/SME_Kernels_and_Usage_Guide.md` for the exact assembly decision tree in `libBNNS.dylib`.
 
 ## Not pursued here
 

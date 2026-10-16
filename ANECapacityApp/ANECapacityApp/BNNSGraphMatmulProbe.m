@@ -91,6 +91,16 @@ static void RunViaBNNSGraph(const char *label, MILMatmulWeightInputConfig config
         return;
     }
 
+extern size_t BNNSGraphGetOperationCount(bnns_graph_t graph, const char *function);
+extern const char *BNNSGraphGetOperationTypeName(bnns_graph_t graph, const char *function, size_t op_id);
+
+    size_t opCount = BNNSGraphGetOperationCount(graph, NULL);
+    for (size_t op = 0; op < opCount; op++) {
+        const char *opType = BNNSGraphGetOperationTypeName(graph, NULL, op);
+        printf("[%s] Compiled Op[%zu]: %s\n", label, op, opType ?: "(null)");
+        fflush(stdout);
+    }
+
     bnns_graph_context_t context = BNNSGraphContextMake(graph);
     if (!context.data) {
         printf("[%s] BNNSGraphContextMake failed\n", label);
@@ -177,6 +187,7 @@ static void RunViaBNNSGraph(const char *label, MILMatmulWeightInputConfig config
         printf("[%s] Avg: %.3f ms, Speed: %.4f TOPS, y[0] bits=0x%04x, y[mid] bits=0x%04x, zeros=%zu, "
                "non-finite=%zu\n",
                label, avg * 1000.0, (ops / 1e12) / avg, y[0], y[M * N / 2], zeros, nonFinite);
+        fflush(stdout);
 
         free(args);
         free(workspace);
@@ -192,8 +203,9 @@ cleanup:
 
 void BNNSGraphMatmulProbeRun(void) {
     size_t M = 1024, K = 1024, N = 1024;
-    int iterations = 2000;
+    int iterations = 10;
     printf("BNNSGraphCompileFromFile on-device probe: M=K=N=%zu, %d iterations\n", M, iterations);
+    fflush(stdout);
 
     MILMatmulWeightInputConfig fp16Config = {.M = M, .K = K, .N = N, .weightIsInt8 = NO};
     RunViaBNNSGraph("BNNSGraph FP16 weight-input", fp16Config, iterations);

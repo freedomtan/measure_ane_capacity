@@ -119,6 +119,14 @@ static void RunViaBNNSGraph(const char *label, MILMatmulWeightInputConfig config
     return;
   }
 
+  extern size_t BNNSGraphGetOperationCount(bnns_graph_t graph, const char *function);
+  extern const char *BNNSGraphGetOperationTypeName(bnns_graph_t graph, const char *function, size_t op_id);
+  size_t opCount = BNNSGraphGetOperationCount(graph, NULL);
+  for (size_t op = 0; op < opCount; op++) {
+    const char *opType = BNNSGraphGetOperationTypeName(graph, NULL, op);
+    printf("[%s] Compiled Op[%zu]: %s\n", label, op, opType ?: "(null)");
+  }
+
   bnns_graph_context_t context = BNNSGraphContextMake(graph);
   if (!context.data) {
     printf("[%s] BNNSGraphContextMake failed\n", label);

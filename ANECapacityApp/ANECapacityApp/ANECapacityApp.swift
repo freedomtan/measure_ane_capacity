@@ -51,6 +51,35 @@ struct ANECapacityApp: App {
                 exit(0)
             }
         }
+        if ProcessInfo.processInfo.arguments.contains("--sme-microbench") {
+            DispatchQueue.global().async {
+                // Apple Silicon has no baseline (non-streaming) SVE -- only streaming SVE
+                // via SME's `smstart`. check_sve_support() calls bare SVE outside streaming
+                // mode and traps (SIGILL); skip it and go straight to what's supported.
+                check_streaming_sve_support()
+                check_sme_support()
+                check_sme2_support()
+                check_sme_f16f16_support()
+                check_sme_b16b16_support()
+                check_sme_f8f16_support()
+                check_sme_f8f32_support()
+                run_micro_benchmark(1, 1)
+                run_gemm(1, 1)
+                exit(0)
+            }
+        }
+        if ProcessInfo.processInfo.arguments.contains("--sme2-fp8-sketch") {
+            DispatchQueue.global().async {
+                run_sme2_fp8_sketch()
+                exit(0)
+            }
+        }
+        if ProcessInfo.processInfo.arguments.contains("--sme2-fp8-peak") {
+            DispatchQueue.global().async {
+                run_sme2_fp8_peak()
+                exit(0)
+            }
+        }
         if let idx = ProcessInfo.processInfo.arguments.firstIndex(of: "--native-coreml-matmul-single"),
            idx + 1 < ProcessInfo.processInfo.arguments.count {
             let precisionArg = ProcessInfo.processInfo.arguments[idx + 1]
