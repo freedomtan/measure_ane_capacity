@@ -315,10 +315,14 @@ When `--save-package` is enabled, `measure_ane_pmu` serializes each variant into
 
 For in-depth microarchitectural investigations, register breakdowns, theoretical derivations, and empirical benchmark analyses across H18 and H19, consult:
 
+* [**`Apple_M6_Peak_TOPS_Benchmark_Report.md`**](docs/Apple_M6_Peak_TOPS_Benchmark_Report.md): Definitive peak performance evaluation of Apple M6 (`Mac18,5`, Super Core + Bonded 32-core ANE + Metal 4 GPU), demonstrating **107.26 TOPS** (ANE INT8), **72.56 TOPS** (ANE FP8), **56.35 TOPS** (ANE FP16), and **9.135 TOPS** (CPU SME2.1 FP8).
+* [**`SME_SME2_Generational_Benchmark_Report.md`**](docs/SME_SME2_Generational_Benchmark_Report.md): Cross-generational empirical evaluation of ARM Scalable Matrix Extension (SME, SME2, SME2.1) across A18 Pro, A19 Pro, A20 Pro, and M6.
+* [**`SME_Kernels_and_Usage_Guide.md`**](docs/SME_Kernels_and_Usage_Guide.md): Architectural analysis and dispatch guide for Apple Silicon SME / SME2 kernels in `libBNNS.dylib` and CoreAI.
 * [**`ANE_FP8_vs_INT8_FP16_Performance_Report.md`**](docs/ANE_FP8_vs_INT8_FP16_Performance_Report.md): Complete cross-precision performance analysis comparing FP8, FP16, and INT8 on iPhone 17 Pro (H18) and iPhone 18 Pro (H19). Explains why INT8 reaches **90.25 TOPS** via 1D Winograd, why FP16 hits **43.80 TFLOPS**, and why FP8 peaks at **55.41 TOPS** under the 1.87 GHz power clamp.
 * [**`ANE_H19_Theoretical_Peak_and_Winograd_FP8_Analysis.md`**](docs/ANE_H19_Theoretical_Peak_and_Winograd_FP8_Analysis.md): Mathematical derivation of theoretical compute ceilings for Dual 16-Core H19 (2130 MHz) and Single 16-Core H18 (2172 MHz), complete with binary disassembly proof from `ANECompiler.framework` establishing that 1D Winograd minimal filtering is explicitly prohibited on FP8 (`e4_m3`).
 * [**`How_to_Interpret_measure_ane_pmu_Numbers.md`**](docs/How_to_Interpret_measure_ane_pmu_Numbers.md): Guide to interpreting raw Apple Neural Engine silicon PMU hardware performance counters.
 * [**`FP8_BENCHMARKING_AND_ANE_ARCHITECTURE.md`**](docs/FP8_BENCHMARKING_AND_ANE_ARCHITECTURE.md): Technical guide to FP8 (Float8E4M3) Quantize-Dequantize (QDQ) execution in MPSGraph.
+
 
 ### Non-Zero Tensor Initialization (Required for H17 and Later)
 
@@ -364,3 +368,10 @@ For in-depth microarchitectural investigations, register breakdowns, theoretical
 *\*Note: Historical rows marked with asterisks used all-zero tensor buffers (`0x00`), which triggered hardware zero-skipping and lossless zero-compression on H17/H18 silicon, artificially inflating measured TOPS. The bold non-zero rows reflect true dense silicon throughput.*
 *Note: GPU INT8 convolution is not supported by Metal/MPSGraph on this device/configuration.*
 *Note: Results may vary slightly depending on system load and thermal state.*
+
+---
+
+## Acknowledgements & References
+
+* **ARM Scalable Matrix Extension (SME) Microbenchmarks:** The standalone SME/SME2 assembly kernels, feature detection routines, and benchmarking harness architectures used in this repository are derived from and build upon the open-source suite by [scalable-analyses/sme](https://github.com/scalable-analyses/sme).
+

@@ -137,6 +137,13 @@ static mil::Value Float16ScalarValue(uint16_t rawBits) {
   return value;
 }
 
+static mil::Value BoolScalarValue(bool val) {
+  mil::Value value;
+  *value.mutable_type() = TensorValueType(mil::BOOL, {});
+  value.mutable_immediatevalue()->mutable_tensor()->mutable_bools()->add_values(val);
+  return value;
+}
+
 static mil::Value Int8ScalarValue(int8_t val) {
   mil::Value value;
   *value.mutable_type() = TensorValueType(mil::INT8, {});
@@ -333,6 +340,73 @@ static std::string WeightBytesFP8(MILConvChainConfig config) {
   return bytes;
 }
 
+// Same reasoning as WeightBytes() above, sized for a [batch, 1, K, N] matmul
+// weight tensor instead of a conv kernel.
+static std::string WeightBytesMatmul(MILMatmulChainConfig config) {
+  size_t count = (size_t)config.batch * config.K * config.N;
+  std::string bytes(count * sizeof(uint16_t), '\0');
+  uint16_t *p = (uint16_t *)bytes.data();
+
+  if (config.weightMode == MILWeightModeRepeat) {
+    static const uint16_t pattern[4] = {
+        kFP16PlusOneSixteenth, kFP16MinusOneSixteenth,
+        kFP16PlusOneThirtySecond, kFP16MinusOneThirtySecond};
+    for (size_t i = 0; i < count; i++) p[i] = pattern[i % 4];
+    return bytes;
+  }
+
+  uint64_t state = kWeightSeed;
+  for (size_t i = 0; i < count; i++) {
+    state ^= state << 13;
+    state ^= state >> 7;
+    state ^= state << 17;
+    p[i] = (state & 1) ? kFP16MinusOneThirtySecond : kFP16PlusOneThirtySecond;
+  }
+  return bytes;
+}
+
+static std::string WeightBytesMatmulINT8(MILMatmulChainConfig config) {
+  size_t count = (size_t)config.batch * config.K * config.N;
+  std::string bytes(count * sizeof(int8_t), '\0');
+  int8_t *p = (int8_t *)bytes.data();
+
+  if (config.weightMode == MILWeightModeRepeat) {
+    static const int8_t pattern[4] = {1, -1, 2, -2};
+    for (size_t i = 0; i < count; i++) p[i] = pattern[i % 4];
+    return bytes;
+  }
+
+  uint64_t state = kWeightSeed;
+  for (size_t i = 0; i < count; i++) {
+    state ^= state << 13;
+    state ^= state >> 7;
+    state ^= state << 17;
+    p[i] = (state & 1) ? -1 : 1;
+  }
+  return bytes;
+}
+
+static std::string WeightBytesMatmulFP8(MILMatmulChainConfig config) {
+  size_t count = (size_t)config.batch * config.K * config.N;
+  std::string bytes(count, '\0');
+  uint8_t *p = (uint8_t *)bytes.data();
+
+  if (config.weightMode == MILWeightModeRepeat) {
+    static const uint8_t pattern[4] = {0x30, 0xB0, 0x38, 0xB8};
+    for (size_t i = 0; i < count; i++) p[i] = pattern[i % 4];
+    return bytes;
+  }
+
+  uint64_t state = kWeightSeed;
+  for (size_t i = 0; i < count; i++) {
+    state ^= state << 13;
+    state ^= state >> 7;
+    state ^= state << 17;
+    p[i] = (state & 1) ? 0xB0 : 0x30;
+  }
+  return bytes;
+}
+
 #pragma mark - Model description
 
 static void SetArrayFeature(ms::FeatureDescription *desc,
@@ -391,10 +465,11 @@ NSString *MILWeightModeName(MILWeightMode mode) {
 
 NSString *MILPrecisionName(MILPrecision precision) {
   switch (precision) {
-    case MILPrecisionINT8: return @"INT8";
-    case MILPrecisionFP8:  return @"FP8";
+    case MILPrecisionINT8:         return @"INT8";
+    case MILPrecisionFP8:          return @"FP8";
+    case MILPrecisionINT8WeightOnly: return @"INT8W";
     case MILPrecisionFP16:
-    default:               return @"FP16";
+    default:                       return @"FP16";
   }
 }
 
@@ -623,4 +698,373 @@ NSString *MILConvChainText(MILConvChainConfig config) {
   }
   [text appendFormat:@"  -> %@\n", current];
   return text;
+}
+
+#pragma mark - Matmul chain
+
+static void SetMetadataMatmul(ms::Metadata *metadata,
+                              MILMatmulChainConfig config) {
+  NSString *summary = [NSString
+      stringWithFormat:@"%lux matmul [%lu, 1, %lu, %lu] x [%lu, 1, %lu, %lu], "
+                       @"weights=%@",
+                       (unsigned long)config.layers, (unsigned long)config.batch,
+                       (unsigned long)config.M, (unsigned long)config.K,
+                       (unsigned long)config.batch, (unsigned long)config.K,
+                       (unsigned long)config.N,
+                       MILWeightModeName(config.weightMode)];
+  metadata->set_shortdescription(summary.UTF8String);
+
+  auto &userDefined = *metadata->mutable_userdefined();
+  userDefined["workload.batch"] = std::to_string(config.batch);
+  userDefined["workload.m"] = std::to_string(config.M);
+  userDefined["workload.k"] = std::to_string(config.K);
+  userDefined["workload.n"] = std::to_string(config.N);
+  userDefined["workload.layers"] = std::to_string(config.layers);
+  userDefined["workload.precision"] = MILPrecisionName(config.precision).UTF8String;
+  userDefined["workload.weights"] =
+      MILWeightModeName(config.weightMode).UTF8String;
+  userDefined["builder"] = "MILSpecBuilder (native, no coremltools)";
+}
+
+NSString *MILMatmulChainInputName(void) { return @"x"; }
+
+NSString *MILMatmulChainOutputName(MILMatmulChainConfig config) {
+  return [NSString stringWithFormat:@"matmul_%lu",
+                                    (unsigned long)(config.layers - 1)];
+}
+
+static BOOL MILValidateMatmul(MILMatmulChainConfig config, NSError **error) {
+  const struct {
+    const char *name;
+    NSUInteger value;
+  } dims[] = {
+      {"batch", config.batch}, {"m", config.M},
+      {"k", config.K},         {"n", config.N},
+      {"layers", config.layers},
+  };
+  for (const auto &dim : dims) {
+    if (dim.value == 0) {
+      if (error) {
+        *error = MILError(1, [NSString stringWithFormat:
+                                           @"%s must be greater than zero",
+                                           dim.name]);
+      }
+      return NO;
+    }
+  }
+  // Each layer's output is [batch, 1, M, N]; chaining into another matmul
+  // against the same [batch, 1, K, N] weight requires N == K, same reasoning
+  // as the conv chain's channelsIn == channelsOut requirement.
+  if (config.layers > 1 && config.K != config.N) {
+    if (error) {
+      *error = MILError(2, @"chained layers require k == n");
+    }
+    return NO;
+  }
+  return YES;
+}
+
+NSData *MILBuildMatmulChainSpec(MILMatmulChainConfig config, NSError **error) {
+  if (!MILValidateMatmul(config, error)) return nil;
+
+  const std::vector<uint64_t> inputShape = {config.batch, 1, config.M, config.K};
+  const std::vector<uint64_t> weightShape = {config.batch, 1, config.K, config.N};
+  const std::vector<uint64_t> outputShape = {config.batch, 1, config.M, config.N};
+  const std::string outputName = MILMatmulChainOutputName(config).UTF8String;
+
+  ms::Model model;
+  model.set_specificationversion(kSpecificationVersion);
+
+  ms::ModelDescription *description = model.mutable_description();
+  SetArrayFeature(description->add_input(),
+                  MILMatmulChainInputName().UTF8String, inputShape);
+  SetArrayFeature(description->add_output(), outputName, outputShape);
+  SetMetadataMatmul(description->mutable_metadata(), config);
+
+  mil::Program *program = model.mutable_mlprogram();
+  program->set_version(1);
+
+  mil::Function &function = (*program->mutable_functions())["main"];
+  function.set_opset(kOpset);
+  mil::NamedValueType *functionInput = function.add_inputs();
+  functionInput->set_name(MILMatmulChainInputName().UTF8String);
+  SetTensorType(functionInput->mutable_type(), mil::FLOAT16, inputShape);
+
+  mil::Block &block = (*function.mutable_block_specializations())[kOpset];
+  block.add_outputs(outputName);
+
+  if (config.precision == MILPrecisionINT8) {
+    // Weights: constexpr_blockwise_shift_scale with INT8 inline data
+    AddConstexprBlockwiseShiftScaleOp(&block, "weights", weightShape,
+                                      WeightBytesMatmulINT8(config), kFP16PlusOneThirtySecond);
+
+    // Activation scale const: scalar fp16 1/32
+    AddConstOp(&block, "act_scale", TensorValueType(mil::FLOAT16, {}),
+               Float16ScalarValue(kFP16PlusOneThirtySecond));
+    AddConstOp(&block, "dtype_int8", StringScalarType(), StringValue("int8"));
+  } else if (config.precision == MILPrecisionINT8WeightOnly) {
+    // Same INT8 weight representation as MILPrecisionINT8, but no activation
+    // quantize/dequantize ops at all -- activations stay FP16 straight
+    // through. Isolates whether BNNS's CPU kernel selection changes once the
+    // per-layer quantize/dequantize round-trip is out of the way.
+    AddConstexprBlockwiseShiftScaleOp(&block, "weights", weightShape,
+                                      WeightBytesMatmulINT8(config), kFP16PlusOneThirtySecond);
+  } else if (config.precision == MILPrecisionFP8) {
+    // Weights: constexpr_lut_to_dense with inline FP8 E4M3 indices and IEEE Float8 LUT
+    AddConstexprLUTToDenseOp(&block, "weights", weightShape,
+                             WeightBytesMatmulFP8(config), kFP8E4M3ScaledToFP16LUT);
+  } else {
+    // One weight constant shared by every layer, as in the MPSGraph version.
+    mil::Value weights;
+    weights.mutable_immediatevalue()->mutable_tensor()->mutable_bytes()->set_values(
+        WeightBytesMatmul(config));
+    AddConstOp(&block, "weights", TensorValueType(mil::FLOAT16, weightShape),
+               std::move(weights));
+  }
+
+  // matmul's transpose_x/transpose_y are "optional, default False" only at
+  // the Python mb.matmul() builder level -- the compiled MLProgram itself
+  // requires them present, confirmed by the compiler otherwise rejecting the
+  // op with "Required param 'transpose_y' is missing".
+  AddConstOp(&block, "no_transpose", TensorValueType(mil::BOOL, {}),
+             BoolScalarValue(false));
+
+  const mil::ValueType activationType = TensorValueType(mil::FLOAT16, outputShape);
+  const mil::ValueType int8QuantizedType = TensorValueType(mil::INT8, outputShape);
+  std::string current = MILMatmulChainInputName().UTF8String;
+  for (NSUInteger i = 0; i < config.layers; i++) {
+    std::string matmulInput = current;
+    if (config.precision == MILPrecisionINT8) {
+      std::string qName = "quant_" + std::to_string(i);
+      AddOp(&block, "quantize",
+            {{"input", current},
+             {"scale", "act_scale"},
+             {"output_dtype", "dtype_int8"}},
+            qName, int8QuantizedType);
+
+      std::string dqName = "dequant_" + std::to_string(i);
+      AddOp(&block, "dequantize",
+            {{"input", qName},
+             {"scale", "act_scale"}},
+            dqName, activationType);
+      matmulInput = std::move(dqName);
+    }
+
+    std::string name = "matmul_" + std::to_string(i);
+    AddOp(&block, "matmul",
+          {{"x", matmulInput},
+           {"y", "weights"},
+           {"transpose_x", "no_transpose"},
+           {"transpose_y", "no_transpose"}},
+          name, activationType);
+    current = std::move(name);
+  }
+
+  std::string serialized;
+  if (!model.SerializeToString(&serialized)) {
+    if (error) *error = MILError(3, @"failed to serialize the model spec");
+    return nil;
+  }
+  return [NSData dataWithBytes:serialized.data() length:serialized.size()];
+}
+
+NSString *MILMatmulChainText(MILMatmulChainConfig config) {
+  NSMutableString *text = [NSMutableString string];
+  [text appendFormat:@"function main (opset %s):\n", kOpset];
+  [text appendFormat:@"  x: fp16[%lu, 1, %lu, %lu]\n", (unsigned long)config.batch,
+                     (unsigned long)config.M, (unsigned long)config.K];
+  if (config.precision == MILPrecisionINT8 || config.precision == MILPrecisionINT8WeightOnly) {
+    [text appendFormat:@"  weights_int8 = const(int8[%lu, 1, %lu, %lu])  // %@, %lu bytes inline\n",
+                       (unsigned long)config.batch, (unsigned long)config.K, (unsigned long)config.N,
+                       MILWeightModeName(config.weightMode),
+                       (unsigned long)(config.batch * config.K * config.N)];
+    [text appendFormat:@"  weights = dequantize(input=weights_int8, scale=1/32, zero_point=0)\n"];
+  } else if (config.precision == MILPrecisionFP8) {
+    [text appendFormat:@"  raw_weights = const(fp8e4m3fn[%lu, 1, %lu, %lu])  // %@, %lu bytes inline\n",
+                       (unsigned long)config.batch, (unsigned long)config.K, (unsigned long)config.N,
+                       MILWeightModeName(config.weightMode),
+                       (unsigned long)(config.batch * config.K * config.N)];
+    [text appendFormat:@"  weights = dequantize(input=raw_weights, scale=1/16, zero_point=0)\n"];
+  } else {
+    [text appendFormat:@"  weights = const(fp16[%lu, 1, %lu, %lu])  // %@, %lu bytes inline\n",
+                       (unsigned long)config.batch, (unsigned long)config.K, (unsigned long)config.N,
+                       MILWeightModeName(config.weightMode),
+                       (unsigned long)(config.batch * config.K * config.N * 2)];
+  }
+  NSString *current = MILMatmulChainInputName();
+  for (NSUInteger i = 0; i < config.layers; i++) {
+    NSString *name = [NSString stringWithFormat:@"matmul_%lu", (unsigned long)i];
+    if (config.precision == MILPrecisionINT8) {
+      NSString *qName = [NSString stringWithFormat:@"quant_%lu", (unsigned long)i];
+      NSString *dqName = [NSString stringWithFormat:@"dequant_%lu", (unsigned long)i];
+      [text appendFormat:@"  %@ = quantize(input=%@, scale=1/32, zero_point=0, output_dtype=\"int8\")\n", qName, current];
+      [text appendFormat:@"  %@ = dequantize(input=%@, scale=1/32, zero_point=0)\n", dqName, qName];
+      [text appendFormat:@"  %@ = matmul(x=%@, y=weights, transpose_x=False, transpose_y=False)\n", name, dqName];
+    } else {
+      [text appendFormat:@"  %@ = matmul(x=%@, y=weights, transpose_x=False, transpose_y=False)\n", name, current];
+    }
+    current = name;
+  }
+  [text appendFormat:@"  -> %@\n", current];
+  return text;
+}
+
+NSString *MILMatmulWeightInputXName(void) { return @"x"; }
+NSString *MILMatmulWeightInputWeightName(void) { return @"weights_in"; }
+NSString *MILMatmulWeightInputOutputName(void) { return @"y"; }
+
+NSData *MILBuildMatmulWeightInputSpec(MILMatmulWeightInputConfig config, NSError **error) {
+  if (config.M == 0 || config.K == 0 || config.N == 0) {
+    if (error) *error = MILError(1, @"M, K, and N must be non-zero");
+    return nil;
+  }
+
+  const std::vector<uint64_t> xShape = {1, 1, config.M, config.K};
+  const std::vector<uint64_t> weightShape = {1, 1, config.K, config.N};
+  const std::vector<uint64_t> outputShape = {1, 1, config.M, config.N};
+  const std::string xName = MILMatmulWeightInputXName().UTF8String;
+  const std::string weightName = MILMatmulWeightInputWeightName().UTF8String;
+  const std::string outputName = MILMatmulWeightInputOutputName().UTF8String;
+
+  ms::Model model;
+  model.set_specificationversion(kSpecificationVersion);
+
+  ms::ModelDescription *description = model.mutable_description();
+  SetArrayFeature(description->add_input(), xName, xShape);
+  // CoreML's top-level ModelDescription I/O contract (FeatureTypes.proto's
+  // ArrayFeatureType.ArrayDataType) only supports FLOAT32/DOUBLE/INT32/FLOAT16
+  // -- there is no INT8 option at this boundary, confirmed by the compiler
+  // rejecting a declared-INT8 model input ("Model input ... has a different
+  // type than its corresponding parameter to main") even though INT8 is a
+  // perfectly normal *internal* MIL tensor type (used throughout Finding
+  // 7/8/10's constexpr/dequantize ops). So the INT8 case declares an INT32
+  // model input and `cast`s it to INT8 as the function's first op --
+  // genuinely non-constant (nothing to fold) but legal at the model boundary.
+  {
+    ms::FeatureDescription *weightFeature = description->add_input();
+    weightFeature->set_name(weightName);
+    ms::ArrayFeatureType *array = weightFeature->mutable_type()->mutable_multiarraytype();
+    array->set_datatype(config.weightIsInt8 ? ms::ArrayFeatureType::INT32
+                                            : ms::ArrayFeatureType::FLOAT16);
+    for (uint64_t dim : weightShape) array->add_shape((int64_t)dim);
+  }
+  SetArrayFeature(description->add_output(), outputName, outputShape);
+
+  mil::Program *program = model.mutable_mlprogram();
+  program->set_version(1);
+
+  mil::Function &function = (*program->mutable_functions())["main"];
+  function.set_opset(kOpset);
+
+  mil::NamedValueType *xInput = function.add_inputs();
+  xInput->set_name(xName);
+  SetTensorType(xInput->mutable_type(), mil::FLOAT16, xShape);
+
+  mil::NamedValueType *weightInput = function.add_inputs();
+  weightInput->set_name(weightName);
+  SetTensorType(weightInput->mutable_type(), config.weightIsInt8 ? mil::INT32 : mil::FLOAT16,
+               weightShape);
+
+  mil::Block &block = (*function.mutable_block_specializations())[kOpset];
+  block.add_outputs(outputName);
+
+  AddConstOp(&block, "no_transpose", TensorValueType(mil::BOOL, {}), BoolScalarValue(false));
+
+  std::string matmulWeight = weightName;
+  if (config.weightIsInt8) {
+    AddConstOp(&block, "cast_dtype_int8", StringScalarType(), StringValue("int8"));
+    AddOp(&block, "cast", {{"x", weightName}, {"dtype", "cast_dtype_int8"}}, "weights_int8",
+          TensorValueType(mil::INT8, weightShape));
+
+    AddConstOp(&block, "weight_scale", TensorValueType(mil::FLOAT16, {}),
+               Float16ScalarValue(kFP16PlusOneThirtySecond));
+    AddOp(&block, "dequantize", {{"input", "weights_int8"}, {"scale", "weight_scale"}}, "weights",
+          TensorValueType(mil::FLOAT16, weightShape));
+    matmulWeight = "weights";
+  }
+
+  if (config.fuseRelu) {
+    AddOp(&block, "matmul",
+         {{"x", xName},
+          {"y", matmulWeight},
+          {"transpose_x", "no_transpose"},
+          {"transpose_y", "no_transpose"}},
+         "matmul_raw", TensorValueType(mil::FLOAT16, outputShape));
+    AddOp(&block, "relu", {{"x", "matmul_raw"}}, outputName,
+         TensorValueType(mil::FLOAT16, outputShape));
+  } else {
+    AddOp(&block, "matmul",
+         {{"x", xName},
+          {"y", matmulWeight},
+          {"transpose_x", "no_transpose"},
+          {"transpose_y", "no_transpose"}},
+         outputName, TensorValueType(mil::FLOAT16, outputShape));
+  }
+
+  std::string serialized;
+  if (!model.SerializeToString(&serialized)) {
+    if (error) *error = MILError(3, @"failed to serialize the model spec");
+    return nil;
+  }
+  return [NSData dataWithBytes:serialized.data() length:serialized.size()];
+}
+
+NSString *MILAttentionQueryName(void) { return @"query"; }
+NSString *MILAttentionKeyName(void) { return @"key"; }
+NSString *MILAttentionValueName(void) { return @"value"; }
+NSString *MILAttentionOutputName(void) { return @"attn_out"; }
+
+NSData *MILBuildAttentionSpec(MILAttentionConfig config, NSError **error) {
+  if (config.B == 0 || config.L == 0 || config.S == 0 || config.E == 0) {
+    if (error) *error = MILError(1, @"B, L, S, and E must be non-zero");
+    return nil;
+  }
+
+  const std::vector<uint64_t> queryShape = {config.B, config.L, config.E};
+  const std::vector<uint64_t> keyShape = {config.B, config.S, config.E};
+  const std::vector<uint64_t> valueShape = {config.B, config.S, config.E};
+  const std::vector<uint64_t> outputShape = {config.B, config.L, config.E};
+  const std::string queryName = MILAttentionQueryName().UTF8String;
+  const std::string keyName = MILAttentionKeyName().UTF8String;
+  const std::string valueName = MILAttentionValueName().UTF8String;
+  const std::string outputName = MILAttentionOutputName().UTF8String;
+
+  ms::Model model;
+  model.set_specificationversion(kSpecificationVersion);
+
+  ms::ModelDescription *description = model.mutable_description();
+  SetArrayFeature(description->add_input(), queryName, queryShape);
+  SetArrayFeature(description->add_input(), keyName, keyShape);
+  SetArrayFeature(description->add_input(), valueName, valueShape);
+  SetArrayFeature(description->add_output(), outputName, outputShape);
+
+  mil::Program *program = model.mutable_mlprogram();
+  program->set_version(1);
+
+  mil::Function &function = (*program->mutable_functions())["main"];
+  function.set_opset(kOpset);
+
+  mil::NamedValueType *qInput = function.add_inputs();
+  qInput->set_name(queryName);
+  SetTensorType(qInput->mutable_type(), mil::FLOAT16, queryShape);
+  mil::NamedValueType *kInput = function.add_inputs();
+  kInput->set_name(keyName);
+  SetTensorType(kInput->mutable_type(), mil::FLOAT16, keyShape);
+  mil::NamedValueType *vInput = function.add_inputs();
+  vInput->set_name(valueName);
+  SetTensorType(vInput->mutable_type(), mil::FLOAT16, valueShape);
+
+  mil::Block &block = (*function.mutable_block_specializations())[kOpset];
+  block.add_outputs(outputName);
+
+  AddOp(&block, "scaled_dot_product_attention",
+       {{"query", queryName}, {"key", keyName}, {"value", valueName}},
+       outputName, TensorValueType(mil::FLOAT16, outputShape));
+
+  std::string serialized;
+  if (!model.SerializeToString(&serialized)) {
+    if (error) *error = MILError(3, @"failed to serialize the model spec");
+    return nil;
+  }
+  return [NSData dataWithBytes:serialized.data() length:serialized.size()];
 }

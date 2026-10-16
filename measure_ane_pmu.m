@@ -578,6 +578,32 @@ static BenchResult benchmarkVariant(const BenchConfig *cfg, id<MTLDevice> dev,
                    chipMacsPerCycle, macsPerCoreCycle);
         }
 
+        // --- Output Zero-Skip & Sparsity Audit ---
+        IOSurfaceLock(outSurf, kIOSurfaceLockReadOnly, NULL);
+        void *outPtr = IOSurfaceGetBaseAddress(outSurf);
+        size_t totalElem = B * H * W * Co;
+        size_t zeros = 0;
+        if (dataType == MPSDataTypeFloat16 && !isQDQ) {
+            uint16_t *p = (uint16_t *)outPtr;
+            for (size_t i = 0; i < totalElem; i++) {
+                if (p[i] == 0x0000 || p[i] == 0x8000) zeros++;
+            }
+            double zeroPct = (double)zeros / totalElem * 100.0;
+            printf("   • Output Zero-Skip Audit     : %'lu / %'lu zeros (%.3f%%) | Samples: [0x%04x, 0x%04x, 0x%04x, 0x%04x] -> %s\n",
+                   zeros, totalElem, zeroPct, p[0], p[1], p[2], p[3],
+                   (zeroPct > 90.0) ? "⚠️ DEGENERATE ALL-ZERO OUTPUT (SPARSITY INFLATION!)" : "✅ DENSE VALID OUTPUT (NO ZERO-SKIPPING)");
+        } else {
+            int8_t *p = (int8_t *)outPtr;
+            for (size_t i = 0; i < totalElem; i++) {
+                if (p[i] == 0) zeros++;
+            }
+            double zeroPct = (double)zeros / totalElem * 100.0;
+            printf("   • Output Zero-Skip Audit     : %'lu / %'lu zeros (%.3f%%) | Samples: [%d, %d, %d, %d] -> %s\n",
+                   zeros, totalElem, zeroPct, p[0], p[1], p[2], p[3],
+                   (zeroPct > 90.0) ? "⚠️ DEGENERATE ALL-ZERO OUTPUT (SPARSITY INFLATION!)" : "✅ DENSE VALID OUTPUT (NO ZERO-SKIPPING)");
+        }
+        IOSurfaceUnlock(outSurf, kIOSurfaceLockReadOnly, NULL);
+
         [client unloadModel:model options:@{} qos:25 error:nil];
         CFRelease(inSurf);
         CFRelease(outSurf);

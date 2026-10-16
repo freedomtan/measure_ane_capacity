@@ -1,0 +1,806 @@
+# CPU Matrix Multiplication / Convolution Capability
+
+**Scope:** this repo's ANE/GPU benchmarks (`measure_matmul_universal.m`, `measure_conv_universal.m`,
+`measure_conv_coreml.m`) have no CPU baseline. This investigates two possible routes to one —
+MPSGraph's private `CPUDevice` SPI, and CoreML/MIL's public `MLComputeUnitsCPUOnly` — before
+reaching for lower-level APIs (Accelerate BLAS/BNNS, raw NEON).
+
+**Environment:** macOS 27.0 / Xcode 27, Apple M4 Pro (same unit as the README's baseline numbers).
+
+## Finding 1 — `+[MPSGraphDevice CPUDevice]` exists but crashes unconditionally on compile
+
+`MPSGraphDevice` ships a private `+CPUDevice` class method, parallel to the `+ANEDevice` method
+`measure_matmul_universal.m`/`measure_conv_universal.m` already used (confirmed via a cached
+header dump: `/Users/freedom/work/mil/MPSGraphDevice.h`):
+
+```objc
+/* class methods */
++[MPSGraphDevice deviceWithMTLDevice:];
++[MPSGraphDevice CPUDevice];
++[MPSGraphDevice ANEDevice];
+```
+
+Both `measure_matmul_universal.m` and `measure_conv_universal.m` were extended with a `kTargetCPU`
+option that builds the graph identically to the GPU/ANE paths but passes `[MPSGraphDevice CPUDevice]`
+as the compile-time device. Running either benchmark against this target crashes, every time,
+with the identical stack trace regardless of op (matmul or conv) or optimization level:
+
+```
+*** Terminating app due to uncaught exception 'NSInvalidArgumentException', reason:
+'*** -[__NSCFConstantString stringByAppendingString:]: nil argument'
+*** First throw call stack:
+...
+2   Foundation                      NSCreateMapTable + 0
+3   MetalPerformanceShadersGraph    -[MPSGraphExecutable applyOptimizationPassesWithDevice:module:
+                                      compilationID:compilationDescriptor:perEntryPointFuncOpMLIRName:] + 7980
+4   MetalPerformanceShadersGraph    -[MPSGraphExecutable specializedModuleWithDevice:shapedEntryPoints:
+                                      compilationDescriptor:error:] (block) + 3692
+5   MetalPerformanceShadersGraph    -[MPSGraphExecutable specializedModuleWithDevice:shapedEntryPoints:
+                                      compilationDescriptor:error:] + 4808
+6   MetalPerformanceShadersGraph    -[MPSGraphExecutable specializeWithDevice:shapedEntryPoints:
+                                      compilationDescriptor:error:] (block) + 72
+7-14 libdispatch.dylib / libsystem_pthread.dylib (background GCD worker thread)
+```
+
+**Not shape-specific, not optimization-level-specific.** Tried `MPSGraphOptimizationLevel0` to skip
+whatever `applyOptimizationPassesWithDevice:` normally does — same crash, same offset (`+7980`),
+confirming the method runs unconditionally during specialization regardless of the requested
+optimization level. Same exact stack for both the matmul and the convolution benchmark.
+
+**Likely root cause (not confirmed by disassembly): a nil `metalDeviceName`.** `MPSGraphDevice`'s
+`metalDevice`/`metalDeviceName` properties are presumably nil for a `CPUDevice` instance (it has no
+backing `MTLDevice`), and something inside this compile/specialization pass builds a cache key or
+debug label by `-stringByAppendingString:` against that name, which throws instead of handling the
+nil case. This is a hypothesis, not verified via disassembly here — would need the same
+`ipsw macho disass` treatment the main MXU investigation doc used on `MPSNDArray`/`MetalPerformanceShadersGraph`.
+
+**Not catchable in-process.** The exception is thrown from a background GCD worker thread inside
+`compileWithDevice:`'s own internals (`_dispatch_lane_invoke`/`_dispatch_workloop_worker_thread`),
+not the calling thread — wrapping the call in `@try`/`@catch` on the caller's thread does nothing;
+the whole process still aborts. Both benchmarks were restructured with a `--target gpu|ane|cpu` flag
+so each target runs as its own subprocess, isolating the CPU crash from the GPU/ANE results.
+
+**Conclusion: this SPI, on this OS/MPSGraph build, is not a usable path to a CPU baseline.**
+Confirmed results on this M4 Pro, GPU/ANE unaffected by the refactor:
+
+| Workload | GPU FP16 | ANE FP16 | ANE INT8 | MPSGraph CPU |
+|---|---|---|---|---|
+| Matmul 1024×1024×1024, L=20 | 6.13–6.30 TOPS | 15.68–16.58 TOPS | 16.58 TOPS | crashes |
+| Conv [1,128,256,256]/3×3, L=20 | 9.92 TOPS | 19.10 TOPS | 37.21 TOPS | crashes |
+
+## Finding 2 — CoreML/MIL's `MLComputeUnitsCPUOnly` works cleanly and gives a real number
+
+`measure_conv_coreml.m` already supported `--units cpu` (`MLComputeUnitsCPUOnly`) from the
+original CoreML/MIL benchmark work — it was simply never run against that target before. Running
+it:
+
+```
+$ ./measure_conv_coreml --units cpu
+CoreML Conv2D Capacity Benchmark (FP16)
+Model: built at runtime by MILSpecBuilder (weights=dense)
+Input: dense (random-sign)
+Workload: [1, 128, 256, 256] x 20 conv3x3 (Co=128), 386.55 GOPs/pass, 20 iterations
+[CoreML CPU FP16] Compile: 45.95 ms, Load: 465.55 ms, Avg: 125.26 ms, Speed: 3.0860 TOPS (8.0 FPS)
+```
+
+No crash, no code change needed — just the first time anyone pointed this tool at `cpu`. **3.09
+TOPS is now this repo's first real CPU convolution baseline**, ~3.2x slower than GPU FP16 (9.92
+TOPS) and ~6.2x slower than ANE FP16 (19.10 TOPS) on the same chip, same workload shape.
+
+## Finding 3 — the same bug reproduces on iOS (A18 Pro, A20 Pro), but at a different pipeline stage
+
+Ported the macOS CLI's `kTargetCPU` path into `ANECapacityApp` as `NativeCPUMatmulConvProbe.swift`
+(`--native-cpu-matmul` / `--native-cpu-conv`), using the identical `+[MPSGraphDevice CPUDevice]`
+SPI call via the same raw-`IMP` pattern used throughout this app's other probes. Tested on both
+physical devices available: an iPhone 16 Pro (A18 Pro) and an iPhone 18 Pro (A20 Pro).
+
+**First attempt, full-size shapes (matmul 1024³×20, matching the macOS CLI): no crash, no output,
+no completion for several minutes.** Forced `setvbuf(stdout, nil, _IONBF, 0)` to rule out output
+buffering as the explanation — still nothing printed, including the very first `print()` call,
+until the process was manually terminated. This was ambiguous: either a true hang, or just an
+extremely slow compile with nothing to show for it in between.
+
+**Shrinking the shapes resolved the ambiguity: it's slow, not hung, and the crash moves to a
+different stage than on macOS.** At trivial sizes (64×64×64×1 matmul, 32×32×8ch 3×3×1 conv), both
+devices reliably reproduce a crash — but **the crash is no longer inside the compile call**.
+`-[MPSGraphExecutable compileWithDevice:...]` returns a real, non-nil executable; the identical
+`NSInvalidArgumentException`/`-stringByAppendingString:: nil argument` crash instead happens
+during `-[MPSGraphExecutable runWithMTLCommandQueue:inputsArray:resultsArray:executionDescriptor:]`:
+
+```
+[CPUProbe] Device: Apple A18 Pro GPU, targeting MPSGraphDevice.CPUDevice for matmul
+[CPUProbe] Compiling matmul graph for CPUDevice...
+[CPUProbe] Compile returned without crashing: <MPSGraphExecutable: 0x11a6c5400>
+*** Terminating app due to uncaught exception 'NSInvalidArgumentException', reason:
+'*** -[__NSCFConstantString stringByAppendingString:]: nil argument'
+```
+
+Identical on all four combinations tried (A18 Pro × {matmul, conv}, A20 Pro × {matmul, conv}) —
+same exception class, same message, same "compile succeeds, run crashes" ordering, differing only
+in raw unsymbolicated addresses (no on-device dSYM to resolve them to function names, unlike the
+macOS case where the crash reporter had full symbols).
+
+**Later confirmed on a third chip, an iPhone 17 Pro (A19 Pro):** identical crash, identical
+ordering, for both matmul and conv:
+
+```
+[CPUProbe] Device: Apple A19 Pro GPU, targeting MPSGraphDevice.CPUDevice for matmul
+[CPUProbe] Compiling matmul graph for CPUDevice...
+[CPUProbe] Compile returned without crashing: <MPSGraphExecutable: 0x10c6ed400>
+*** Terminating app due to uncaught exception 'NSInvalidArgumentException', reason:
+'*** -[__NSCFConstantString stringByAppendingString:]: nil argument'
+```
+
+**Interpretation:** this is very likely the same underlying defect as Finding 1 (something
+building a cache key or debug label off a nil `metalDeviceName`-shaped string for a `CPUDevice`
+instance), but iOS's MPSGraph build apparently defers whatever triggers it from compile-time to
+run-time, and/or the macOS crash's `applyOptimizationPassesWithDevice:` code path legitimately
+takes much longer at full problem size on these phones' CPUs before failing — the full-size,
+several-minutes-with-no-output run was never confirmed to be either "still compiling" or "would
+crash eventually," since it was terminated rather than left to run further. Likely compounds with
+the fact that MPSGraph's CPU "device" has to synthesize working code on a path presumably never
+performance-tuned or perhaps even regularly exercised by Apple's own internal callers (Finding 2's
+CoreML/MIL route being the one that actually works).
+
+**Net result: `+[MPSGraphDevice CPUDevice]` is confirmed non-functional across all four physical
+chips tested in this repo (M4 Pro, A18 Pro, A19 Pro, A20 Pro) and both benchmark shapes (matmul,
+conv).** Finding 2's CoreML/MIL route remains the only working CPU path.
+
+## Finding 4 — resolved: `MILSpecBuilder.mm` now has a `matmul` chain builder, and `measure_matmul_coreml.m` gives a real CPU matmul number
+
+Added `MILMatmulChainConfig`/`MILBuildMatmulChainSpec`/`MILMatmulChainText` to `MILSpecBuilder.mm`
+(FP16 only — no quantized variant yet, unlike the conv chain), and a new `measure_matmul_coreml.m`
+CLI matching `measure_conv_coreml.m`'s `--units`/`--plan`/`--check`/`--dump-mil`/`--save`
+conventions.
+
+**One real surprise building it:** `matmul`'s `transpose_x`/`transpose_y` parameters are documented
+as "optional, default `False`" — true only at coremltools' Python `mb.matmul()` builder level. The
+raw compiled `MLProgram` rejects the op outright without them: `Required param 'transpose_y' is
+missing`. Fixed with an explicit shared `no_transpose` `BOOL` const bound to both parameters.
+
+Verified correct with a standalone test harness (hand-computed a 2×2 single-layer matmul against
+the model's own deterministic weight-generation seed; result matched exactly, max diff `0.0`) before
+trusting it enough to benchmark. Then ran the real workload (`[1,1,1024,1024] x [1,1,1024,1024]`,
+20 layers, matching `measure_matmul_universal.m`'s shapes) across all three CoreML compute units on
+this M4 Pro, with `--check` confirming finite, non-degenerate output on each:
+
+```
+[CoreML ANE FP16] Compile: 122.01 ms, Load: 10606.14 ms, Avg: 2.84 ms, Speed: 15.1109 TOPS (351.8 FPS)
+[CoreML GPU FP16] Compile: 122.45 ms, Load: 5978.17 ms,  Avg: 7.01 ms, Speed: 6.1261 TOPS (142.6 FPS)
+[CoreML CPU FP16] Compile: 122.49 ms, Load: 2028.27 ms,  Avg: 6.49 ms, Speed: 6.6172 TOPS (154.1 FPS)
+```
+
+`--plan` confirms the ANE run genuinely places all 20/20 `matmul` ops on the Neural Engine, not a
+silent CPU/GPU fallback. **6.62 TOPS is this repo's first real CPU matmul baseline** — and,
+surprisingly, CoreML's CPU matmul here is *faster* than its GPU matmul (6.62 vs 6.13 TOPS), unlike
+the conv case where CPU (3.09 TOPS) was clearly slowest. Not investigated further; plausibly matmul
+being a much more regular, cache-friendly access pattern than a strided 3×3/128-channel convolution,
+favoring whatever CPU GEMM path CoreML dispatches to (Accelerate's BLAS/AMX path is the leading
+guess, not confirmed).
+
+Updated results table (both ops, all three CoreML compute units, this M4 Pro):
+
+| Workload | ANE FP16 | GPU FP16 | CPU FP16 |
+|---|---|---|---|
+| Matmul 1024³×L20 | 15.11 TOPS | 6.13 TOPS | **6.62 TOPS** |
+| Conv 256²/128ch/3×3×L20 | — | — | 3.09 TOPS |
+
+(ANE/GPU conv-via-CoreML cells intentionally left blank — not re-measured in this pass; the
+MPSGraph ANE/GPU numbers from the main table earlier in this doc are the trustworthy ones for
+those two cells.)
+
+## Finding 5 — the CoreML/MIL matmul path works on real iPhones too, all three chips
+
+Ported the matmul chain builder into `ANECapacityApp`'s own, independent `MILSpecBuilder.m` — a
+pure-Objective-C, zero-dependency reimplementation that hand-encodes the protobuf wire format
+directly (no C++ protobuf library, which can't go into an iOS app bundle the way the repo-root
+`MILSpecBuilder.mm` does). Added `MILMatmulChainConfig`/`MILBuildMatmulChainSpec`/
+`MILMatmulChainInputName`/`OutputName`, mirroring the C++ version field-for-field (same MIL.proto
+schema, so the same `const`/`matmul` op structure, the same `no_transpose` `BOOL` const
+work-around from Finding 4). A new `NativeCoreMLMatmulProbe.swift`
+(`--native-coreml-matmul`) builds the spec, compiles it via `MLModel.compileModel(at:)`, and
+benchmarks all three CoreML compute units in one run — unlike the `MPSGraphDevice.CPUDevice`
+probes, CoreML doesn't crash on any of them, so no per-target process isolation is needed here.
+
+Ran on all three physical iPhones available:
+
+```
+# iPhone 16 Pro (A18 Pro)
+[CoreML ANE FP16] Load: 14077.23 ms, Avg: 3.35 ms,  Speed: 12.8122 TOPS (298.3 FPS)
+[CoreML GPU FP16] Load: 9336.53 ms,  Avg: 28.61 ms, Speed: 1.5013 TOPS (35.0 FPS)
+[CoreML CPU FP16] Load: 2645.87 ms,  Avg: 15.60 ms, Speed: 2.7526 TOPS (64.1 FPS)
+
+# iPhone 17 Pro (A19 Pro)
+[CoreML ANE FP16] Load: 12807.51 ms, Avg: 3.34 ms,  Speed: 12.8659 TOPS (299.6 FPS)
+[CoreML GPU FP16] Load: 8268.15 ms,  Avg: 6.97 ms,  Speed: 6.1613 TOPS (143.5 FPS)
+[CoreML CPU FP16] Load: 2452.38 ms,  Avg: 13.40 ms, Speed: 3.2048 TOPS (74.6 FPS)
+
+# iPhone 18 Pro (A20 Pro)
+[CoreML ANE FP16] Load: 13374.08 ms, Avg: 2.40 ms,  Speed: 17.9289 TOPS (417.4 FPS)
+[CoreML GPU FP16] Load: 6157.91 ms,  Avg: 4.67 ms,  Speed: 9.2017 TOPS (214.2 FPS)
+[CoreML CPU FP16] Load: 1759.73 ms,  Avg: 11.05 ms, Speed: 3.8883 TOPS (90.5 FPS)
+```
+
+All nine runs (three chips × three compute units) report finite, non-degenerate output (`--check`-
+equivalent output-range logging built into the probe). **First real CPU matmul numbers on actual
+iPhone silicon: 2.75 TOPS (A18 Pro), 3.20 TOPS (A19 Pro), 3.89 TOPS (A20 Pro)** — a clean
+monotonic increase across generations.
+
+Notably, the M4 Pro's "CPU beats GPU at matmul" surprise from Finding 4 does **not** reproduce on
+any of the three iPhones — on all three, GPU comfortably beats CPU, the ordering you'd expect
+(ANE > GPU > CPU). A18 Pro's GPU number (1.50 TOPS) stands out as unusually low relative to A19 Pro
+and A20 Pro's GPU numbers (6.16, 9.20 TOPS) despite A18 Pro's own ANE/CPU numbers being roughly
+in line with A19 Pro's — plausibly compile/specialization overhead specific to that run (A18 Pro's
+GPU load time, 9.3s, is disproportionately long relative to its own avg latency) rather than a
+genuine generational throughput cliff, but not confirmed. The M4 Pro's CPU-beats-GPU result should
+be treated as a Mac-specific or small-sample artifact, not a general "CoreML CPU matmul beats GPU
+matmul" rule — it is the only platform of the four tested where that ordering appears.
+
+Also confirmed on this third chip: the `MPSGraphDevice.CPUDevice` crash from Finding 3 reproduces
+identically on A19 Pro, for both matmul and conv (same exception, same "compile succeeds, run
+crashes" ordering) — see Finding 3's update above.
+
+Final results table, all platforms and both ops:
+
+| Workload | Platform | ANE FP16 | GPU FP16 | CPU FP16 |
+|---|---|---|---|---|
+| Matmul 1024³×L20 | M4 Pro (Mac) | 15.11 TOPS | 6.13 TOPS | 6.62 TOPS |
+| Matmul 1024³×L20 | A18 Pro (iPhone 16 Pro) | 12.81 TOPS | 1.50 TOPS | 2.75 TOPS |
+| Matmul 1024³×L20 | A19 Pro (iPhone 17 Pro) | 12.87 TOPS | 6.16 TOPS | 3.20 TOPS |
+| Matmul 1024³×L20 | A20 Pro (iPhone 18 Pro) | 17.93 TOPS | 9.20 TOPS | 3.89 TOPS |
+| Conv 256²/128ch/3×3×L20 | M4 Pro (Mac) | — | — | 3.09 TOPS |
+
+## Finding 6 — does the CoreML CPU matmul path use AMX, SME2, or plain NEON? It uses Apple AMX
+
+(There is no SSE2 on Apple Silicon at all — that's an x86 Intel ISA. The real question is whether
+the CPU GEMM reaches Apple's private AMX matrix coprocessor, ARM's newer official SME/SME2
+extension, or falls back to plain NEON SIMD loops.)
+
+> **Executive Conclusion (see [`docs/AMX_GEMM_Microkernel_Disassembly.md`](AMX_GEMM_Microkernel_Disassembly.md)):**
+> CoreML CPU matmul (`MLComputeUnitsCPUOnly`) executes on **Apple AMX**, not SME2. While `libBNNS.dylib`
+> contains genuine SME2 instructions (`smstart za`, `zt0`, `luti4`, `fmopa`), the actual compute kernel
+> dispatched by BNNS for this workload (`0x18f0623a4`) consists entirely of Apple's private AMX
+> NOP-space instructions (`ldx`, `ldy`, `ldz`, and op-19 outer-product accumulators). See the detailed
+> disassembly document for the exact live call chain and instruction-by-instruction breakdown.
+
+**Confirmed the call path with `sample`:** ran `measure_matmul_coreml --units cpu` with a long
+iteration count in the background and sampled the live process for 3 seconds. Every hot-path
+stack bottoms out at:
+
+```
+main -> runBenchmark -> ... -> E5RT::Ops::BnnsCpuInferenceOperation::...
+       -> BNNSGraphContextExecute_v2 (libBNNS.dylib) -> ??? (stripped, in libBNNS.dylib)
+```
+
+So CoreML's CPU compute unit, for this workload, really does go through Accelerate's BNNS
+(Basic Neural Network Subroutines), not a generic/naive loop. The deepest frames inside
+`libBNNS.dylib` are stripped of symbol names (`???` in the sample output), so the exact leaf
+kernel wasn't directly visible this way.
+
+**Found the real answer in `libBNNS.dylib`'s own string literals.** Disassembled the library
+(the standalone, non-shared-cache copy at
+`.../ios-hacking/disassm/extracted/.../vecLib.framework/Versions/A/libBNNS.dylib`, via
+`otool -tv`, ~4.5M lines) and grepped for every `"KERNEL_..."` string — these are BNNS's internal
+kernel-selection enum names, baked in as literal strings for logging/error messages. For
+GEMM/MatMul specifically:
+
+```
+KERNEL_GEMM_NEON / KERNEL_GEMM_NEON_DYNAMIC
+KERNEL_GEMM_MLA1 / MLA1_DYNAMIC
+KERNEL_GEMM_MLA2 / MLA2_DYNAMIC
+KERNEL_GEMM_MLA3 / MLA3_DYNAMIC
+KERNEL_GEMM_SME2 / SME2_DYNAMIC
+KERNEL_GEMM_INTEL64 / INTEL64_DYNAMIC        (Rosetta/x86 fallback, irrelevant here)
+KERNEL_MATMUL_{NEON,MLA1,MLA2,MLA3,SME2,SME2P1,INTEL64}[_DYNAMIC]
+KERNEL_SPARSE_MATMUL_{NEON,AMX2,AMX3,SME2P1}[_DYNAMIC]
+```
+
+The sparse-matmul family names its matrix-coprocessor tiers **`AMX2`/`AMX3`** explicitly; other
+strings elsewhere in the binary reference `"combo_dodge_v2_amx3"`,
+`"BNNS transpose2d_amx1/2/3, unsupported data types"`, and
+`"dynamic_prep_and_execute_copy ... dispatching of AMX copies"`. The dense GEMM/MatMul family uses
+a **different label, `MLA1`/`MLA2`/`MLA3`**, for what is almost certainly the same hardware
+block under a different internal name (the numbering lines up with the sparse path's `AMX2`/`AMX3`,
+and `MLA1` for an even older/first-generation tier) — not confirmed by name alone, but strongly
+suggested by the parallel structure. **So: yes, BNNS has a real, named, non-NEON matrix-coprocessor
+kernel tier for GEMM — it isn't just NEON SIMD loops.**
+
+
+**This chip (M4 Pro) also exposes ARM's official SME/SME2 extension, confirmed via `sysctl`:**
+
+```
+hw.optional.arm.FEAT_SME: 1
+hw.optional.arm.FEAT_SME2: 1
+hw.optional.arm.FEAT_SME2p1: 0
+hw.optional.neon: 1
+```
+
+No equivalent public sysctl exists for AMX (expected — Apple has never documented or exposed it,
+consistent with the entire private-SPI theme of this repo's other findings). Given `KERNEL_GEMM_SME2`
+exists as a named tier and this hardware genuinely has `FEAT_SME2`, the most likely real answer for
+this specific chip is that dense FP16 GEMM here runs through the **public SME2** path rather than
+the private legacy AMX tiers (`MLA1`/`MLA2`/`MLA3` plausibly exist for M1–M3-era chips that predate
+SME2 silicon) — but this is an informed inference from kernel-naming conventions and hardware
+capability bits, **not a direct runtime observation of which kernel actually got dispatched**.
+
+**Closed out: confirmed SME2 is genuinely dispatched, both statically and live via `lldb`.**
+
+Took a `sample` capture of a sustained `measure_matmul_coreml --units cpu` run (3000 iterations,
+6 s sampling window) and walked the full stack past the stripped `???` frames by resolving file
+offsets against the standalone `libBNNS.dylib` copy's own function-start table (scanned for
+`pacibsp` prologues, since `nm`'s exported-symbol table is too sparse — most of these are static
+functions with no exported name at all). The hot leaf stack bottoms out in one ~19 KB unnamed
+function (`libBNNS.dylib + 0xa73ca4`, called from a small dispatcher at `+0xa7330c`, itself called
+from `BNNSGraphContextExecute_v2` through a `dispatch_apply`-parallelized chain). Disassembling
+that function directly shows:
+
+```
+smstart za / smstop za        -- enables the SME matrix-accumulator (ZA) state
+ldr  zt0, [...]                -- loads the SME2-only ZT0 lookup-table register
+luti4 { z8.h - z11.h }, zt0, ...  -- SME2 lookup-table instruction (476 occurrences)
+fmopa / bfmopa                 -- outer-product accumulate into ZA (64 occurrences)
+```
+
+`ZT0` and `luti4` are **SME2-exclusive** — that register and instruction don't exist in baseline
+SME1 at all — so this isn't just "SME-capable hardware, possibly running an older path"; the
+compiled code itself is SME2 code.
+
+Then confirmed this is actually reached at runtime, not just present-but-dead code: set an `lldb`
+breakpoint directly on that function's address (`breakpoint set --shlib libBNNS.dylib --address
+0x18f6e0ca4`), launched the real benchmark under the debugger, and hit it immediately with a full,
+unbroken backtrace from CoreML's prediction call down through BNNS:
+
+```
+measure_matmul_coreml`runBenchmark -> ... -> -[MLE5Engine predictionFromFeatures:...]
+  -> Espresso::E5RT::Ops::BnnsCpuInferenceOperation::ExecuteSync()
+  -> BNNSGraphContextExecute_v2 (libBNNS.dylib)
+  -> ___lldb_unnamed_symbol_18f2dc0c8 -> ... -> dispatch_apply_with_attr (parallelized)
+  -> ___lldb_unnamed_symbol_18ee1a55c -> ___lldb_unnamed_symbol_18f6e030c (dispatcher)
+  -> ___lldb_unnamed_symbol_18f6e0ca4   <- breakpoint hit here, the SME2 kernel above
+```
+
+(An earlier attempt — breaking on `__bnns_hgemm`'s own entry point and on 32 addresses chosen by
+raw proximity to it — never hit, at all, across either run. That ruled those specific guesses out
+but didn't answer the question; the fix was finding the real callee via `sample`-derived file
+offsets and the function-start table, rather than guessing by address proximity.)
+
+**Net result: yes, SME2 is used** for this CPU FP16 matmul workload on this M4 Pro, confirmed both
+statically (SME2-exclusive instructions in the actual hot function) and dynamically (`lldb`
+breakpoint hit on that exact function during a real benchmark run, with a clean backtrace up
+through BNNS and CoreML). Not confirmed/out of scope: whether the private legacy AMX tiers
+(`MLA1`/`MLA2`/`MLA3`) are ever selected on this chip for other shapes/dtypes, or whether older
+chips without `FEAT_SME2` (pre-M4-generation) fall back to those AMX tiers instead — this was only
+checked for the FP16 dense path on this specific chip.
+
+> **Correction (see `docs/AMX_GEMM_Microkernel_Disassembly.md`):** the "SME2-exclusive
+> instructions in the actual hot function" claim above is wrong. It came from disassembling an
+> overly wide address window around the breakpoint-hit function, which pulled in a *different*,
+> later function's SME2 code and misattributed it. Properly bounded (via the function's own
+> `pacibsp`/`ret` pair) and traced live by stepping through its indirect calls, the breakpoint-hit
+> function dispatches to a different, genuinely AMX-based kernel (same undocumented
+> `0x00201000`-NOP-space encoding as Finding 11), not SME2. The `lldb` breakpoint-hit confirmation
+> itself was real and is not in question — only which instructions execute there. The real SME2
+> code does exist elsewhere in `libBNNS.dylib`; whether this repo's benchmarks ever reach it is now
+> open. See the linked doc for the full annotated disassembly and decompiled pseudocode of the
+> actual kernel.
+
+## Finding 7 — matmul now supports INT8 and FP8, matching the conv chain's QDQ pattern, on all three CoreML compute units
+
+Extended `MILMatmulChainConfig` with the same `precision` field the conv chain already has, and
+mirrored its QDQ (quantize/dequantize) pattern exactly for `matmul`:
+
+- **INT8**: weights stored via `constexpr_blockwise_shift_scale` (INT8 inline bytes + FP16
+  per-channel scale), activations `quantize`d to INT8 and `dequantize`d back to FP16 around each
+  `matmul`, same `act_scale = 1/32` constant the conv chain uses.
+- **FP8**: weights stored via `constexpr_lut_to_dense` (FP8-E4M3 inline indices + the same
+  256-entry IEEE-Float8-to-FP16 lookup table the conv chain uses), dequantized once to FP16 — like
+  the conv chain, activations are **not** quantized for FP8, only the weights.
+
+Added `--precision fp16|int8|fp8` to `measure_matmul_coreml.m`, matching `measure_conv_coreml.m`'s
+flag exactly. Ran all 9 combinations (3 precisions × ANE/GPU/CPU) on this M4 Pro, `--check`-verified
+finite/non-degenerate output on every one:
+
+| Precision | ANE | GPU | CPU |
+|---|---|---|---|
+| FP16 | 15.11 TOPS | 6.13 TOPS | 6.62 TOPS |
+| INT8 | 18.51 TOPS | 6.17 TOPS | 4.89 TOPS |
+| FP8  | 15.94 TOPS | 6.51 TOPS | 6.63 TOPS |
+
+**FP8's output is numerically identical to FP16's** (same sample values down to the printed
+digits) — expected, not a bug: like the conv chain, FP8 here only changes how the *weights* are
+stored on disk (`constexpr_lut_to_dense` dequantizes them to FP16 immediately), and the actual
+`matmul` still executes in FP16. This measures "FP8-compressed-weights overhead," not a native
+FP8 compute path — same caveat the conv chain's FP8 mode has always had, now true for matmul too.
+
+**INT8 is the only precision where ANE pulls meaningfully ahead of FP16/FP8** (18.51 vs ~15.5
+TOPS) — consistent with INT8 being the one case here that changes the actual *activation* dtype
+flowing through the op, not just the weight storage format, giving the ANE's integer path
+something real to do. INT8 CPU is the only precision where CPU meaningfully regresses (4.89 vs
+~6.6 TOPS for FP16/FP8) — plausibly the `quantize`/`dequantize` ops around every layer adding
+real per-layer overhead on CPU that the other compute units absorb better; not investigated
+further.
+
+## Finding 8 — INT8/FP8 matmul ported to all three iPhones; the INT8-CPU-regression pattern is Mac-specific
+
+Ported the same QDQ pattern into `ANECapacityApp`'s independent `MILSpecBuilder.m` (new
+`generateWeightsMatmulINT8`/`generateWeightsMatmulFP8`, and precision branching in
+`MILBuildMatmulChainSpec` mirroring the root `.mm`'s exactly), and extended
+`NativeCoreMLMatmulProbe.swift` to loop over all three precisions. One Swift/ObjC-bridging
+surprise along the way: `MILPrecisionFP16`/`INT8`/`FP8` import into Swift not as the usual
+lowercased-prefix-stripped `.fp16`/`.int8`/`.fp8` (which is what `MILWeightModeDense` becomes —
+`.dense`), but as **`.FP16`/`.INT8`/`.FP8`**, fully uppercase — plausibly because Swift's import
+heuristic, when the remaining suffix is *entirely* uppercase letters/digits, treats it as an
+all-caps acronym and leaves the case alone rather than lowercasing it the way it does for a
+mixed-case remainder like `Dense`. Confirmed empirically via a `swiftc -typecheck` throwaway
+rather than guessed.
+
+Ran all 27 combinations (3 chips × 3 precisions × ANE/GPU/CPU) across the three iPhones, all
+finite/non-degenerate:
+
+| Precision | A18 Pro ANE | A18 Pro GPU | A18 Pro CPU | A19 Pro ANE | A19 Pro GPU | A19 Pro CPU | A20 Pro ANE | A20 Pro GPU | A20 Pro CPU |
+|---|---|---|---|---|---|---|---|---|---|
+| FP16 | 13.01 | 1.51 | 3.13 | 13.02 | 6.35 | 3.19 | 16.96 | 9.28 | 4.04 |
+| INT8 | 17.69 | 1.50 | 3.00 | 20.43 | 6.17 | 2.93 | 21.06 | 9.23 | 3.55 |
+| FP8  | 12.76 | 1.58 | 3.16 | 13.04 | 5.96 | 3.32 | 18.16 | 8.82 | 4.06 |
+
+(All TOPS. GPU numbers are flat across precision on each chip, as expected — GPU compute doesn't
+change between FP16/INT8/FP8 here any more than it did on the Mac, since the dequantize-then-FP16
+pattern means the GPU's actual matmul is always FP16 regardless of precision label.)
+
+**The headline cross-platform finding: the M4 Pro's INT8-CPU-regression result (4.89 vs ~6.6 TOPS
+for FP16/FP8) does not reproduce on any of the three iPhones.** CPU INT8 is close to CPU FP16/FP8
+on every phone — a small dip (A18 Pro: 3.13→3.00, A19 Pro: 3.19→2.93) or a mild dip (A20 Pro:
+4.04→3.55), nothing like the Mac's ~26% drop. Combined with Finding 5's earlier observation that
+the Mac's "CPU beats GPU at matmul" result also doesn't reproduce on iPhones, this is now the
+**second** CPU-matmul anomaly specific to the M4 Pro/macOS CoreML CPU path rather than a property
+of the underlying arithmetic — consistent with Finding 6's finding that BNNS's CPU GEMM dispatch
+has multiple real hardware-tiered kernels (`MLA1/2/3`, `SME2`) whose selection logic could very
+plausibly behave differently for the QDQ-wrapped INT8 case specifically on macOS vs iOS, though
+this wasn't traced further.
+
+**ANE INT8 pulling ahead of FP16/FP8 reproduces cleanly on every chip** (consistent with Finding
+7's Mac result and the explanation given there — INT8 is the only precision that changes the
+actual activation dtype flowing through the op, not just the weight storage format).
+
+## Finding 9 — does FP8 take a different SME2 code path on iPhone 18 Pro (A20 Pro), which adds new SME2 FP8 extensions?
+
+A20 Pro is the first chip in this repo built on ARM's newer SME2.1 extensions, which add two new
+feature bits ARM calls `FEAT_SME_F8F16`/`FEAT_SME_F8F32` (dedicated FP8 outer-product instructions,
+accumulating into FP16/FP32 ZA state respectively — a genuine hardware FP8 matmul path, unlike
+plain SME2's FP16/BF16 `fmopa`). Checked whether this repo's own FP8 matmul benchmark actually
+reaches that new path on this chip.
+
+**Confirmed the hardware generational split with a small on-device `sysctlbyname` probe**
+(`SysctlFeatureProbe.swift`, new `--sysctl-features` launch arg), run on all four chips:
+
+| | M4 Pro (Mac) | A18 Pro | A19 Pro | A20 Pro |
+|---|---|---|---|---|
+| `FEAT_SME2p1` | 0 | 0 | 1 | 1 |
+| `FEAT_SME_F8F16` | 0 | 0 | 0 | **1** |
+| `FEAT_SME_F8F32` | 0 | 0 | 0 | **1** |
+
+A20 Pro is the only chip tested here with the new FP8-capable SME2 hardware at all — exactly the
+"new FP8 features for SME2" in question.
+
+**But the benchmark itself doesn't exercise it.** Three lines of evidence, all pointing the same
+way:
+
+1. **`libBNNS.dylib`'s own kernel-tier names are identical across chips.** The iPhone 18 Pro's copy
+   (pulled from the matching Xcode `iOS DeviceSupport` symbol cache, `iPhone19,2 27.0.1 (24A446)`)
+   has the exact same `KERNEL_GEMM_{NEON,MLA1,MLA2,MLA3,SME2}`/`KERNEL_MATMUL_{...,SME2P1}` string
+   set as Finding 6 found on the Mac — no distinct `KERNEL_GEMM_FP8`/`_F8F16` tier exists anywhere,
+   on any chip. BNNS's dense-GEMM kernel selector has no FP8-specific option to even pick.
+2. **On-device A/B timing on the A20 Pro itself is statistically identical between precisions**
+   (isolated via a new `--native-coreml-matmul-single <precision> --units <unit>` launch arg added
+   to avoid comparing across unrelated runs):
+   `[CoreML CPU FP16] Avg: 10.05 ms, Speed: 4.2722 TOPS` vs. `[CoreML CPU FP8] Avg: 10.07 ms, Speed:
+   4.2658 TOPS` — a 0.2% difference, well within run-to-run noise, not what a genuinely different
+   compute kernel would look like.
+3. **This is architecturally expected, not a surprise**, per Finding 7: this repo's FP8 mode
+   dequantizes FP8-E4M3 weights to FP16 via `constexpr_lut_to_dense` *before* the `matmul` op, so
+   the op BNNS actually receives is a plain FP16-input matmul regardless of the "FP8" label on the
+   weight constant. BNNS's dispatcher never sees a real FP8 tensor from this MIL graph, so it has
+   no reason to select a different kernel even on hardware that has one.
+
+**Net result: no, this benchmark does not take a different SME2 path for FP8 on iPhone 18 Pro** —
+it hits the identical SME2 FP16 kernel traced in Finding 6, on every chip, including this one. The
+new `FEAT_SME_F8F16`/`FEAT_SME_F8F32` hardware exists and is uniquely present on A20 Pro, but
+reaching it would require a MIL graph with a genuine FP8-typed `matmul` input (not just an FP8-
+compressed-then-dequantized weight constant) — CoreML/MIL's `matmul` op doesn't expose that today
+in the way this repo's builders construct it. Confirming whether *any* CoreML/MIL op can reach the
+true FP8 SME2 path at all is a candidate follow-up, not done here. (Also not pursued: pinpointing
+the exact code location that reads the `FEAT_SME_F8F16` sysctl inside `libBNNS.dylib` — a low-level
+string-cross-reference attempt hit a dead end, repeatedly landing on unrelated pointer-
+authentication trampoline code rather than the real reader.)
+
+## Finding 10 — can we reach BNNS's real quantized kernel at all? Weight-only INT8 just gets constant-folded away
+
+Finding 6 turned up a kernel name worth testing directly: `KERNEL_MATMUL_WITH_AFFINE_QUANTIZE_WEIGHT`
+— a dense GEMM tier distinct from the plain `MLA1/2/3`/`SME2` ones, suggesting BNNS has a real
+weight-only-quantized compute path. The current INT8 matmul (Finding 7/8) wraps *activations* in
+an explicit `quantize`/`dequantize` pair every layer, mirroring the conv chain's pattern — maybe
+that's what's preventing the affine-quantize-weight kernel from being picked, and causing the
+CPU regression Finding 7 found (4.89 vs ~6.6 TOPS).
+
+Added a fourth precision, `MILPrecisionINT8WeightOnly` (`--precision int8w`): identical INT8
+weight representation (`constexpr_blockwise_shift_scale`) to the existing INT8 mode, but with the
+per-layer activation `quantize`/`dequantize` pair removed entirely — activations flow into
+`matmul` as plain FP16, same as the FP16 mode, with only the weight constant stored as INT8.
+
+| Precision | Avg | TOPS |
+|---|---|---|
+| FP16 | 6.50 ms | 6.6091 |
+| INT8 (QDQ) | 8.84 ms | 4.8569 |
+| INT8W (new) | 6.50 ms | 6.6088 |
+
+**INT8W is bit-identical to FP16** — same timing to two decimal places, same output values down to
+the printed digits (`0.0409851, -0.0431824, ...` for both). Confirmed via `sample` that INT8W hits
+the exact same hot function addresses as the FP16 SME2 kernel from Finding 6
+(`libBNNS.dylib + 0xa73ca4`/`+0xa7330c` region).
+
+**The real explanation: the MIL compiler constant-folds the whole thing away.** `weights =
+dequantize(weights_int8_const, scale_const)` has two compile-time-constant inputs, so the compiler
+evaluates it at compile time and bakes a plain FP16 constant into the compiled program — there is
+no quantized data left by the time BNNS executes anything. This settles two things at once:
+
+- **Finding 7's INT8-CPU-regression was never about hardware kernel selection at all** — it was
+  purely the per-layer `quantize`/`dequantize` *op overhead* on the activation path (20 extra op
+  pairs per inference), not a slower GEMM kernel. Weight-only quantization through this builder
+  path costs nothing at runtime, but also *gains* nothing at runtime — the only benefit is a
+  smaller compiled spec (half the inline weight bytes) and proportionally faster compile/load
+  time (compile: 58.71 ms vs FP16's 124.03 ms; load: 816 ms vs 1995 ms), not faster inference.
+- **This builder path cannot reach `KERNEL_MATMUL_WITH_AFFINE_QUANTIZE_WEIGHT` (or any genuinely
+  quantized BNNS kernel) at all**, because MIL's constant folding erases the INT8-ness before BNNS
+  ever sees the graph. Whatever that kernel is for, it isn't reachable by feeding BNNS a
+  compile-time-constant quantized weight through CoreML/MIL — you'd need the weight (or activation)
+  to be a genuine runtime-variable INT8 tensor that MIL's compiler can't fold away, which the
+  `quantize`/`dequantize`-wrapped activation path *does* satisfy (hence Finding 7's INT8 mode isn't
+  folded) — but that path pays the QDQ op overhead instead of reaching a faster kernel.
+
+**Where this leaves "native" low-precision compute through BNNS**: this repo's MIL-builder
+approach cannot produce a genuinely-INT8-typed `matmul` the compiler won't fold back to FP16/erase
+the overhead from — by construction, in MIL, a `matmul` op's `x`/`y` are typed FP16 whenever either
+operand traces back to a compile-time constant. Reaching real native INT8 (or any) compute would
+mean going around MIL/CoreML entirely and calling `libBNNS.dylib`'s own public C API directly:
+
+- **`BNNSMatMul`** / `BNNSFilterCreateLayerFullyConnected` (chained with a `BNNSQuantization`
+  filter) in the legacy, still-callable (if `__API_DEPRECATED`) `bnns.h` — takes raw
+  `BNNSNDArrayDescriptor` structs with an explicit `BNNSDataType`, including real `Int8`, no MIL or
+  CoreML involved, so no constant-folding compiler sits between us and whatever kernel BNNS
+  actually picks for an int8 x int8 call.
+- **No public `BNNSDataType` value exists for FP8 at all** — checked `bnns_constants.h`
+  exhaustively (Float16/32, BFloat16, Int8/16/32/64, UInt*, Indexed, Boolean). The `Float8E4M3FN_v1`
+  type strings found in Finding 9 belong to a private "AICode"/MLIR type system used internally by
+  the graph compiler, not exposed in this struct — so a standalone BNNS harness could test real
+  native INT8 this way, but not native FP8.
+
+Not done here: writing that standalone `BNNSMatMul`-direct harness. Flagged as the natural next
+step if "does BNNS's `KERNEL_MATMUL_WITH_AFFINE_QUANTIZE_WEIGHT` (or any real quantized kernel)
+actually exist and get selected" is worth settling definitively.
+
+## Finding 11 — calling libBNNS directly: BNNSMatMul rejects INT8 outright; BNNSFilterCreateLayerFullyConnected accepts real INT8 weights but routes them through legacy AMX, not SME2
+
+Finding 10 showed the MIL-builder path can't reach BNNS with a genuinely-INT8-typed tensor at all
+— the compiler folds it away first. The natural next step: skip MIL/CoreML entirely and call
+`libBNNS.dylib`'s public, documented `bnns.h` C API directly (new standalone harnesses,
+`bnns_matmul_probe.m` and `bnns_fc_probe.m`, linked straight against `Accelerate.framework`, no
+MIL/CoreML/protobuf anywhere in the binary).
+
+**`BNNSMatMul` (and `BNNSMatMulWorkspaceSize`) reject every integer `BNNSDataType` combination
+outright.** Tried `Int8`/`Int8`→`Int8`, `→Int32`, `→Float32`, `→Float16`, `Int16`/`Int16`→`Int32`,
+and mixed `Int8`/`Float16`→`Float16`, with both `data_scale=1` and the default — every single one
+returns `BNNSMatMulWorkspaceSize() == -1` (invalid), before `BNNSMatMul` itself is even called.
+This free function's "GEMM" is float-only, full stop; the `data_scale`/`data_bias` fields on
+`BNNSNDArrayDescriptor` are documented generically but `BNNSMatMul` doesn't honor them for
+non-float inputs at all.
+
+**`BNNSFilterCreateLayerFullyConnected` does accept a genuinely-INT8 weight matrix.**
+`BNNSLayerParametersFullyConnected` gives `i_desc`/`w_desc`/`o_desc` *independent*
+`BNNSNDArrayDescriptor`s, so `w_desc` can be `BNNSDataTypeInt8` (with `data_scale`) while
+`i_desc`/`o_desc` stay `BNNSDataTypeFloat16` — and since there's no compiler in this path at all,
+there's nothing to constant-fold it away. **Correctness confirmed by hand**: a tiny 4-input/3-output
+case with weight rows `[1,1,1,1]`, `[2,2,2,2]`, `[1,2,3,4]` and input `[1,2,3,4]` produced exactly
+the expected `[10, 20, 30]`.
+
+**But it's slower than FP16, not faster** (1024³, `BNNSFilterApplyBatch` with `batch_size=M`):
+
+| | Avg | TOPS |
+|---|---|---|
+| FC, FP16 weight | 1.497 ms | 1.4349 |
+| FC, INT8 weight (scale=1/32) | 3.488 ms | 0.6156 |
+
+**Why: this legacy API reaches real Apple AMX instructions, not SME2.** Sampling the INT8-weight
+call and resolving the hot leaf's file offset against the function-start table from Finding 6 lands
+in a ~6 KB function containing instructions `otool` can't decode at all — printed as raw
+`.long 0x0020100f` / `0x0020102f` / `0x0020118a..8d` words, which is exactly the signature of
+Apple's private, undocumented AMX coprocessor (no public mnemonics exist for it, same point Finding
+6 raised and didn't chase at the time). Decoding the operand field by the publicly known AMX
+NOP-space encoding scheme (instruction `= 0x00201000 | (op << 5) | operand`), `0x00f`→op 0 (`ldx`),
+`0x02f`→op 1 (`ldy`), and the repeated `0x18a`/`8b`/`8c`/`8d` block → op 12 (`fma64`) four times
+with incrementing accumulator operands — a textbook AMX load-X/load-Y/four-way-FMA-accumulate GEMM
+microkernel. The FP16-weight call, sampled the same way, never reaches this function at all; its
+hot path instead calls out to addresses entirely outside `libBNNS.dylib`'s own mapped range,
+consistent with (though not conclusively proven to be) delegating to Accelerate's `libBLAS.dylib`
+instead.
+
+**Net result: real native INT8 compute through BNNS's public API exists and is callable today**,
+confirmed both by output correctness and by direct instruction-level inspection (not CoreML/MIL
+constant-folding it away this time) — but it's the *old* AMX-coprocessor path from before SME2
+existed, which this specific legacy, `__API_DEPRECATED(macOS 15)` `BNNSFilterCreateLayerFullyConnected`
+API still routes to, and on this M4 Pro it's measurably slower than the modern SME2-based FP16 path
+Finding 6 traced through `BNNSGraphContextExecute_v2`. This reframes the original question: it's
+not that BNNS "can't" do native low-precision matmul — it's that Apple's newer, faster SME2 kernel
+set (reached only through the modern `BNNSGraph*` APIs that CoreML itself uses) apparently doesn't
+have an INT8-weight variant exposed on this path at all, while the older AMX-based kernel set that
+*does* support it predates the hardware generation that made SME2 worth switching to. Whether
+`BNNSGraphCompileFromFile` (the modern API, directly callable too) can be fed a hand-written
+`model.mil` text file with a genuinely non-foldable INT8 weight (e.g. a graph input instead of a
+constant) and reach a faster, modern quantized kernel is the natural next question — not attempted
+here.
+
+## Finding 12 — BNNSGraphCompileFromFile, the modern API, reaches the fast AMX kernel even with a genuinely non-foldable INT8 weight
+
+Finding 11's natural follow-up: `BNNSGraphCompileFromFile` is the modern graph-execution API (macOS
+15/iOS 18+) CoreML's own `E5RT` backend calls internally — the exact function Finding 6 traced the
+live call chain into. It takes a compiled `.mlmodelc`, not raw MIL text, so the plan is: build a MIL
+spec whose weight is a genuine function **input** (not a `const`, unlike Finding 10's folded-away
+`INT8WeightOnly`), compile it with the normal CoreML compiler (`MLModel.compileModelAtURL:` — still
+needed just to produce the `.mlmodelc` artifact), then execute that artifact directly through
+`BNNSGraphCompileFromFile` + `BNNSGraphContextExecute`, with no `MLModel`/`MLFeatureProvider`
+anywhere in the execution path at all. New builder function `MILBuildMatmulWeightInputSpec` and
+harness `bnns_graph_matmul_probe.m`.
+
+
+**Hit CoreML's top-level I/O type restriction immediately.** `FeatureTypes.proto`'s
+`ArrayFeatureType.ArrayDataType` only has `FLOAT32`/`DOUBLE`/`INT32`/`FLOAT16` — there is no `INT8`
+option at the model-boundary level, confirmed by the compiler rejecting a declared-INT8 model input
+("Model input ... has a different type than its corresponding parameter to main") even though INT8
+is completely normal as an *internal* MIL tensor type (used throughout Findings 7/8/10's
+constexpr/dequantize ops). **Worked around it**: declare the weight as an `INT32` model input, and
+make `cast(x=weights_in, dtype="int8")` the function's first op — genuinely non-constant (there is
+still nothing here for the compiler to fold; it's a real runtime input) but legal at the model
+boundary. `dequantize` then runs on that cast INT8 tensor, same as before, feeding `matmul`.
+
+**Two debugging dead ends worth recording**, both of which produced *wrong output with no error*,
+not a clean failure:
+- The naive "copy the compiled model to a stable path" step (mirroring every other CLI in this
+  repo) silently self-destructed: `MLModel.compileModelAtURL:`'s default output path and this
+  probe's own computed "destination" path both land in `NSTemporaryDirectory()` with the same
+  name-derivation rule, so `removeItemAtURL:` on the "destination" deletes the compiler's own
+  output *before* the copy runs. Fix: skip the copy, use the compiler's own output URL directly.
+- `BNNSGraphContextExecute` silently produced `inf` in every output element with `rc == 0` (no
+  error) when given a `malloc()`-returned workspace buffer — the API requires a **page-aligned**
+  workspace (documented, easy to miss) and apparently doesn't validate alignment before using it.
+  Fix: `posix_memalign(&workspace, 16384, workspaceSize)`. Caught the *other* half of this bug
+  class (wrong argument count/size instead of alignment) by wiring
+  `BNNSGraphContextSetMessageLogCallback`/`SetMessageLogMask` — raising the mask to include
+  `BNNSGraphMessageLevelInfo` surfaced `"BNNS: Provided workspace is not page-aligned"` directly,
+  which is how the alignment requirement was found at all.
+- **Correctness confirmed by hand** on tiny cases afterward: `M=1,K=8,N=1` all-ones input/weight
+  gives exactly `8`; `M=K=N=2` all-ones gives exactly `2` everywhere; the INT8-via-cast path with
+  weight values of `32` (scale `1/32` → real value `1.0`) and `K=4` ones-input gives exactly `4`.
+
+**Results (1024³, single matmul call, no chaining, averaged over 2000 iterations, no concurrent
+profiling — an initial 8000-iteration trial run *while* `sample` was concurrently profiling the same
+process skewed the INT8 number to looking 2.2× slower; these numbers are from clean, unprofiled
+runs and were reproduced three times):**
+
+| | Avg | TOPS |
+|---|---|---|
+| BNNSGraph, FP16 weight-input | 0.321 ms | 6.68 |
+| BNNSGraph, INT8 weight-input (cast+dequantize) | 0.394 ms | 5.46 |
+
+**Only ~22% slower than FP16** — nowhere near Finding 11's legacy `BNNSFilterCreateLayerFullyConnected`
+path, which was over 2× slower for the equivalent comparison. Sampling a sustained run and resolving
+the hottest address (`libBNNS.dylib + 0xa74b60`, 3167 of ~4400 total samples) against the
+function-start table from Finding 6 confirms it lands inside **the exact same function**
+(`libBNNS.dylib + 0xa73ca4`/static address `0x18f6e0ca4`) already identified there as the real SME2
+kernel (`smstart za`, `ldr zt0`, `luti4`, `fmopa`). **The INT8-weight-input case reaches the same
+modern SME2 kernel as the plain FP16 case** — the ~22% gap is the cost of the `cast`+`dequantize`
+preprocessing passes over the 1M-element weight tensor, not a different, slower kernel the way
+Finding 11's legacy AMX path was.
+
+**Confirmed live with `lldb`, not just inferred from `sample`.** The `sample`-based address match
+above is static-analysis-adjacent — it shows the hottest *sampled* instruction pointer lands in
+that function, which is strong but not the same as a direct, synchronous observation. Closed the
+gap the same way Finding 6 did: temporarily built a copy of `bnns_graph_matmul_probe.m` with the
+FP16 call commented out (so only the INT8-weight-input path runs at all), set an `lldb` breakpoint
+directly on `--shlib libBNNS.dylib --address 0x18f6e0ca4` with `breakpoint command add 1` scripted
+to auto-`bt 4`/`continue` (avoiding the interactive-hang mistake from Finding 6's first attempt),
+and launched the real benchmark under it:
+
+```
+* frame #0: libBNNS.dylib`___lldb_unnamed_symbol_18f6e0ca4            <- breakpoint-hit function (see correction below)
+  frame #1: libBNNS.dylib`___lldb_unnamed_symbol_18f6e030c + 2412     <- dispatcher
+  frame #2: libBNNS.dylib`___lldb_unnamed_symbol_18ee1c2e8 + 348
+  frame #3: libdispatch.dylib`_dispatch_client_callout3_a + 16
+```
+
+Hit repeatedly, every time, with the FP16 path entirely absent from the binary's execution for that
+run — this is the same function, same dispatcher, same call shape as Finding 6's live FP16 trace,
+now proven to also be live-executed by the INT8-weight-input path specifically, not merely
+statistically likely from sampling. Reverted the temporary edit afterward (confirmed via `git diff`
+that the source file matches its committed state).
+
+> **Correction (see `docs/AMX_GEMM_Microkernel_Disassembly.md`):** the live backtrace above is a
+> real, reproducible hit on the breakpoint-hit function — that part stands. But "the SME2 kernel"
+> label on `frame #0` is wrong, for the same reason as Finding 6's correction: that function
+> (properly bounded by its own `pacibsp`/`ret`) contains no SME2 instructions at all. Stepping
+> through its indirect calls live resolves to a genuinely AMX-based microkernel instead (same
+> `0x00201000`-NOP-space encoding as Finding 11). The underlying claim this section exists to
+> support — that `BNNSGraphCompileFromFile` reaches the *same* fast kernel for both FP16 and
+> INT8-weight-input, confirmed live — is unaffected by this correction; only the "which hardware
+> engine" label was wrong.
+
+**Net result: `BNNSGraphCompileFromFile` is a materially better way to reach BNNS with a genuinely
+non-foldable low-precision weight than either of Finding 11's legacy `bnns.h` entry points.**
+`BNNSMatMul` rejected INT8 outright; `BNNSFilterCreateLayerFullyConnected` accepted it but paid for
+it with a 2×+ regression into a different (slower-dispatching) AMX code path. The modern graph API
+accepts a genuinely runtime-variable INT8 (via the INT32-boundary/cast workaround) and dispatches
+the *same* fast kernel the FP16 case uses, paying only the dequantize preprocessing cost — the
+smallest, most honest "quantization overhead" number found anywhere in this investigation. This
+also means Finding 10's constant-folding result and Finding 11's legacy-kernel result were both,
+in their own way, artifacts of *which API* was used to reach BNNS, not fundamental limits on what
+the hardware or BNNS's modern kernel set can do with INT8.
+
+## Finding 13 — Finding 12 ported to all three iPhones: the modern BNNSGraph path's small INT8 overhead reproduces everywhere, and shrinks on newer chips
+
+Ported `MILBuildMatmulWeightInputSpec` into `ANECapacityApp`'s independent, pure-Objective-C
+`MILSpecBuilder.m` (same hand-rolled-protobuf approach as every other on-device port in this repo),
+plus a new `BNNSGraphMatmulProbe.m`/`.h` that reimplements `bnns_graph_matmul_probe.m`'s
+`BNNSGraphCompileFromFile`/`BNNSGraphContext*` logic natively in Objective-C (triggered by
+`--native-bnns-graph-matmul`). `bnns_graph.h` is available on iOS 18+ same as macOS 15+, so this
+needed no API substitutions — only the same CoreML top-level-INT8-type workaround (INT32 model
+input, `cast` to INT8) carried over unchanged from Finding 12.
+
+Ran on all three iPhones, same 1024³ single-matmul workload, 2000 iterations each:
+
+| | FP16 weight-input | INT8 weight-input | Overhead |
+|---|---|---|---|
+| M4 Pro (Mac) | 0.321 ms / 6.68 TOPS | 0.394 ms / 5.46 TOPS | +23% |
+| A18 Pro | 0.582 ms / 3.69 TOPS | 0.656 ms / 3.27 TOPS | +13% |
+| A19 Pro | 0.652 ms / 3.29 TOPS | 0.703 ms / 3.05 TOPS | +8% |
+| A20 Pro | 0.531 ms / 4.04 TOPS | 0.586 ms / 3.66 TOPS | +10% |
+
+**Output bits are identical across all four chips** (`y[0] = 0xaf00`, `y[mid] = 0xa000` for FP16;
+`0x3250`/`0xba44` for INT8, on every chip) — the same deterministic xorshift fill producing
+bit-for-bit identical results everywhere is a correctness cross-check in its own right, independent
+of the small hand-verified cases from Finding 12.
+
+**The small INT8 overhead from Finding 12 reproduces on every chip, and is smaller on every
+iPhone than on the Mac** — in fact A19 Pro's gap (+8%, confirmed by repeating the run twice) is
+barely above run-to-run noise. None of the iPhones show anything resembling Finding 11's 2×+
+legacy-kernel regression. This is consistent with (though doesn't by itself prove) the modern
+`BNNSGraph` path dispatching the same real microkernel on every one of these chips that this
+investigation traced on the Mac (see [`docs/AMX_GEMM_Microkernel_Disassembly.md`](AMX_GEMM_Microkernel_Disassembly.md) — it's AMX, not
+SME2, correcting Finding 6/12's original "SME2" label), with the `cast`+`dequantize` preprocessing
+cost shrinking relative to the matmul itself as each generation's AMX/CPU throughput improves — the
+newest chips absorb the quantization bookkeeping almost for free, in sharp contrast to the Mac's
+`MLModel`-based INT8 path (Finding 7/8), where the *same kind* of overhead was large enough to make
+CPU INT8 regress below CPU FP16/FP8, a result that itself never reproduced on any iPhone either
+(Finding 8).
+
+## Finding 14 — Direct SME & SME2 benchmarking resolves hardware capability (bypassing BNNS)
+
+While BNNS dispatches to AMX for the CoreML and graph-level matmul workloads evaluated above,
+hardware-level SME and SME2 microkernels were subsequently verified directly using hand-written
+assembly routines executed in streaming mode (`smstart`/`smstop`).
+
+Key findings documented across [`docs/AMX_GEMM_Microkernel_Disassembly.md`](AMX_GEMM_Microkernel_Disassembly.md),
+[`docs/SME_SME2_Generational_Benchmark_Report.md`](SME_SME2_Generational_Benchmark_Report.md),
+and the comprehensive catalogue [`docs/SME_Kernels_and_Usage_Guide.md`](SME_Kernels_and_Usage_Guide.md):
+- **SME Hardware is Real and Accessible**: Direct assembly microkernels achieve **2.43 TOPS** (FP32/FP16), **4.85 TOPS** (INT8 `SMOPA`), and **9.69 TOPS** (SME2 FP8 `F8F16`) on a single CPU core on the A20 Pro.
+- **`FEAT_SME_F16F16` & `FEAT_SME_B16B16`** were introduced on **iPhone 17 Pro (A19 Pro)**, doubling non-widening half-precision throughput to **4.30 TOPS**.
+- **`FEAT_SME_F8F16` & `FEAT_SME_F8F32`** were introduced on **iPhone 18 Pro (A20 Pro)**, delivering up to **9.69 TOPS** for low-precision matrix multiply.
+- **Kernel Dispatch Mechanics**: While ARMv9.2-A silicon (M4 Pro and A18 Pro) defaults to AMX (`KERNEL_MATMUL_MLA3`, 3.48–6.71 TOPS) because baseline SME2 lacks `FEAT_SME2p1`, `FEAT_CSSC`, and non-widening `FEAT_SME_F16F16`, ARMv9.4-A chips with those extensions (iPhone 17 Pro / 18 Pro) natively dispatch `KERNEL_MATMUL_SME2P1` (3.30 TOPS). See Section 4 of `docs/SME_Kernels_and_Usage_Guide.md` for the exact assembly decision tree in `libBNNS.dylib`.
+
+## Not pursued here
+
+- Disassembling `applyOptimizationPassesWithDevice:` to confirm the nil-`metalDeviceName`
+  hypothesis in Finding 1 (would reuse the `ipsw`/Xcode-cached-dylib techniques from
+  `GPU_MXU_And_Convolution_Dispatch_Investigation.md`).
+- Accelerate (BLAS `cblas_sgemm` / BNNS convolution) as a lower-level alternative CPU baseline,
+  independent of both MPSGraph and CoreML — explicitly deferred per discussion in favor of trying
+  the two existing frameworks first.
+- Identifying whether any specific CoreML/MIL graph pattern (e.g. attention, custom fusions) can force BNNS to select its `KERNEL_MATMUL_SME2` or `KERNEL_MATMUL_SOFTMAX_MATMUL_SME` paths rather than default AMX (tested matmul+relu and scaled_dot_product_attention; both still routed to AMX).
+

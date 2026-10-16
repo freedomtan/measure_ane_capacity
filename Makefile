@@ -28,7 +28,12 @@ PROTOBUF_LIB = $(shell pkg-config --libs protobuf-lite 2>/dev/null || \
 	echo -L/opt/homebrew/lib -L/opt/local/lib -L/usr/local/lib -lprotobuf-lite)
 # protobuf 33's generated code trips absl's own deprecation attributes.
 PROTO_CXXFLAGS = -std=c++17 -O2 -Wno-deprecated-declarations
-TARGETS  = measure_conv_fp16 measure_conv measure_conv_universal measure_matmul_universal measure_conv_qdq measure_conv_swift measure_ane_pmu measure_conv_coreml measure_conv_fp8 measure_matmul_fp8 convert_fp8_to_hwx
+TARGETS  = measure_conv_fp16 measure_conv measure_conv_universal measure_matmul_universal measure_conv_qdq measure_conv_swift measure_ane_pmu measure_conv_coreml measure_matmul_coreml measure_conv_fp8 measure_matmul_fp8 convert_fp8_to_hwx bnns_matmul_probe bnns_fc_probe bnns_graph_matmul_probe bnns_graph_attention_probe
+
+# bnns_matmul_probe/bnns_fc_probe (docs/CPU_Matrix_Convolution_Capability.md
+# Finding 11) call libBNNS.dylib's public bnns.h API directly -- no MIL,
+# CoreML, Metal, or protobuf anywhere in these binaries.
+ACCELERATE_FRAMEWORKS = -framework Foundation -framework Accelerate
 
 all: ${TARGETS}
 
@@ -78,12 +83,47 @@ measure_conv_coreml: measure_conv_coreml.m MILSpecBuilder.o $(PROTO_OBJS)
 		measure_conv_coreml.m MILSpecBuilder.o $(PROTO_OBJS) \
 		-o measure_conv_coreml
 
+measure_matmul_coreml: measure_matmul_coreml.m MILSpecBuilder.o $(PROTO_OBJS)
+	$(CC) $(CFLAGS) $(COREML_FRAMEWORKS) $(PROTOBUF_LIB) -lc++ \
+		measure_matmul_coreml.m MILSpecBuilder.o $(PROTO_OBJS) \
+		-o measure_matmul_coreml
+
+bnns_matmul_probe: bnns_matmul_probe.m
+	$(CC) $(CFLAGS) $(ACCELERATE_FRAMEWORKS) bnns_matmul_probe.m -o bnns_matmul_probe
+
+bnns_fc_probe: bnns_fc_probe.m
+	$(CC) $(CFLAGS) $(ACCELERATE_FRAMEWORKS) bnns_fc_probe.m -o bnns_fc_probe
+
+bnns_graph_matmul_probe: bnns_graph_matmul_probe.m MILSpecBuilder.o $(PROTO_OBJS)
+	$(CC) $(CFLAGS) $(ACCELERATE_FRAMEWORKS) -framework CoreML $(PROTOBUF_LIB) -lc++ \
+		bnns_graph_matmul_probe.m MILSpecBuilder.o $(PROTO_OBJS) \
+		-o bnns_graph_matmul_probe
+
+bnns_graph_attention_probe: bnns_graph_attention_probe.m MILSpecBuilder.o $(PROTO_OBJS)
+	$(CC) $(CFLAGS) $(ACCELERATE_FRAMEWORKS) -framework CoreML $(PROTOBUF_LIB) -lc++ \
+		bnns_graph_attention_probe.m MILSpecBuilder.o $(PROTO_OBJS) \
+		-o bnns_graph_attention_probe
+
+probe_ane_device_info: probe_ane_device_info.m
+	$(CC) $(CFLAGS) -framework Foundation $(ANE_FRAMEWORKS) probe_ane_device_info.m -o probe_ane_device_info
+
+test_ane_fp8_app: test_ane_fp8_app.m
+	$(CC) $(CFLAGS) $(FRAMEWORKS) test_ane_fp8_app.m -o test_ane_fp8_app
+
+measure_m6_sme_suite: measure_m6_sme_suite.cpp ANECapacityApp/ANECapacityApp/SME_check_support.c ANECapacityApp/ANECapacityApp/SME_kernels.s ANECapacityApp/ANECapacityApp/SME_fp8_sketch.s
+	@mkdir -p build
+	clang -c -march=armv9.4-a+nomops+sme+sme2+sme-f8f16+sme-f8f32 ANECapacityApp/ANECapacityApp/SME_check_support.c -o build/SME_check_support.o
+	clang -c -march=armv9.4-a+nomops+sme+sme2+sme-f16f16+sme-b16b16+sme-f64f64+sme-i16i64+sme-f8f16+sme-f8f32 ANECapacityApp/ANECapacityApp/SME_kernels.s -o build/SME_kernels.o
+	clang -c -march=armv9.4-a+nomops+sme+sme2+sme-f8f16+sme-f8f32 ANECapacityApp/ANECapacityApp/SME_fp8_sketch.s -o build/SME_fp8_sketch.o
+	clang++ -O3 -march=armv9.4-a+nomops+sme+sme2+sme-f8f16+sme-f8f32 measure_m6_sme_suite.cpp build/SME_check_support.o build/SME_kernels.o build/SME_fp8_sketch.o -o measure_m6_sme_suite
+
 .PHONY: all clean app
 
 clean:
-	rm -f ${TARGETS} measure_conv_ios MILSpecBuilder.o
+	rm -f ${TARGETS} measure_matmul_coreml measure_conv_ios MILSpecBuilder.o probe_ane_device_info test_ane_fp8_app measure_m6_sme_suite
 	rm -rf packages/ models/ build/
 
 app:
 	xcodebuild -project ANECapacityApp/ANECapacityApp.xcodeproj -scheme ANECapacityApp -sdk iphoneos -destination 'generic/platform=iOS' CODE_SIGNING_ALLOWED=NO CODE_SIGN_IDENTITY="" CODE_SIGNING_REQUIRED=NO build
+
 

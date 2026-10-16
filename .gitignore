@@ -11,6 +11,16 @@ measure_conv_coreml
 measure_conv_fp8
 measure_matmul_fp8
 convert_fp8_to_hwx
+bnns_fc_probe
+bnns_graph_attention_probe
+bnns_graph_matmul_probe
+bnns_matmul_probe
+measure_matmul_coreml
+measure_m6_sme_suite
+measure_sme_peak
+probe_ane_device_info
+probe_ane_fp8
+test_ane_fp8_app
 
 # Build artifacts and packages
 *.o
