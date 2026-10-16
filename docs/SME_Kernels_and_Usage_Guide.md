@@ -376,3 +376,12 @@ Because M4 lacks `FEAT_SME_F16F16`, the factory returns `x0 = NULL`. **Gate 2** 
    Weights quantized via CoreML weight compression (`constexpr_lut_to_dense` or `constexpr_blockwise_shift_scale`) will automatically dequantize to FP16 and stream through `KERNEL_MATMUL_SME2P1`.
 3. **For Research / Peak Compute**:
    To exploit native FP8 matrix multipliers on A20 Pro hardware without FP16 memory expansion, direct assembly with `FEAT_SME_F8F16` (`fmopa za.h, ..., z.b, z.b`) yields **9.69 TOPS**.
+
+---
+
+## 6. Acknowledgements & References
+
+The standalone ARM Scalable Matrix Extension (SME / SME2) assembly kernels, feature detection routines, and microbenchmarking methodologies documented and utilized in this research are derived from and build upon the open-source SME microbenchmark suite:
+* **Repository**: [https://github.com/scalable-analyses/sme](https://github.com/scalable-analyses/sme)
+* **Citation**: Scalable Analyses SME Microbenchmarking Suite (`scalable-analyses/sme`), exploring ARM Scalable Matrix Extension hardware execution.
+

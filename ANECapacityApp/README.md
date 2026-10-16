@@ -200,5 +200,13 @@ ANECapacityApp/
     ├── ANECapacityApp-Bridging-Header.h # Bridging header for private ANE and MIL telemetry
     ├── BenchmarkModels.swift      # Data models, BenchmarkBackend enum, dimensions, presets
     ├── Info.plist                 # iOS app bundle configuration
-    └── Assets.xcassets/           # App icon & accent colors
+    ├── Assets.xcassets/           # App icon & accent colors
+    └── SME_*                      # ARM SME/SME2 microbenchmarks & assembly kernels (derived from scalable-analyses/sme)
 ```
+
+---
+
+## Acknowledgements & References
+
+* **SME Microkernels & Benchmarking:** Standalone ARM Scalable Matrix Extension (SME / SME2) assembly kernels, verification routines, and harness structures (`SME_*`) are derived from and build upon the open-source suite by [scalable-analyses/sme](https://github.com/scalable-analyses/sme).
+
