@@ -104,12 +104,26 @@ bnns_graph_attention_probe: bnns_graph_attention_probe.m MILSpecBuilder.o $(PROT
 		bnns_graph_attention_probe.m MILSpecBuilder.o $(PROTO_OBJS) \
 		-o bnns_graph_attention_probe
 
+probe_ane_device_info: probe_ane_device_info.m
+	$(CC) $(CFLAGS) -framework Foundation $(ANE_FRAMEWORKS) probe_ane_device_info.m -o probe_ane_device_info
+
+test_ane_fp8_app: test_ane_fp8_app.m
+	$(CC) $(CFLAGS) $(FRAMEWORKS) test_ane_fp8_app.m -o test_ane_fp8_app
+
+measure_m6_sme_suite: measure_m6_sme_suite.cpp ANECapacityApp/ANECapacityApp/SME_check_support.c ANECapacityApp/ANECapacityApp/SME_kernels.s ANECapacityApp/ANECapacityApp/SME_fp8_sketch.s
+	@mkdir -p build
+	clang -c -march=armv9.4-a+nomops+sme+sme2+sme-f8f16+sme-f8f32 ANECapacityApp/ANECapacityApp/SME_check_support.c -o build/SME_check_support.o
+	clang -c -march=armv9.4-a+nomops+sme+sme2+sme-f16f16+sme-b16b16+sme-f64f64+sme-i16i64+sme-f8f16+sme-f8f32 ANECapacityApp/ANECapacityApp/SME_kernels.s -o build/SME_kernels.o
+	clang -c -march=armv9.4-a+nomops+sme+sme2+sme-f8f16+sme-f8f32 ANECapacityApp/ANECapacityApp/SME_fp8_sketch.s -o build/SME_fp8_sketch.o
+	clang++ -O3 -march=armv9.4-a+nomops+sme+sme2+sme-f8f16+sme-f8f32 measure_m6_sme_suite.cpp build/SME_check_support.o build/SME_kernels.o build/SME_fp8_sketch.o -o measure_m6_sme_suite
+
 .PHONY: all clean app
 
 clean:
-	rm -f ${TARGETS} measure_matmul_coreml measure_conv_ios MILSpecBuilder.o
+	rm -f ${TARGETS} measure_matmul_coreml measure_conv_ios MILSpecBuilder.o probe_ane_device_info test_ane_fp8_app measure_m6_sme_suite
 	rm -rf packages/ models/ build/
 
 app:
 	xcodebuild -project ANECapacityApp/ANECapacityApp.xcodeproj -scheme ANECapacityApp -sdk iphoneos -destination 'generic/platform=iOS' CODE_SIGNING_ALLOWED=NO CODE_SIGN_IDENTITY="" CODE_SIGNING_REQUIRED=NO build
+
 
