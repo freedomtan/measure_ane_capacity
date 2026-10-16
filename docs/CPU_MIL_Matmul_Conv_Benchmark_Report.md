@@ -77,14 +77,33 @@ Live profiling via `sample` and interactive instruction-stepping via `lldb` reve
 ### Discovery 1: CoreML CPU is Fully Multi-Threaded Across Cores
 When executing a model under `MLComputeUnitsCPUOnly`, `libBNNS.dylib` partitions matrix multiplication across worker threads via `dispatch_apply_with_attr`. Threads on `com.apple.root.user-interactive-qos` concurrently process tile blocks.
 
-### Discovery 2: The Underlying Compute Engine is Apple AMX, Not SME2
-Disassembly of the actual hot compute kernel (`0x18f0623a4`) hit by live execution proves that BNNS executes **Apple's undocumented AMX coprocessor**, not SME2:
-- `0x00201009..0d` $\to$ AMX `ldx` (load X staging register)
-- `0x00201029` $\to$ AMX `ldy` (load Y staging register)
-- `0x0020108a` $\to$ AMX `ldz` (load Z accumulator tile)
-- `0x00201268..6d` $\to$ AMX op 19 (outer-product multiply-accumulate into Z)
+### Discovery 2: Generational Split — AMX on M4 vs. Native SME2.1 on M6 / A19+ / A20+
+Live profiling and interactive instruction stepping via `lldb` across multiple generations reveals that whether CoreML dispatches to AMX or SME2 depends strictly on hardware ISA capabilities:
 
-Even though `libBNNS.dylib` contains real SME2 instructions (`smstart za`, `zt0`, `luti4`, `fmopa`), the runtime scheduler routes dense matmul directly to the legacy AMX block.
+1. **On Apple M4 / M4 Pro / A18 Pro (ARMv9.2-A, AMX MLA3)**:
+   - While M4 has base `FEAT_SME` and `FEAT_SME2`, it **lacks** `FEAT_SME2p1` and `FEAT_SME_F16F16`.
+   - The SME kernel factory inside `libBNNS.dylib` checks for FP16 non-widening tile accumulation (`FEAT_SME_F16F16`). Because M4 returns false, the factory rejects SME instantiation (`x0 = NULL`) and falls back to **Apple AMX MLA3 (`KERNEL_MATMUL_MLA3`)**:
+     - `0x00201009..0d` $\to$ AMX `ldx` (load X staging register)
+     - `0x00201029` $\to$ AMX `ldy` (load Y staging register)
+     - `0x0020108a` $\to$ AMX `ldz` (load Z accumulator tile)
+     - `0x00201268..6d` $\to$ AMX op 19 (outer-product multiply-accumulate into Z)
+
+2. **On Apple M6 / A19 Pro / A20 Pro (ARMv9.4-A+, SME2.1)**:
+   - These chips implement `FEAT_SME2p1`, `FEAT_CSSC`, and `FEAT_SME_F16F16`.
+   - CoreML compiles the MIL graph to `.mlmodelc`, which `MLE5Engine` passes to `BNNSGraphContextExecute_v2`.
+   - Disassembly of the active compute kernel (`0x1a7f9e52c` $\to$ `0x1a7f9f2a8`) during live CoreML execution on Apple M6 proves that BNNS directly executes **`KERNEL_MATMUL_SME2P1`**:
+     ```assembly
+     0x1a7f9e5e8: smstart sm                                      ; Enter Streaming SVE mode
+     0x1a7f9f2e8: smstart za                                      ; Enable SME ZA array
+     0x1a7f9f2ec: zero    {za}                                    ; Zero accumulators
+     0x1a7f9f4ac: ld1h    { z16.h, z20.h, z24.h, z28.h }, pn8/z, [x3] ; SME2 multi-vector load
+     0x1a7f9f4b4: fmopa   za0.h, p1/m, p2/m, z16.h, z4.h         ; SME non-widening FP16 FMOPA
+     0x1a7f9f4b8: fmopa   za0.h, p1/m, p2/m, z20.h, z5.h         ; FEAT_SME_F16F16
+     0x1a7f9f534: mov     { z16.d - z19.d }, za.d[w11, 2, vgx4]   ; SME2 multi-vector extraction
+     0x1a7f9f538: fmla    za.h[w11, 2, vgx4], { z16.h - z19.h }, z4.h ; SME2 multi-vector FMLA
+     ```
+   - CoreML does **not** use AMX on M6; it natively executes SME2 / SME2.1 at **~4.0 TOPS** FP16.
+
 
 ---
 
@@ -134,9 +153,11 @@ On the iPhone 18 Pro (A20 Pro), there is **exactly one Performance cluster** (2 
 1. **Topology Governs CPU Throughput**:
    - The M4 Pro achieves **~6.6 TOPS** because it contains **2 Performance clusters** running 2 concurrent AMX blocks.
    - The iPhone A-series chips achieve **~3.1–4.0 TOPS** because they contain **1 Performance cluster** running 1 AMX block.
-2. **CoreML CPU is Conservative**:
-   - For dense matrix multiplication, CoreML continues to dispatch Apple's proprietary AMX coprocessor.
-   - The hardware's newer, public ARM SME/SME2 extensions (`FEAT_SME_F16F16`, `FEAT_SME_F8F16`) offer **$2\times$ to $2.4\times$ higher throughput (4.85–9.69 TOPS)** on the identical silicon, but require direct assembly or lower-level interfaces until Apple's compiler updates its graph routing.
+2. **Generational Engine Selection in CoreML / BNNS**:
+   - **On M4 / A18 Pro**: Lacking `FEAT_SME_F16F16` and `FEAT_SME2p1`, CoreML / BNNS gracefully falls back to Apple's proprietary AMX coprocessor (`KERNEL_MATMUL_MLA3`).
+   - **On M6 / A19 Pro / A20 Pro**: CoreML / BNNS actively targets **`KERNEL_MATMUL_SME2P1`**, executing native SME2 non-widening outer products (`fmopa za.h`) and multi-vector SME2 instructions at ~4.0 TOPS FP16.
+   - **Unlocking Peak FP8 Compute**: While CoreML FP16 GEMM is fully accelerated by SME2.1, CoreML's software weight-expansion pass (`constexpr_lut_to_dense`) unpacks FP8 to FP16 before the compute kernel. Directly executing native FP8 outer products (`FEAT_SME_F8F16`) via assembly achieves **9.13–9.69 TOPS** on the CPU.
+
 
 ---
 
