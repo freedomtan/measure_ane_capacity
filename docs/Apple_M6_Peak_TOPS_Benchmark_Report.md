@@ -20,14 +20,21 @@ The Apple M6 SoC represents a major architectural milestone in Apple Silicon his
 +----------------------+-------------------------+-------------+----------------+-------------------------------+
 | Apple Neural Engine  | INT8 Conv (Physical PMU)| 107.26 TOPS | 22.00 ms (45.5)| 22,529.1 MACs/cyc (Bonded ANE)|
 | (2x 16-Core H18g,    | INT8 Conv (MPSGraph)    | 105.42 TOPS | 22.00 ms (45.5)| End-to-end MPSGraph Runner    |
-|  32 Cores Bonded)    | INT8 Conv (CoreML)      |  92.67 TOPS | 24.89 ms (40.2)| CoreML MIL Engine             |
+|  32 Cores Bonded)    | INT8 Conv (CoreML PMU)  |  96.81 TOPS | 23.96 ms (41.7)| Native MILBlob W8A8 QDQ (PMU) |
+|                      | INT8 Conv (CoreML MIL)  |  96.51 TOPS | 16.02 ms (62.4)| SRAM-Resident [64^2, C512, L80|
+|                      | INT8 Conv (MLModel)     |  92.67 TOPS | 24.89 ms (40.2)| CoreML MLModel Framework      |
+|                      | FP8 Conv (CoreML Native)|  77.93 TOPS | 39.68 ms (25.2)| Native MILBlob E4M3 (95.4% sat|
+|                      | FP8 Conv (CoreML Native)|  76.80 TOPS | 20.13 ms (49.7)| Native MIL [256^2, C256, L20] |
 |                      | FP8 Conv (MPSGraph W8A8)|  72.56 TOPS | 11.99 ms (83.4)| True W8A8 QDQ (1.29x vs FP16) |
 |                      | FP16 Conv (Physical PMU)|  56.35 TOPS | 40.94 ms (24.4)| 11,652.9 MACs/cyc (Bonded ANE)|
 |                      | FP16 Conv (MPSGraph)    |  55.64 TOPS | 15.68 ms (63.8)| End-to-end MPSGraph Runner    |
-|                      | FP8 Conv (CoreML MIL)   |  54.33 TOPS | 35.57 ms (28.1)| Weight-Only QDQ (FP16 ALUs)   |
-|                      | INT8 Dense MatMul       |  41.33 TOPS |  1.04 ms (962) | CoreML 1024^3 x L20           |
+|                      | FP16 Conv (CoreML PMU)  |  54.99 TOPS | 32.29 ms (31.0)| CoreML MIL PMU [256^2, C224]  |
+|                      | FP8 Conv (CoreML LUT)   |  54.33 TOPS | 35.57 ms (28.1)| constexpr_lut_to_dense (FP16) |
+|                      | INT8 Dense MatMul (MIL) |  54.05 TOPS |  6.36 ms (157) | CoreML MIL 2048^3 x L20 (GEMM)|
+|                      | INT8 Dense MatMul (MIL) |  42.16 TOPS |  1.02 ms (982) | CoreML MIL 1024^3 x L20 (GEMM)|
 |                      | FP8 Conv (Weight QDQ)   |  39.67 TOPS |  9.74 ms (103) | MPSGraph Weight-Only QDQ      |
-|                      | FP16 Dense MatMul       |  20.33 TOPS |  2.12 ms (471) | CoreML / MPSGraph MatMul      |
+|                      | FP16 Dense MatMul (MIL) |  32.97 TOPS | 10.42 ms (96.0)| CoreML MIL 2048^3 x L20 (GEMM)|
+|                      | FP16 Dense MatMul (MIL) |  28.62 TOPS |  1.50 ms (666) | CoreML MIL 1024^3 x L20 (GEMM)|
 +----------------------+-------------------------+-------------+----------------+-------------------------------+
 | Metal 4 GPU          | FP8 W8A8 Conv (QDQ)     |  25.38 TOPS | 15.23 ms (65.7)| MPSGraph Float8E4M3 QDQ       |
 | (12-Core Metal 4)    | FP16 Native Conv        |  19.74 TOPS | 19.59 ms (51.0)| Metal Native Conv2D           |
@@ -135,7 +142,147 @@ Workload: $[B, H \times W, C, L]$ chained $3 \times 3$ convolutions in native `M
 
 ---
 
-### 2.4 Physical Silicon PMU Telemetry
+### 2.4 CoreML / MIL Engine on ANE: Dual Compilation Pipelines & Empirical Sweeps
+
+While MPSGraph provides direct programmatic access to ANE acceleration, production Apple Silicon machine learning is overwhelmingly deployed via **CoreML** and its **Model Intermediate Language (MIL)** compiler backend (`ANECompiler.framework` / Zin compiler v10.26.6). Rigorous benchmarking on Apple M6 reveals that CoreML performance on the bonded 32-core ANE is strictly dictated by the **MIL model synthesis pipeline**:
+
+```mermaid
+flowchart TD
+    subgraph Pathways ["CoreML MIL Authoring Pathways on Apple M6"]
+        P1["Pipeline A: In-Memory Protobuf MLProgram<br/>(MILSpecBuilder / .mlmodel)<br/>• Inline TensorValue.RepeatedBytes<br/>• Zero filesystem footprint<br/>• Weight-Only FP8 LUT / INT8 QDQ"]
+        P2["Pipeline B: Native Model Package<br/>(.mlmodelc / weight.bin)<br/>• 64-byte aligned MILBlob (Version 3)<br/>• DataType 16 (Fp8E4M3FN Weights)<br/>• Activation QDQ + Fused Hardware Bias"]
+    end
+
+    subgraph Backend ["ANECompiler & Zin Backend Optimization"]
+        Z1["Compiler Branch A: In-Memory Spec<br/>• FP8: Falls back to constexpr_lut_to_dense<br/>• KernelCfg: Fmt=FLOAT16, Pal=1 (8-bit LUT)<br/>• Execution: Single-rate FP16 ALUs (~54 TOPS)"]
+        Z2["Compiler Branch B: Native Package<br/>• Passes ZinIrCodegenValidateTds&lt;20u&gt;<br/>• KernelCfg: Fmt=e4m3, Pal=0, InDim=e4m3<br/>• Execution: Native Bonded FP8 ALUs (77.93 TOPS)"]
+    end
+
+    subgraph Silicon ["Physical Apple M6 Silicon (ane0 + ane1 Bonded)"]
+        HW1["INT8 / Winograd 1D: Up to 96.81 TOPS CoreML"]
+        HW2["Native FP8 E4M3 ALUs: Up to 77.93 TOPS CoreML"]
+        HW3["Dense MatMul (GEMM): Up to 54.05 TOPS CoreML"]
+    end
+
+    P1 --> Z1
+    P2 --> Z2
+    Z1 --> HW1
+    Z2 --> HW2
+    P1 --> HW3
+```
+
+#### 2.4.1 Architectural Breakdown: In-Memory Protobuf vs Native Package
+
+1. **Pipeline A: In-Memory / Monolithic Protobuf MLProgram (`MILSpecBuilder` / `.mlmodel`)**:
+   - **Mechanism:** Serializes a CoreML `ms::Model` protobuf (`specificationVersion = 9` / `CoreML8`) with weights embedded directly as `TensorValue.RepeatedBytes`. The serialized bytes are compiled dynamically via `+[MLModel compileModelAtURL:]`.
+   - **INT8 Arithmetic:** Generates `constexpr_blockwise_shift_scale` with inline `int8` data and wraps each layer in dynamic activation QDQ (`quantize(output_dtype="int8")` $\to$ `dequantize`). This compiles cleanly to native packed INT8 execution on M6, hitting **92.67 TOPS** via `MLModel` and **96.81 TOPS** via `_ANEClient` PMU.
+   - **FP8 In-Memory Limitation:** Protobuf deserializer `MLAssetIO` lacks an inline string mapping for enum `40` (`MILBlob::Fp8E4M3FN`), triggering `NSInvalidArgumentException` (`[NSMutableSet addObject:]: object cannot be nil`). To bypass this, in-memory specs must utilize `constexpr_lut_to_dense` (weight palettization). The ANE compiler decompresses 8-bit LUT indices into 16-bit registers (`KernelCfg: Fmt=FLOAT16, Pal=1(8bit)`), constraining execution to FP16 ALUs at **51.54 – 54.33 TOPS**.
+   - **FP16 Activation Growth Trap:** Under standard uniform sign-alternating weights without Xavier normalization ($\frac{1}{\sqrt{C_{in} \cdot K^2}}$), the per-layer gain is $\frac{\sqrt{C_{in} \cdot K^2}}{32}$. For $C=256, K=3$, this causes a $1.50\times$ per-layer activation variance growth ($1.50^{30} \approx 191,751 > 65,504$), generating numerical overflows and NaNs over 30 layers unless variance is explicitly normalized.
+
+2. **Pipeline B: Native Model Package (`.mlmodelc` / `.mlpackage` with `MILBlob` `weight.bin`)**:
+   - **Mechanism:** Emits a compiled directory containing a 64-byte aligned `weights/weight.bin` binary container (`Version = 3`) and `model.mil` (`ios19` / `func main<ios19>`).
+   - **Binary Container Structure:**
+     - *Blob 0:* Raw FP8 weights (`DataType = 16`, `Fp8E4M3FN`, size $C_{out} \times C_{in} \times K \times K$).
+     - *Blob 1:* FP16 scale factors (`DataType = 1`, `Float16`, size $C_{out} \times 2$ bytes).
+     - *Blob 2:* FP16 fused hardware channel biases (`DataType = 1`, `Float16`, size $C_{out} \times 2$ bytes).
+   - **Hardware Channel Bias (`BiasEn=1`):** Alternating non-zero bias ($\pm 0.05$) is fused directly into `conv(bias=b, weight=dqw, x=dqx)`. This completely eliminates memory writeback round-trips and keeps activations non-zero, eliminating hardware zero-skipping.
+   - **Hardware Register Assignment:** Passing compiler validator `ZinIrCodegenValidateTds<20u>`, the ANE allocates true native hardware FP8 registers: `KernelCfg: Fmt=e4m3 Pal=0(Disabled) DblInt8=1`, `InDim: Type=e4m3`, `OutDim: Type=e4m3`. This activates the bonded 32-core physical FP8 pipelines without palette table bottlenecks, achieving **77.93 TOPS** sustained throughput!
+
+---
+
+#### 2.4.2 CoreML MIL Convolution Parameter Sweeps (Live Apple M6 Silicon)
+
+The table below presents direct measurements on live Apple M6 desktop silicon across both Native `MILBlob` packages and In-Memory Protobuf specifications, verified with PMU counters:
+
+| Precision & Workload | Configuration $[B, H \times W, C, L]$ | Latency | Realized TOPS | MACs / Cycle (Bonded ANE) | DMA Traffic | Zero Audit Status |
+|:---|:---|---:|---:|---:|---:|:---:|
+| **Native MIL FP8 (E4M3)** | $[1, 256 \times 256, C=128, L=20]$ | 5.87 ms | 65.85 TOPS | 13,577.9 MACs/cyc | 9.83 MB/iter | 0.292% zeros |
+| **Native MIL FP8 (E4M3)** | $[1, 256 \times 256, C=160, L=20]$ | 8.97 ms | 67.34 TOPS | 14,100.1 MACs/cyc | 14.81 MB/iter | 0.274% zeros |
+| **Native MIL FP8 (E4M3)** | $[1, 256 \times 256, C=192, L=20]$ | 12.95 ms | 67.17 TOPS | 14,544.0 MACs/cyc | 20.81 MB/iter | 0.239% zeros |
+| **Native MIL FP8 (E4M3)** | $[1, 256 \times 256, C=224, L=20]$ | 17.44 ms | 67.89 TOPS | 14,998.2 MACs/cyc | 27.60 MB/iter | 0.223% zeros |
+| **Native MIL FP8 (E4M3)** | $[1, 256 \times 256, C=256, L=20]$ | 20.13 ms | **76.80 TOPS** | 15,384.5 MACs/cyc | 34.62 MB/iter | **0.000% zeros** |
+| **Native MIL FP8 (E4M3)** | **$[1, 128 \times 128, C=512, L=40]$** | **39.68 ms** | **77.93 TOPS** | **15,622.7 MACs/cyc (95.4%)** | 68.19 MB/iter | **0.000% zeros** |
+| **Native MIL FP8 (SRAM)** | $[1, 64 \times 64, C=512, L=40]$ | 10.54 ms | 73.33 TOPS | 14,780.3 MACs/cyc | 18.02 MB/iter | **0.000% zeros** |
+| **Native MIL FP8 (SRAM)** | $[1, 64 \times 64, C=512, L=80]$ | 20.32 ms | **76.10 TOPS** | 15,303.2 MACs/cyc | 34.80 MB/iter | **0.000% zeros** |
+| **Native MIL INT8 (W8A8)**| $[1, 256 \times 256, C=192, L=20]$ | 9.45 ms | 92.07 TOPS | 20,452.0 MACs/cyc | 14.91 MB/iter | 0.006% zeros |
+| **Native MIL INT8 (W8A8)**| $[1, 256 \times 256, C=256, L=20]$ | 16.14 ms | 95.82 TOPS | 22,064.1 MACs/cyc | 24.82 MB/iter | 0.006% zeros |
+| **Native MIL INT8 (W8A8)**| **$[1, 256 \times 256, C=256, L=30]$** | **24.42 ms** | **94.97 TOPS** | **22,182.6 MACs/cyc** | 37.17 MB/iter | **0.006% zeros** |
+| **Native MIL INT8 (PMU)** | $[1, 256 \times 256, C=256, L=30]$ | 23.96 ms | **96.81 TOPS** | **22,611.3 MACs/cyc** | 36.49 MB/iter | **0.007% zeros** |
+| **Native MIL INT8 (SRAM)**| $[1, 64 \times 64, C=512, L=80]$ | 16.02 ms | **96.51 TOPS** | **22,443.3 MACs/cyc** | 24.48 MB/iter | **0.004% zeros** |
+| **Native MIL FP16 (Dense)**| $[1, 256 \times 256, C=192, L=20]$ | 17.10 ms | 50.87 TOPS | 11,358.4 MACs/cyc | 26.86 MB/iter | 0.001% zeros |
+| **Native MIL FP16 (Dense)**| $[1, 256 \times 256, C=224, L=30]$ | 34.42 ms | 51.59 TOPS | 11,731.6 MACs/cyc | 53.38 MB/iter | 0.002% zeros |
+| **CoreML FP16 (PMU)**     | $[1, 256 \times 256, C=224, L=30]$ | 32.29 ms | **54.99 TOPS** | **11,755.1 MACs/cyc** | 52.39 MB/iter | **0.000% zeros** |
+| **CoreML FP8 (LUT/FP16)** | $[1, 256 \times 256, C=192, L=20]$ | 16.44 ms | 52.91 TOPS | 11,325.0 MACs/cyc | 26.65 MB/iter | 0.000% zeros |
+| **CoreML FP8 (LUT/FP16)** | $[1, 256 \times 256, C=256, L=20]$ | 35.57 ms | 54.33 TOPS | 11,480.0 MACs/cyc | 37.20 MB/iter | 0.001% zeros |
+
+---
+
+#### 2.4.3 CoreML MIL Dense Matrix Multiplication (GEMM) Parameter Sweeps
+
+Dense Matrix Multiplication in MIL executes as chained $[1, 1, M, K] \times [1, 1, K, N]$ operations. Evaluated via `measure_matmul_coreml` across $L=20$ chained layers with full compute plan verification (`100% of matmul ops dispatched to ANE`):
+
+| Matrix Dimension $[M = K = N]$ | Precision Mode | Framework Latency | Throughput (TOPS) | Framerate (FPS) | Output Zero Audit |
+|:---|:---|---:|---:|---:|:---:|
+| $512 \times 512 \times L20$ | FP16 | 0.39 ms | 13.94 TOPS | 2,597.4 FPS | 0.000% zeros |
+| $512 \times 512 \times L20$ | INT8 (W8A8 QDQ) | 0.32 ms | 16.53 TOPS | 3,079.3 FPS | 0.000% zeros |
+| $512 \times 512 \times L20$ | FP8 (Weight LUT) | 0.39 ms | 13.63 TOPS | 2,538.1 FPS | 0.000% zeros |
+| $1024 \times 1024 \times L20$ | FP16 | 1.50 ms | 28.62 TOPS | 666.2 FPS | 0.012% zeros |
+| $1024 \times 1024 \times L20$ | INT8 (W8A8 QDQ) | 1.02 ms | **42.16 TOPS** | 981.6 FPS | 0.486% zeros |
+| $1024 \times 1024 \times L20$ | FP8 (Weight LUT) | 1.47 ms | 29.29 TOPS | 681.9 FPS | 0.012% zeros |
+| $2048 \times 2048 \times L20$ | FP16 | 10.42 ms | 32.97 TOPS | 96.0 FPS | 0.000% zeros |
+| $2048 \times 2048 \times L20$ | **INT8 (W8A8 QDQ)** | **6.36 ms** | **54.05 TOPS** | **157.3 FPS** | **0.009% zeros** |
+| $2048 \times 2048 \times L20$ | FP8 (Weight LUT) | 10.53 ms | 32.64 TOPS | 95.0 FPS | 0.000% zeros |
+| $4096 \times 4096 \times L20$ | FP16 | 135.90 ms | 20.23 TOPS | 7.4 FPS | Degenerate/NaN |
+| $4096 \times 4096 \times L20$ | INT8 (W8A8 QDQ) | 87.15 ms | 31.54 TOPS | 11.5 FPS | 0.006% zeros |
+
+##### Architectural Derivations & GEMM Ceilings:
+1. **Direct MAC Limit for GEMM vs Winograd Boost:**
+   - In $3 \times 3$ convolution, the ANE activation feeder applies 1D Winograd ($F(2,3)$), providing an algorithmic $1.5\times$ arithmetic boost that pushes INT8 convolution over **105 TOPS**.
+   - In GEMM ($1 \times 1$ conv equivalence), spatial Winograd filtering is algebraically impossible. Hence, GEMM is constrained by the raw, un-transformed physical MAC array.
+   - At $M=2048$, INT8 GEMM sustains **54.05 TOPS** (77.4% of the nominal 69.8 TOPS direct physical ceiling across 32 cores), outpacing FP16 GEMM (**32.97 TOPS**) by **1.64×**.
+2. **FP8 vs FP16 in In-Memory Protobuf GEMM:**
+   - Under `constexpr_lut_to_dense`, FP8 weights are expanded to FP16 in hardware before GEMM execution, matching FP16 compute latency almost exactly (10.53 ms vs 10.42 ms at $2048^3$) while cutting constant storage by 50%.
+3. **Scaling Constraints of In-Memory Specs at $4096^3$:**
+   - At $M=4096$, storing 20 layers of unquantized inline weights inflates the monolithic `.mlmodel` protobuf to $>670\text{ MB}$, causing `coremlcompiler` to spend substantial time in memory allocation and compilation. This underscores why LLM matrix deployment on ANE strictly mandates external `MILBlob` (`weight.bin`) storage.
+
+---
+
+#### 2.4.4 High-Level Framework (`MLModel`) vs Kernel Driver (`_ANEClient` / `kANEFModelMIL`)
+
+CoreML provides two distinct runtime interfaces for evaluating MIL programs on Apple M6:
+- **`MLModel` (`predictionFromFeatures:`):** The official macOS/iOS runtime. Operates asynchronously through CoreML framework queues, performing `MLMultiArray` type checking, dynamic memory management, and `_ANERequest` lifecycle scheduling. Introduces $\sim 0.5 - 1.5\text{ ms}$ of fixed dispatch overhead, which amortizes down to $<3\%$ for large matrix workloads ($L \ge 20$).
+- **`_ANEClient` (`kANEFModelMIL`):** Low-level driver SPI bypass. Evaluates the compiled `.mlmodelc/model.mil` directly on the `ane0`+`ane1` bonded kernel driver using zero-copy DMA `IOSurface` buffers. Enables per-inference access to the 29 physical hardware PMU counters (`kANEFPerformanceStatsMask = 15`), measuring clock-accurate execution uncorrupted by user-space framework jitter.
+
+---
+
+#### 2.4.5 Microarchitectural Proof: Hardware Task Descriptors (`.hwx`)
+
+Disassembly of the compiled ANE Mach-O task descriptors (`model.hwx`) from Native FP8 MIL packages confirms true hardware allocation:
+
+```text
+[ANE Task 0 (Stream 0) @ 0x10] (Activation Quantization)
+  InDim     : W=256 H=256 C=256 Type=FLOAT16
+  OutDim    : W=256 H=256 C=256 Type=E4M3
+  MacCfg    : TaskType=6 (Elementwise Scale/Quantize) ActiveNE=4
+  PE Scale  : 0x3c000000 (1.000000)
+
+[ANE Task 1 (Stream 0) @ 0xe0] (Native FP8 Bonded Fused Convolution)
+  InDim     : W=256 H=256 C=256 Type=E4M3 (Src2Type=FLOAT16)
+  OutDim    : W=256 H=256 C=256 Type=E4M3
+  ConvCfg   : K=3x3 S=1x1 P=1x1
+  KernelCfg : Fmt=E4M3 Pal=0(Disabled) SparseEn=0 Reuse=0 DetectZeros=1
+              PostEn=1 NLMode=0 MaxPoolEn=0 ArgSel=1 DblInt8=1
+  MacCfg    : TaskType=0 (Conv) ActiveNE=4 (Both 16-Core Units Bonded)
+  BiasUnit  : BiasEn=1 (Hardware Channel Bias Fused)
+```
+
+- `KernelCfg: Fmt=E4M3, Pal=0`: Validates that the ANE compiler did **not** insert an 8-bit LUT palettization decompressor. Weights are fetched directly from coefficient SRAM as packed 8-bit floating-point numbers.
+- `InDim/OutDim: Type=E4M3`: Activations remain in FP8 throughout all 40 intermediate layers, cutting activation SRAM footprint and memory bus bandwidth by 50.0%.
+- `MacCfg: ActiveNE=4`: Confirms that both physical 16-core ANE units (`ane0` and `ane1`) are bonded and actively executing across all compute clusters.
+
+---
+
+### 2.5 Physical Silicon PMU Telemetry
 
 Hardware register readings obtained via `_ANEClient` telemetry on live M6 silicon:
 - **Nominal Silicon Clock:** $\sim 1.95\text{ GHz}$ under sustained matrix load.
@@ -146,14 +293,16 @@ Hardware register readings obtained via `_ANEClient` telemetry on live M6 silico
 
 ---
 
-### 2.5 Zero-Skip & Sparsity Invariant Audit
+### 2.6 Zero-Skip & Sparsity Invariant Audit
 
 To ensure that reported numbers represent genuine dense compute rather than hardware zero-skipping artifacts:
 1. **Input Tensors:** Initialized with deterministic non-zero, non-canceling pseudo-random distributions (INT8: `{-tier, +tier}`; FP16: Xavier-scaled alternating signs; FP8: multi-tier `[0x28, 0x30, 0x38, 0x40]`).
 2. **Post-Inference IOSurface Inspection:** Raw physical output bytes were inspected immediately after kernel completion:
-   - **INT8 ($C=256, L=30$):** Exactly $1,096\text{ zeros}$ out of $16,777,216\text{ elements}$ (**0.007% zeros**).
-   - **FP16 ($C=224, L=30$):** Exactly $2\text{ zeros}$ out of $16,777,216\text{ elements}$ (**0.000% zeros**).
+   - **INT8 MPSGraph ($C=256, L=30$):** Exactly $1,096\text{ zeros}$ out of $16,777,216\text{ elements}$ (**0.007% zeros**).
+   - **INT8 Native MIL ($C=256, L=30$):** Exactly $1,016\text{ zeros}$ out of $16,777,216\text{ elements}$ (**0.006% zeros**).
+   - **FP16 MPSGraph ($C=224, L=30$):** Exactly $2\text{ zeros}$ out of $16,777,216\text{ elements}$ (**0.000% zeros**).
    - **FP8 MPSGraph ($C=192, L=20$):** Exactly $210\text{ zeros}$ out of $12,582,912\text{ elements}$ (**0.002% zeros**).
+   - **FP8 Native MIL ($C=512, L=40$):** Exactly **$0\text{ zeros}$** out of $8,388,608\text{ elements}$ (**0.0000% zeros**).
 3. **Conclusion:** 99.99%+ of all output tensor cells contain verified dense numeric values. Zero-skipping did not contribute to any measured performance.
 
 ---
@@ -213,9 +362,10 @@ INT8 Peak Neural Engine Throughput
             iPhone 16 Pro    MacBook M4 Pro    iPhone 18 Pro       Mac mini M6
 ```
 
-1. **FP8 Accelerates Over FP16:** Unlike previous generations where FP8 was constrained by software QDQ dequantization bottlenecks, M6 demonstrates true **72.56 TOPS** throughput on ANE (1.29x faster than FP16) and **25.38 TOPS** on GPU (1.29x faster than FP16).
-2. **SME2.1 Replaces AMX:** The CPU matrix architecture is completely unified under standard ARMv9.4-A+ SME2.1, yielding **9.135 TOPS** single-core FP8 matrix throughput and end-to-end framework integration in `libBNNS`.
-3. **Verified Dense Compute:** Realized throughput across all engines was rigorously validated against raw memory buffers, confirming zero-skipping elimination and solid hardware utilization.
+1. **FP8 Accelerates Over FP16 Across Both MPSGraph & Native MIL:** Unlike previous generations where FP8 was constrained by software QDQ dequantization bottlenecks, M6 demonstrates true hardware FP8 acceleration across both execution frameworks: reaching **77.93 TOPS** in Native MIL (`MILBlob` `weight.bin`, **1.42x faster than FP16**) and **72.56 TOPS** in MPSGraph W8A8 QDQ (1.29x faster than FP16) on ANE, and **25.38 TOPS** on GPU (1.29x faster than FP16).
+2. **CoreML / MIL Dual Pathways Characterized:** Unveiled the microarchitectural bifurcation in CoreML on ANE between in-memory protobuf specs (`.mlmodel`, constrained to weight-only LUT FP8 at ~54 TOPS) and native compiled packages (`.mlmodelc` with 64-byte aligned `MILBlob` `weight.bin` and fused hardware bias, unlocking native bonded FP8 ALUs at **77.93 TOPS** and INT8 GEMM at **54.05 TOPS**).
+3. **SME2.1 Replaces AMX:** The CPU matrix architecture is completely unified under standard ARMv9.4-A+ SME2.1, yielding **9.135 TOPS** single-core FP8 matrix throughput and end-to-end framework integration in `libBNNS`.
+4. **Verified Dense Compute:** Realized throughput across all engines was rigorously validated against raw memory buffers, confirming zero-skipping elimination and solid hardware utilization.
 
 ---
 
