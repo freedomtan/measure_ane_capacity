@@ -315,7 +315,7 @@ When `--save-package` is enabled, `measure_ane_pmu` serializes each variant into
 
 For in-depth microarchitectural investigations, register breakdowns, theoretical derivations, and empirical benchmark analyses across H18 and H19, consult:
 
-* [**`Apple_M6_Peak_TOPS_Benchmark_Report.md`**](docs/Apple_M6_Peak_TOPS_Benchmark_Report.md): Definitive peak performance evaluation of Apple M6 (`Mac18,5`, Super Core + Bonded 32-core ANE + Metal 4 GPU), demonstrating **107.26 TOPS** (ANE INT8), **72.56 TOPS** (ANE FP8), **56.35 TOPS** (ANE FP16), and **9.135 TOPS** (CPU SME2.1 FP8).
+* [**`Apple_M6_Peak_TOPS_Benchmark_Report.md`**](docs/Apple_M6_Peak_TOPS_Benchmark_Report.md): Definitive peak performance evaluation of Apple M6 (`Mac18,5`, Super Core + Bonded 32-core ANE + Metal 4 GPU), demonstrating **107.26 TOPS** (ANE INT8), **77.93 TOPS** (ANE Native FP8 MIL), **36.02 TOPS** (Metal 4 GPU FP8 QDQ), **20.46 TOPS** (Metal GPU FP16), and **9.135 TOPS** (CPU SME2.1 FP8).
 * [**`SME_SME2_Generational_Benchmark_Report.md`**](docs/SME_SME2_Generational_Benchmark_Report.md): Cross-generational empirical evaluation of ARM Scalable Matrix Extension (SME, SME2, SME2.1) across A18 Pro, A19 Pro, A20 Pro, and M6.
 * [**`SME_Kernels_and_Usage_Guide.md`**](docs/SME_Kernels_and_Usage_Guide.md): Architectural analysis and dispatch guide for Apple Silicon SME / SME2 kernels in `libBNNS.dylib` and CoreAI.
 * [**`ANE_FP8_vs_INT8_FP16_Performance_Report.md`**](docs/ANE_FP8_vs_INT8_FP16_Performance_Report.md): Complete cross-precision performance analysis comparing FP8, FP16, and INT8 on iPhone 17 Pro (H18) and iPhone 18 Pro (H19). Explains why INT8 reaches **90.25 TOPS** via 1D Winograd, why FP16 hits **43.80 TFLOPS**, and why FP8 peaks at **55.41 TOPS** under the 1.87 GHz power clamp.
@@ -360,10 +360,18 @@ For in-depth microarchitectural investigations, register breakdowns, theoretical
 | *iPhone 17 Pro (legacy)* | H18 | *ANE* | *FP16* | *8.70 ms* | *44.41\** | *Zero-filled (Zero-skipped)* |
 | *iPhone 17 Pro (legacy)* | H18 | *ANE* | *INT8* | *7.85 ms* | *49.27\** | *Zero-filled (Zero-skipped)* |
 | *iPhone 17 Pro (legacy)* | H18 | *ANE* | *DQ->FP16->Q* | *6.12 ms* | *63.20\** | *Zero-filled (Zero-skipped)* |
+| **iPhone 18 Pro** | H19 | **GPU** | FP16 | 36.71 ms | **10.53** | Dense (Non-Zero) |
+| **iPhone 18 Pro** | H19 | **GPU** | FP8 (W8A8 QDQ) | 28.71 ms | **13.46** | Dense (Non-Zero) |
 | **iPhone 18 Pro** | H19 | **ANE** | FP16 | 9.98 ms | **38.74** | **Dense (Non-Zero)** |
 | **iPhone 18 Pro** | H19 | **ANE** | FP8 (E4M3) | 7.66 ms | **50.45** | **Dense (Non-Zero)** |
 | **iPhone 18 Pro** | H19 | **ANE** | INT8 (L=20) | 4.98 ms | **77.66** | **Dense (Non-Zero)** |
 | **iPhone 18 Pro** | H19 | **ANE** | INT8 (L=80) | 9.53 ms | **90.25** | **Dense (Non-Zero, Winograd 1D)** 🏆 |
+| **Mac mini M6** | H19 | **GPU** | FP16 Native | 18.96 ms | **20.39** | Dense (Non-Zero) |
+| **Mac mini M6** | H19 | **GPU** | FP8 (W8A8 QDQ, C=128) | 14.62 ms | **26.43** | Dense (Non-Zero) |
+| **Mac mini M6** | H19 | **GPU** | FP8 (W8A8 QDQ, C=512) | 171.71 ms | **36.02** | **Dense (Non-Zero)** 🏆 |
+| **Mac mini M6** | H19 | **ANE** | FP16 (Bonded) | 6.85 ms | **56.35** | **Dense (Non-Zero)** |
+| **Mac mini M6** | H19 | **ANE** | FP8 (MILBlob Bonded) | 4.96 ms | **77.93** | **Dense (Non-Zero)** 🏆 |
+| **Mac mini M6** | H19 | **ANE** | INT8 (Bonded) | 3.60 ms | **107.26** | **Dense (Non-Zero)** 🏆 |
 
 *\*Note: Historical rows marked with asterisks used all-zero tensor buffers (`0x00`), which triggered hardware zero-skipping and lossless zero-compression on H17/H18 silicon, artificially inflating measured TOPS. The bold non-zero rows reflect true dense silicon throughput.*
 *Note: GPU INT8 convolution is not supported by Metal/MPSGraph on this device/configuration.*
