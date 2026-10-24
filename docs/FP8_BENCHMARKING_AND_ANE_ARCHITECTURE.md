@@ -120,7 +120,24 @@ To simultaneously satisfy **20-layer math stability** and **H18 hardware underfl
 | **H15** | A16, M3 | ❌ None | MAC array is FP16/INT8 only. MPSGraph falls back to Metal GPU. |
 | **H16 / H16g / H16s** | A17 Pro, M4 / Pro / Max | ❌ None | `ANECCompile` returns MLIR conversion error; falls back to Metal GPU. |
 | **H18** | A19 Pro (iPhone 17 Pro) | ✅ Native (Decoupled) | Native FP8 QDQ runs cleanly using decoupled scale ($2^{-1}$ physical / $2^{-5}$ logical), reaching 29.01 TOPS. Naive unit scale underflows to zero. |
-| **H19** | A20 Pro (iPhone 18 Pro) | ✅ Native | Dual 16-Core ANE with native FP8 QDQ execution, reaching 55.41 TOPS (conv) and 50.33 TOPS (GEMM). |
+| **H19 (Mobile)** | A20 Pro (iPhone 18 Pro) | ✅ Native | Dual 16-Core ANE with native FP8 QDQ execution, reaching 55.41 TOPS (conv) and 50.33 TOPS (GEMM). |
+| **H18g / H19 (Desktop)** | M6 (Mac18,5) | ✅ Native Bonded | Dual 16-Core ANE (32 cores total) with unified bonded driver mode (`ANEDevicePropertyBondedModeSupported = 1`), sustaining **77.93 TOPS** in Native MIL (`MILBlob`) and **72.56 TOPS** in MPSGraph W8A8 QDQ. |
+
+### 5.1 Metal 4 GPU FP8 (Float8e4m3) QDQ Acceleration
+
+Beginning with Metal 4 on macOS 27 and iOS 27, the underlying GPU architecture (`AGXG18GFamilyDevice` on M6, `AGXG19GFamilyDevice` on A20 Pro) introduces dedicated hardware-accelerated FP8 handling (`[device supportsFP8] = true`):
+
+| Workload Configuration | Apple M6 GPU (12 Cores) | iPhone 18 Pro GPU (6 Cores) | Core Scaling Ratio | FP8 Speedup vs. FP16 |
+| :--- | :---: | :---: | :---: | :---: |
+| **FP8 $1\times 1$ Conv ($C=128, L=20$)** | 6.74 ms (**6.37 TOPS**) | 10.29 ms (**4.17 TOPS**) | $1.52\times$ | $0.86\times$ *(QDQ overhead)* |
+| **FP8 $3\times 3$ Conv ($C=128, L=20$)** | 14.62 ms (**26.43 TOPS**) | 28.54 ms (**13.54 TOPS**) | **$1.95\times$** | **$1.29\times$ faster** |
+| **FP8 $5\times 5$ Conv ($C=128, L=20$)** | 33.41 ms (**32.14 TOPS**) | 67.34 ms (**15.95 TOPS**) | **$2.01\times$** | **$1.57\times$ faster** |
+| **FP8 $7\times 7$ Conv ($C=128, L=20$)** | 62.98 ms (**33.42 TOPS**) | — | — | **$1.61\times$ faster** |
+| **FP8 $3\times 3$ Conv ($C=512, L=20$)** | 171.71 ms (**36.02 TOPS**) | 342.36 ms (**18.06 TOPS**) | **$1.994\times$ 🎯** | **$1.75\times$ faster** |
+
+#### Key Microarchitectural Takeaways:
+1. **Breaching the FP16 Ceiling:** While native FP16 convolution strictly flatlines on the ALU roofline of **20.4 – 20.7 TOPS** on M6 and **10.3 – 10.6 TOPS** on iPhone 18 Pro, the Metal 4 FP8 datapath accelerates spatial convolutions up to **36.02 TOPS** (M6) and **18.06 TOPS** (iPhone 18 Pro).
+2. **Linear Core Scaling:** Across all compute-bound channel depths ($C \ge 128$) and kernel taps ($K \ge 3$), the throughput ratio between M6 and iPhone 18 Pro aligns at **$1.95 - 2.01\times$**, empirically matching the 12 vs 6 physical GPU core configuration.
 
 ---
 

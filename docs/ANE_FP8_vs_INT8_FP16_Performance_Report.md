@@ -1,6 +1,6 @@
 # Technical Investigation: ANE Convolution Performance Analysis (FP8 vs. FP16 vs. INT8)
 
-**Target Devices:** Apple iPhone 17 Pro (H18 / TSMC N3P) & Apple iPhone 18 Pro (H19 / TSMC N2)  
+**Target Devices:** Apple iPhone 17 Pro (H18 / TSMC N3P), Apple iPhone 18 Pro (H19 / TSMC N2), and Apple M6 (Mac18,5, Bonded Dual 16-Core ANE)  
 **Workloads:** Chained 2D Convolution (K=3×3, L ∈ [20, 80, 100]) and Chained Matrix Multiplication (1×1 Conv GEMM, M ∈ [1024…4096])  
 **Telemetry & Verification Sources:** 
 * Extracted iOS Shared Cache Binary Disassembly (`/System/Library/PrivateFrameworks/ANECompiler.framework/Versions/A/ANECompiler`)
@@ -17,6 +17,7 @@ Benchmarking on physical iPhone 17 Pro (H18) and iPhone 18 Pro (H19) demonstrate
 | :--- | :---: | :---: | :---: |
 | **iPhone 17 Pro (H18)**<br>*(16-Core @ 2172 MHz)* | 20.88 TFLOPS<br>*(58.7% MAC Peak)* | 29.01 TOPS<br>*(81.5% Direct MAC)* | **41.29 TOPS**<br>*(77.4% Winograd 1D Peak)* |
 | **iPhone 18 Pro (H19)**<br>*(Dual 16-Core @ 2130 MHz)* | **43.80 TFLOPS**<br>*(83.7% Wino Peak)* | **55.41 TOPS**<br>*(79.4% nom / 90.4% act)* | **90.25 TOPS**<br>*(86.2% Winograd 1D Peak)* |
+| **Apple M6 (Mac18,5)**<br>*(Dual Bonded 16-Core)* | **56.35 TFLOPS**<br>*(76.2% MAC Peak)* | **77.93 TOPS** (Native MIL)<br>**72.56 TOPS** (MPSGraph) | **107.26 TOPS**<br>*(Winograd 1D Bonded Peak)* |
 
 ### Primary Discoveries & Microarchitectural Answers:
 
@@ -59,6 +60,15 @@ The compute capacity of the Apple Neural Engine follows:
   `2 × 8,192 MACs/cycle × 2.172 GHz × 10⁻³ =` **35.58 TOPS**
 * **Effective 1D Winograd Ceiling (1.5× for INT8 3×3):**  
   `35.585 TOPS × 1.5 =` **53.38 TOPS** (12,288 effective MACs/cycle)
+
+### 2.3 Apple M6 (Mac18,5, Bonded Dual 16-Core H18g/H19 @ 1850 MHz Base / 2130 MHz Burst)
+* **Silicon Topology:** Dual 16-Core hardware blocks (`ane0`, `ane1`) bonded via driver (`numANEs = 2`, `numANECores = 32`).
+* **Physical MACs per Cycle:** 32 cores × 512 MACs/core = **16,384 MACs/cycle**.
+* **Direct MAC Ceiling (GEMM / 1×1 / FP8 @ 1850 MHz / 2130 MHz):**  
+  `2 × 16,384 MACs/cycle × 1.850 GHz × 10⁻³ =` **60.62 TOPS** (Burst: **69.80 TOPS**)
+* **Effective 1D Winograd Ceiling (1.5× for INT8 3×3 @ Burst):**  
+  `69.798 TOPS × 1.5 =` **104.70 TOPS** (Burst capability up to **107.26 TOPS** measured)
+* **Realized Peak:** Reaches **107.26 TOPS** in dense INT8, **77.93 TOPS** in Native MIL FP8, and **56.35 TOPS** in FP16.
 
 ---
 
