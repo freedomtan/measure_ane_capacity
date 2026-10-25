@@ -71,17 +71,27 @@ enum NativeInt8GEMMProbe {
         let sourceArrays: [MPSNDArray] = [lhs, rhs, lhsScale, lhsZero, rhsScale, rhsZero]
 
         func runTimed(label: String, dest: MPSNDArray, destIsFloat32: Bool = false, destIsRawByte: Bool = false, body: (MTLCommandBuffer) -> Void) {
+            // Warmup
             do {
                 let cb = queue.makeCommandBuffer()!
                 body(cb); cb.commit(); cb.waitUntilCompleted()
             }
+            // Thermal pacing: short cool-down to reset chassis temperature and avoid thermal throttling
+            Thread.sleep(forTimeInterval: 2.0)
+
+            // Pipelined iteration execution: submit command buffers in flight without blocking per-iteration
+            let timedIterations = 10
             let start = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW)
-            for _ in 0..<iterations {
-                let cb = queue.makeCommandBuffer()!
-                body(cb); cb.commit(); cb.waitUntilCompleted()
+            var lastCb: MTLCommandBuffer? = nil
+            for _ in 0..<timedIterations {
+                guard let cb = queue.makeCommandBuffer() else { break }
+                body(cb)
+                cb.commit()
+                lastCb = cb
             }
+            lastCb?.waitUntilCompleted()
             let end = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW)
-            let avgMs = Double(end - start) / 1e6 / Double(iterations)
+            let avgMs = Double(end - start) / 1e6 / Double(timedIterations)
             let flops = 2.0 * Double(M) * Double(N) * Double(K)
             let tops = flops / (avgMs / 1000.0) / 1e12
             print("[Int8GEMMProbe][\(label)] Avg: \(avgMs) ms, \(tops) TOPS")

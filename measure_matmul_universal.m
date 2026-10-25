@@ -58,6 +58,10 @@ static void fillNonZeroData(void *buffer, size_t byteCount, MPSDataType dataType
  * Therefore, in MPSGraph, INT8 matrix multiplication requires the standard Quantize-Dequantize
  * flow: INT8 inputs are dequantized to FP16 before matmul, and requantized to INT8 afterwards.
  */
+static NSUInteger g_size = 1024;
+static NSUInteger g_layers = 20;
+static NSUInteger g_optLevel = 0;
+
 void run_bench(id<MTLDevice> device, Target target, MPSDataType dataType,
                NSString *name) {
   @autoreleasepool {
@@ -67,8 +71,7 @@ void run_bench(id<MTLDevice> device, Target target, MPSDataType dataType,
     MPSGraph *graph = [MPSGraph new];
 
     // High-throughput GEMM dimensions: 4D tensors [B, 1, M, K] x [B, 1, K, N]
-    // ANE natively processes 4D tensors, avoiding layout translation overhead and enabling full hardware saturation.
-    NSUInteger B = 1, M = 1024, K = 1024, N = 1024, L = 20;
+    NSUInteger B = 1, M = g_size, K = g_size, N = g_size, L = g_layers;
     NSArray *inShape = @[ @(B), @1, @(M), @(K) ];
     NSArray *wShape = @[ @(B), @1, @(K), @(N) ];
 
@@ -112,8 +115,7 @@ void run_bench(id<MTLDevice> device, Target target, MPSDataType dataType,
     };
 
     MPSGraphCompilationDescriptor *cd = [MPSGraphCompilationDescriptor new];
-    cd.optimizationLevel =
-        (target == kTargetANE) ? MPSGraphOptimizationLevel1 : MPSGraphOptimizationLevel0;
+    cd.optimizationLevel = (target == kTargetANE) ? MPSGraphOptimizationLevel1 : (MPSGraphOptimization)g_optLevel;
 
     // Safe ANE device targeting across OS versions:
     // On macOS 15+ / 26+, preferredDevice = 2 targets ANE while retaining MTLDevice context.
@@ -232,12 +234,22 @@ int main(int argc, char *argv[]) {
   NSString *onlyTarget = nil;
   for (int i = 1; i < argc; i++) {
     if (strcmp(argv[i], "--target") == 0 && i + 1 < argc) {
-      onlyTarget = [NSString stringWithUTF8String:argv[i + 1]];
+      onlyTarget = [NSString stringWithUTF8String:argv[++i]];
+    } else if (strcmp(argv[i], "--size") == 0 && i + 1 < argc) {
+      g_size = atoi(argv[++i]);
+    } else if (strcmp(argv[i], "--layers") == 0 && i + 1 < argc) {
+      g_layers = atoi(argv[++i]);
+    } else if (strcmp(argv[i], "--opt") == 0 && i + 1 < argc) {
+      g_optLevel = atoi(argv[++i]);
     }
   }
 
+  NSLog(@"Benchmarking GEMM: Size = %lu x %lu, Layers = %lu, OptLevel = %lu", 
+        (unsigned long)g_size, (unsigned long)g_size, (unsigned long)g_layers, (unsigned long)g_optLevel);
+
   if (!onlyTarget || [onlyTarget isEqualToString:@"gpu"]) {
     run_bench(device, kTargetGPU, MPSDataTypeFloat16, @"GPU FP16");
+    run_bench(device, kTargetGPU, MPSDataTypeInt8, @"GPU INT8 (QDQ)");
   }
   if (!onlyTarget || [onlyTarget isEqualToString:@"ane"]) {
     run_bench(device, kTargetANE, MPSDataTypeFloat16, @"ANE FP16");

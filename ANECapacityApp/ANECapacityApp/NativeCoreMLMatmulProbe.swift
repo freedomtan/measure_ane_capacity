@@ -9,9 +9,10 @@ import CoreML
 /// (see ANECapacityApp.swift). Benchmarks all three CoreML compute units in one run,
 /// since (unlike MPSGraphDevice.CPUDevice) CoreML doesn't crash on any of them.
 enum NativeCoreMLMatmulProbe {
-    static func run() {
+    static func run(size: Int? = nil) {
+        let actualSize = resolveSize(size)
         for precision in [MILPrecision.FP16, .INT8, .FP8] {
-            runOne(precision: precision)
+            runOne(precision: precision, size: actualSize)
         }
     }
 
@@ -20,12 +21,24 @@ enum NativeCoreMLMatmulProbe {
     /// (see docs/CPU_Matrix_Convolution_Capability.md Finding 6's follow-up on whether
     /// FP8 takes a different SME2 code path than FP16 on A20 Pro, which supports the
     /// FEAT_SME_F8F16 ARM extension).
-    static func runSingle(precision: MILPrecision, unitsFilter: String? = nil) {
-        runOne(precision: precision, unitsFilter: unitsFilter)
+    static func runSingle(precision: MILPrecision, unitsFilter: String? = nil, size: Int? = nil) {
+        let actualSize = resolveSize(size)
+        runOne(precision: precision, unitsFilter: unitsFilter, size: actualSize)
     }
 
-    private static func runOne(precision: MILPrecision, unitsFilter: String? = nil) {
-        let config = MILMatmulChainConfig(batch: 1, M: 1024, K: 1024, N: 1024, layers: 20, weightMode: .dense, precision: precision)
+    private static func resolveSize(_ explicitSize: Int?) -> Int {
+        if let explicitSize { return explicitSize }
+        if let sIdx = ProcessInfo.processInfo.arguments.firstIndex(of: "--size"),
+           sIdx + 1 < ProcessInfo.processInfo.arguments.count,
+           let s = Int(ProcessInfo.processInfo.arguments[sIdx + 1]) {
+            return s
+        }
+        return 2048 // Default to 2048x2048 to reach high operational intensity (>680 FLOPs/byte)
+    }
+
+    private static func runOne(precision: MILPrecision, unitsFilter: String? = nil, size: Int = 2048) {
+        let uSize = UInt(size)
+        let config = MILMatmulChainConfig(batch: 1, M: uSize, K: uSize, N: uSize, layers: 20, weightMode: .dense, precision: precision)
         let precisionName = MILPrecisionName(precision)
         print("[CoreMLMatmulProbe] === precision: \(precisionName) ===")
 

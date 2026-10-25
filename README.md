@@ -321,6 +321,7 @@ For in-depth microarchitectural investigations, register breakdowns, theoretical
 * [**`ANE_FP8_vs_INT8_FP16_Performance_Report.md`**](docs/ANE_FP8_vs_INT8_FP16_Performance_Report.md): Complete cross-precision performance analysis comparing FP8, FP16, and INT8 on iPhone 17 Pro (H18) and iPhone 18 Pro (H19). Explains why INT8 reaches **90.25 TOPS** via 1D Winograd, why FP16 hits **43.80 TFLOPS**, and why FP8 peaks at **55.41 TOPS** under the 1.87 GHz power clamp.
 * [**`ANE_H19_Theoretical_Peak_and_Winograd_FP8_Analysis.md`**](docs/ANE_H19_Theoretical_Peak_and_Winograd_FP8_Analysis.md): Mathematical derivation of theoretical compute ceilings for Dual 16-Core H19 (2130 MHz) and Single 16-Core H18 (2172 MHz), complete with binary disassembly proof from `ANECompiler.framework` establishing that 1D Winograd minimal filtering is explicitly prohibited on FP8 (`e4_m3`).
 * [**`How_to_Interpret_measure_ane_pmu_Numbers.md`**](docs/How_to_Interpret_measure_ane_pmu_Numbers.md): Guide to interpreting raw Apple Neural Engine silicon PMU hardware performance counters.
+* [**`GPU_Metal_Kernel_Deep_Dive_and_1x1_vs_3x3.md`**](docs/GPU_Metal_Kernel_Deep_Dive_and_1x1_vs_3x3.md): Deep-dive architectural report explaining why Matrix Multiplication (GEMM) and $1\times 1$ convolutions are significantly slower than $3\times 3$ / $5\times 5$ convolutions on Apple Silicon GPUs. Includes Metal Shading Language AIR bytecode disassembly (`conv2d_a18`, `gemm_a18`, `convMatMad`), Winograd analysis (`ndArrayConvWinogradGEMMA18`), Roofline mathematical derivations, and memory bandwidth bottleneck proofs.
 * [**`FP8_BENCHMARKING_AND_ANE_ARCHITECTURE.md`**](docs/FP8_BENCHMARKING_AND_ANE_ARCHITECTURE.md): Technical guide to FP8 (Float8E4M3) Quantize-Dequantize (QDQ) execution in MPSGraph.
 
 
@@ -361,12 +362,16 @@ For in-depth microarchitectural investigations, register breakdowns, theoretical
 | *iPhone 17 Pro (legacy)* | H18 | *ANE* | *INT8* | *7.85 ms* | *49.27\** | *Zero-filled (Zero-skipped)* |
 | *iPhone 17 Pro (legacy)* | H18 | *ANE* | *DQ->FP16->Q* | *6.12 ms* | *63.20\** | *Zero-filled (Zero-skipped)* |
 | **iPhone 18 Pro** | H19 | **GPU** | FP16 | 36.71 ms | **10.53** | Dense (Non-Zero) |
+| **iPhone 18 Pro** | H19 | **GPU** | FP16 GEMM (2048^3) | 31.29 ms | **10.98** | Dense (Non-Zero) |
 | **iPhone 18 Pro** | H19 | **GPU** | FP8 (W8A8 QDQ) | 28.71 ms | **13.46** | Dense (Non-Zero) |
 | **iPhone 18 Pro** | H19 | **ANE** | FP16 | 9.98 ms | **38.74** | **Dense (Non-Zero)** |
 | **iPhone 18 Pro** | H19 | **ANE** | FP8 (E4M3) | 7.66 ms | **50.45** | **Dense (Non-Zero)** |
 | **iPhone 18 Pro** | H19 | **ANE** | INT8 (L=20) | 4.98 ms | **77.66** | **Dense (Non-Zero)** |
+| **iPhone 18 Pro** | H19 | **ANE** | INT8 GEMM (4096^3) | 54.21 ms | **50.71** | **Dense (Non-Zero)** |
 | **iPhone 18 Pro** | H19 | **ANE** | INT8 (L=80) | 9.53 ms | **90.25** | **Dense (Non-Zero, Winograd 1D)** 🏆 |
 | **Mac mini M6** | H19 | **GPU** | FP16 Native | 18.96 ms | **20.39** | Dense (Non-Zero) |
+| **Mac mini M6** | H19 | **GPU** | FP16 GEMM (2048^3) | 17.13 ms | **20.06** | Dense (Non-Zero) |
+| **Mac mini M6** | H19 | **GPU** | INT8 GEMM (QDQ, 2048^3) | 19.05 ms | **19.22** | Dense (Non-Zero) |
 | **Mac mini M6** | H19 | **GPU** | FP8 (W8A8 QDQ, C=128) | 14.62 ms | **26.43** | Dense (Non-Zero) |
 | **Mac mini M6** | H19 | **GPU** | FP8 (W8A8 QDQ, C=512) | 171.71 ms | **36.02** | **Dense (Non-Zero)** 🏆 |
 | **Mac mini M6** | H19 | **ANE** | FP16 (Bonded) | 6.85 ms | **56.35** | **Dense (Non-Zero)** |

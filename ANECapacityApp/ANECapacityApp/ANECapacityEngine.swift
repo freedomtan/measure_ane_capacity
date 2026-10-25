@@ -223,7 +223,70 @@ final class ANECapacityEngine {
         let spatialH: Int
         let spatialW: Int
         
-        if dims.opType == .matmul {
+        if dims.opType == .matmul && target == .gpu {
+            // MatMul (GEMM: [B, 1, M, K] x [B, 1, K, N] -> [B, 1, M, N]) on GPU MXU:
+            // Native matrixMultiplication dispatches directly to gemm_a18 / matrixMultiplyA18FC,
+            // avoiding the conv2d_a18 spatial coordinate tracking and bounds-checking pipeline.
+            spatialH = 1
+            spatialW = 1
+            inShape = [
+                NSNumber(value: dims.batch),
+                1,
+                NSNumber(value: dims.m),
+                NSNumber(value: dims.k)
+            ]
+            let wShape: [NSNumber] = [
+                NSNumber(value: dims.batch),
+                1,
+                NSNumber(value: dims.k),
+                NSNumber(value: dims.n)
+            ]
+            input = graph.placeholder(shape: inShape, dataType: mpsType, name: "in")
+            cur = input
+            
+            let weightMag = Float(0.96 / sqrt(Double(max(dims.k, 1))))
+            
+            if precision.isFP8 {
+                guard #available(iOS 27.0, macOS 27.0, *) else {
+                    throw BenchmarkError.executionFailed("FP8 requires iOS 27.0 / macOS 27.0 or newer.")
+                }
+                let wLength = dims.batch * dims.k * dims.n * 1
+                let wData = createNonZeroData(byteCount: wLength, dataType: mpsType)
+                let wFP8 = graph.constant(wData, shape: wShape, dataType: mpsType)
+                let fp8Scale: Double = 1.0
+                let w = graph.dequantize(wFP8, scale: fp8Scale, zeroPoint: 0.0, dataType: .float16, name: "w_dequant")
+                for _ in 0..<dims.layers {
+                    let lhs = graph.dequantize(cur, scale: fp8Scale, zeroPoint: 0.0, dataType: .float16, name: "act_dequant")
+                    let outFP16 = graph.matrixMultiplication(primary: lhs, secondary: w, name: nil)
+                    cur = graph.quantize(outFP16, scale: fp8Scale, zeroPoint: 0.0, dataType: mpsType, name: "act_quant")
+                }
+            } else if mpsType == .int8 {
+                let wLength = dims.batch * dims.k * dims.n * 2
+                let wData = createNonZeroData(byteCount: wLength, dataType: .float16, magnitude: weightMag)
+                let w = graph.constant(wData, shape: wShape, dataType: .float16)
+                let int8Scale: Double = 1.0 / 32.0
+                for _ in 0..<dims.layers {
+                    let lhs = graph.dequantize(cur, scale: int8Scale, zeroPoint: 0.0, dataType: .float16, name: "act_dequant")
+                    let outFP16 = graph.matrixMultiplication(primary: lhs, secondary: w, name: nil)
+                    cur = graph.quantize(outFP16, scale: int8Scale, zeroPoint: 0.0, dataType: mpsType, name: "act_quant")
+                }
+            } else {
+                let wLength = dims.batch * dims.k * dims.n * elementSize
+                let wData = createNonZeroData(byteCount: wLength, dataType: mpsType, magnitude: weightMag)
+                let w = graph.constant(wData, shape: wShape, dataType: mpsType)
+                for _ in 0..<dims.layers {
+                    cur = graph.matrixMultiplication(primary: cur, secondary: w, name: nil)
+                }
+            }
+            inputBufferLen = dims.batch * dims.m * dims.k * elementSize
+            outputBufferLen = dims.batch * dims.m * dims.n * elementSize
+            outShape = [
+                NSNumber(value: dims.batch),
+                1,
+                NSNumber(value: dims.m),
+                NSNumber(value: dims.n)
+            ]
+        } else if dims.opType == .matmul {
             // MatMul (GEMM: [B, M, K] x [B, K, N] -> [B, M, N]) is mapped as a 1x1 2D Convolution on ANE:
             //   Input:   [B, K, H, W] where H * W = M
             //   Weights: [N, K, 1, 1]
