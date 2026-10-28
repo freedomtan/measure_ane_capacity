@@ -103,20 +103,59 @@ When $K=1$, this entire coordinate generation pipeline still executes on every l
 
 ---
 
-## 3. The Role of Winograd: `ndArrayConvWinogradGEMMA18`
+## 3. The Role of Winograd: `ndArrayConvWinogradGEMMA18` and 1D vs 2D Verification
 
-`MPSNDArray.framework/default.metallib` contains 49 specialized Winograd functions:
-- `ndArrayConvWinogradWeightsTransformA18`: Transforms spatial weights $g$ via $U = G g G^T$.
-- `ndArrayConvWinogradBatched`: Computes forward image tile transform $V = B^T d B$.
+A critical question when analyzing Apple Silicon convolution pipelines is whether the Metal GPU shader libraries implement **1D Winograd $F(2,3)$** (as used in the Apple Neural Engine hardware pipeline) or standard **2D Winograd**.
+
+### 3.1 Kernel Inventory in `default.metallib`
+
+Deep inspection of `/System/Library/Frameworks/MetalPerformanceShaders.framework/Versions/A/Frameworks/MPSNDArray.framework/Versions/A/Resources/default.metallib` using `xcrun metal-nm` and Objective-C runtime inspection reveals the following Winograd symbol inventory:
+
+- `ndArrayConvWinogradWeightsTransformA18`: Pre-transforms 2D spatial weights $g$ into frequency domain tiles $U = G g G^T$ for Apple Silicon MXU (Matrix Execution Unit).
 - `ndArrayConvWinogradGEMMA18`: Executes batched matrix multiplication $M = U \odot V$ across frequency-domain tiles using Morton Order (Z-order curve) memory layout (`@_ZL20kMortonOrderTileSize`).
+- `ndArrayConvWinogradBatched`: Computes forward image tile transform and batched accumulation for A14–A17 / M1–M4 SIMD TEC (Texture Execution Cluster).
+- `ndArrayConvWinogradBatched_reducedTile`: Reduced tile variant for small spatial extents.
+- `ndArrayWinogradAMD_NCHW`: Legacy 2D Winograd implementation for AMD/Intel GPU architectures.
 
-### 3.1 Winograd Algorithmic Speedup vs Direct Execution
+### 3.2 Is There 1D Winograd $F(2,3)$ in Metal? (Negative Finding)
+
+**No.** Disassembly of `MPSNDArray.framework` confirms that Metal does **not** implement 1D Winograd $F(2,3)$.
+
+#### Architectural Evidence from `MPSNDArray`:
+1. **Strict 2D Geometry Constraints:** In `MPSNDArrayConvolutionDeviceBehaviorA14::IsWinogradSupported` (and inherited in A18/A19/M6 behavior), 1D convolutions are rejected:
+   ```cpp
+   // Decompiled from MPSNDArray:
+   if (kernelHeight != 3 || kernelWidth != 3 ||
+       strideInPixelsX != 1 || strideInPixelsY != 1 ||
+       dilationRateInX != 1 || dilationRateInY != 1) {
+       return false; // Rejects 1D convolutions (e.g. 1x3, 3x1); falls back to direct conv
+   }
+   ```
+   Any 1D convolution ($kH=1, kW=3$ or $kH=3, kW=1$) returns `false` and falls back directly to direct convolution (`"Using MXU direct conv"` / direct GEMM).
+2. **2D Tile Parameter Constraints:** Driver tables (`winogradA18GTable`, `winogradA18STable`) and runtime assertions explicitly govern 2D spatial patches:
+   * `"Winograd parameter kernelResultTiles must be less than or equal to 16"`
+   * `"Winograd parameter imageTileSize and batchTileSize product must be equal to dataTileSize"`
+   * `"Winograd parameter MortonOrderTileSize must be less than or equal to 4"`
+3. **Precision Support:**
+   * Supported: FP16, BF16, and Apple's internal 19-bit floating point (`MPSNDARRAY_WINOGRAD_FP19_INTERMEDIATE`, `MPSNDARRAY_WINOGRAD_FP16_INTERMEDIATE`).
+   * Explicitly Unsupported: FP32 (`"A18 Winograd kernel does not support FP32 precision"`).
+
+### 3.3 ANE vs. Metal GPU Winograd Comparison
+
+| Feature | Apple Neural Engine (ANE) | Metal GPU (`MPSNDArray.framework`) |
+| :--- | :--- | :--- |
+| **Winograd Algorithm** | Hardware-native **1D Winograd $F(2,3)$** ($m=2, r=3, \alpha=4$) applied separably | Shader-based **2D Winograd $F(2\times 2, 3\times 3)$ / $F(4\times 4, 3\times 3)$** |
+| **Supported Geometry** | 1D and 2D separable spatial convolutions | Strictly $3\times 3$ 2D convolutions ($kH = 3, kW = 3$) |
+| **Precision** | INT8 / FP16 hardware pipeline | FP16, BF16, and FP19 intermediate precision |
+| **Execution Engine** | Dedicated ANE Convolution Engine | GPU MXU (`ndArrayConvWinogradGEMMA18`) or TEC (`ndArrayConvWinogradBatched`) |
+
+### 3.4 Winograd Algorithmic Speedup vs Direct Execution
 
 For a $3\times 3$ convolution:
 - **Winograd $F(2\times 2, 3\times 3)$:** Transforms $4\times 4$ input tiles to produce $2\times 2$ output pixels. Requires 16 multiplications instead of 36 ($\mathbf{2.25\times}$ multiplication reduction).
 - **Winograd $F(4\times 4, 3\times 3)$:** Transforms $6\times 6$ input tiles to produce $4\times 4$ output pixels. Requires 36 multiplications instead of 144 ($\mathbf{4.0\times}$ multiplication reduction).
 
-### 3.2 Why Direct `conv2d_a18` Was Used in Benchmarks
+### 3.5 Why Direct `conv2d_a18` Was Used in Benchmarks
 
 In runtime tracing, MPSGraph dispatched **`conv2d_a18_float_half_half`**, NOT `ndArrayConvWinogradGEMMA18`. The $20.39\text{ TOPS}$ measured was **un-shortened, direct physical multiply-accumulates**.
 
