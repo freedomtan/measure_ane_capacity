@@ -197,17 +197,27 @@ final class ANECapacityEngine {
         // MPSNDArrayQuantizedMatrixMultiplication kernels directly. This is the
         // only path that actually reaches A20 Pro's native FP8 ALUs; see
         // docs/GPU_MXU_And_Convolution_Dispatch_Investigation.md Finding 4l/4q.
+        //
+        // Exception: native FP8 GEMM hard-aborts on Apple9-family GPUs (A17
+        // Pro/A18/A18 Pro -- see ANE comment below and the Apple10 guard in
+        // runNativeGPUMatmul). On that hardware, fall through to the MPSGraph
+        // dequant/quantize-wrapped path instead (the same one used for ANE):
+        // it runs without crashing, just without any FP8 acceleration (Finding
+        // 4e already established this path is plain FP16 math underneath).
         if dims.opType == .matmul && target == .gpu {
-            return try await runNativeGPUMatmul(
-                dims: dims,
-                precision: precision,
-                iterations: iterations,
-                sweepType: sweepType,
-                sweepValue: sweepValue,
-                sweepLabel: sweepLabel,
-                logHandler: logHandler,
-                device: device
-            )
+            if !(precision.isFP8 && !device.supportsFamily(.apple10)) {
+                return try await runNativeGPUMatmul(
+                    dims: dims,
+                    precision: precision,
+                    iterations: iterations,
+                    sweepType: sweepType,
+                    sweepValue: sweepValue,
+                    sweepLabel: sweepLabel,
+                    logHandler: logHandler,
+                    device: device
+                )
+            }
+            logHandler("[GPU \(precision.rawValue)] Native FP8 GEMM unsupported on this GPU (requires Apple10 GPU family or newer) -- falling back to MPSGraph dequant/quantize path (not hardware-accelerated, see Finding 4e).")
         }
 
         let mpsType = precision.mpsDataType
