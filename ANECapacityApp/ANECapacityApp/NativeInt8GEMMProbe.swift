@@ -9,13 +9,20 @@ import MetalPerformanceShaders
 /// normal ConvDimensions/BenchmarkResult pipeline -- this is a standalone
 /// sanity check for docs/GPU_MXU_And_Convolution_Dispatch_Investigation.md Finding 4h/4i.
 enum NativeInt8GEMMProbe {
-    static func run() {
+    // size: M=N=K for the GEMM. layers: chain depth for the FP16/FP8 paths
+    // (homogeneous dtype in/out, so layer N's output is a valid input to layer
+    // N+1 -- ping-ponged between two dest buffers). INT8-affine stays at a
+    // single layer regardless: MPSNDArrayQuantizedMatrixMultiplication always
+    // dequantizes on write (output dtype float16 != input dtype int8), so
+    // chaining it would need a requantize step this plain NDArray API doesn't
+    // expose.
+    static func run(size: Int = 2048, layers: Int = 1) {
         guard let device = MTLCreateSystemDefaultDevice(), let queue = device.makeCommandQueue() else {
             print("[Int8GEMMProbe] No Metal device/queue"); return
         }
         print("[Int8GEMMProbe] Device: \(device.name)")
 
-        let M = 2048, N = 2048, K = 2048
+        let M = size, N = size, K = size
         let iterations = 20
 
         func ndArray(dataType: MPSDataType, shape: [Int]) -> MPSNDArray {
@@ -70,7 +77,7 @@ enum NativeInt8GEMMProbe {
         )
         let sourceArrays: [MPSNDArray] = [lhs, rhs, lhsScale, lhsZero, rhsScale, rhsZero]
 
-        func runTimed(label: String, dest: MPSNDArray, destIsFloat32: Bool = false, destIsRawByte: Bool = false, body: (MTLCommandBuffer) -> Void) {
+        func runTimed(label: String, layers: Int = 1, dest: MPSNDArray, destIsFloat32: Bool = false, destIsRawByte: Bool = false, body: (MTLCommandBuffer) -> Void) {
             // Warmup
             do {
                 let cb = queue.makeCommandBuffer()!
@@ -92,9 +99,9 @@ enum NativeInt8GEMMProbe {
             lastCb?.waitUntilCompleted()
             let end = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW)
             let avgMs = Double(end - start) / 1e6 / Double(timedIterations)
-            let flops = 2.0 * Double(M) * Double(N) * Double(K)
+            let flops = 2.0 * Double(M) * Double(N) * Double(K) * Double(layers)
             let tops = flops / (avgMs / 1000.0) / 1e12
-            print("[Int8GEMMProbe][\(label)] Avg: \(avgMs) ms, \(tops) TOPS")
+            print("[Int8GEMMProbe][\(label)] L=\(layers) Avg: \(avgMs) ms, \(tops) TOPS")
 
             if destIsRawByte {
                 var out = [UInt8](repeating: 0, count: M * N)
@@ -129,9 +136,16 @@ enum NativeInt8GEMMProbe {
         rhsFBuf.withUnsafeMutableBytes { raw in rhsF.writeBytes(raw.baseAddress!, strideBytes: nil) }
 
         let mm = MPSNDArrayMatrixMultiplication(device: device, sourceCount: 2)
-        let fp16Dest = ndArray(dataType: .float16, shape: [1, 1, M, N])
-        runTimed(label: "GPU FP16 GEMM (MPSNDArrayMatrixMultiplication, baseline)", dest: fp16Dest) { cb in
-            mm.encode(to: cb, sourceArrays: [lhsF, rhsF], destinationArray: fp16Dest)
+        let fp16DestA = ndArray(dataType: .float16, shape: [1, 1, M, N])
+        let fp16DestB = ndArray(dataType: .float16, shape: [1, 1, M, N])
+        runTimed(label: "GPU FP16 GEMM (MPSNDArrayMatrixMultiplication, baseline)", layers: layers, dest: fp16DestB) { cb in
+            var cur = lhsF
+            let pingPong = [fp16DestA, fp16DestB]
+            for layer in 0..<layers {
+                let dst = pingPong[layer % 2]
+                mm.encode(to: cb, sourceArrays: [cur, rhsF], destinationArray: dst)
+                cur = dst
+            }
         }
 
         // FP8 is a native float encoding (not integer+scale), so the plain
@@ -155,10 +169,17 @@ enum NativeInt8GEMMProbe {
             let rhs8 = ndArray(dataType: .float8e4m3, shape: [1, 1, K, N])
             fillFP8E4M3(lhs8, count: M * K)
             fillFP8E4M3(rhs8, count: K * N)
-            let fp8Dest = ndArray(dataType: .float8e4m3, shape: [1, 1, M, N])
+            let fp8DestA = ndArray(dataType: .float8e4m3, shape: [1, 1, M, N])
+            let fp8DestB = ndArray(dataType: .float8e4m3, shape: [1, 1, M, N])
             let mm8 = MPSNDArrayMatrixMultiplication(device: device, sourceCount: 2)
-            runTimed(label: "GPU Native FP8-E4M3 GEMM (MPSNDArrayMatrixMultiplication)", dest: fp8Dest, destIsRawByte: true) { cb in
-                mm8.encode(to: cb, sourceArrays: [lhs8, rhs8], destinationArray: fp8Dest)
+            runTimed(label: "GPU Native FP8-E4M3 GEMM (MPSNDArrayMatrixMultiplication)", layers: layers, dest: fp8DestB, destIsRawByte: true) { cb in
+                var cur = lhs8
+                let pingPong = [fp8DestA, fp8DestB]
+                for layer in 0..<layers {
+                    let dst = pingPong[layer % 2]
+                    mm8.encode(to: cb, sourceArrays: [cur, rhs8], destinationArray: dst)
+                    cur = dst
+                }
             }
         } else {
             print("[Int8GEMMProbe] FP8 requires iOS 27+")

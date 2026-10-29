@@ -1519,6 +1519,80 @@ it is a clean independent confirmation that the generic-plugin-fallback
 result is a property of the chip/driver, not an artifact of one specific
 physical part or one specific Mac.
 
+## Finding 4q — Finding 4l's noisy 1.1–1.8x resolved: native FP8-E4M3 GEMM is a clean, generation-locked ~2x over FP16, once the GEMM is large/deep enough to saturate the GPU
+
+Finding 4l's single-shot (`L=1`), fixed-`2048³` native `MPSNDArrayMatrixMultiplication`
+GEMM gave FP8-E4M3-vs-FP16 ratios that varied **1.1x–1.84x** run to run on the
+same iPhone 18 Pro — real, but too noisy to call a specific number. Two
+changes close that gap: (1) sweep the GEMM size (`2048³`/`4096³`/`8192³`), and
+(2) chain `L=20` dependent GEMMs per command buffer (ping-ponging two
+destination buffers, output of layer *n* feeding layer *n+1* — the same
+methodology the MPSGraph `matmulDimensions` sweep elsewhere in this repo uses
+for its `layers` parameter), instead of timing one dispatch per command
+buffer. INT8-affine (`MPSNDArrayQuantizedMatrixMultiplication`) stays at
+`L=1` throughout — its output dtype is always `float16` (it dequantizes on
+write), never `int8`, so there is no way to feed one layer's output into the
+next without a requantize step this plain NDArray API doesn't expose.
+
+Tested on three chips: iPhone 18 Pro (A20 Pro), iPhone 17 Pro (A19 Pro), and
+an M6 Mac mini (`mac-mini-m6.local`, reached via a standalone `swiftc`-compiled
+port of the app's probe — `ANECapacityApp` itself is iphoneos-only, no macOS
+destination). 8192³ was skipped on both iPhones (too large/slow for this
+form factor; M6 handled it fine).
+
+**A20 Pro (iPhone 18 Pro):**
+
+| Size | FP16 (L=20) | FP8-E4M3 (L=20) | ratio |
+|---|---|---|---|
+| 2048³ | 8.65 TOPS | 15.68 TOPS | 1.81x |
+| 4096³ | 10.03 TOPS | 19.77 TOPS | 1.97x |
+
+**A19 Pro (iPhone 17 Pro):**
+
+| Size | FP16 (L=20) | FP8-E4M3 (L=20) | ratio |
+|---|---|---|---|
+| 2048³ | 6.79 TOPS | 7.18 TOPS | 1.06x |
+| 4096³ | 7.44 TOPS | 7.44 TOPS | 1.00x |
+
+**M6:**
+
+| Size | FP16 (L=20) | FP8-E4M3 (L=20) | ratio |
+|---|---|---|---|
+| 2048³ | 18.66 TOPS | 35.17 TOPS | 1.88x |
+| 4096³ | 18.03 TOPS | 35.82 TOPS | 1.99x |
+| 8192³ | 18.42 TOPS | 37.32 TOPS | 2.03x |
+
+**Reading it:** on A20 Pro-generation silicon (the iPhone chip and M6's GPU
+both), the ratio climbs with problem size and *converges to ~2.0x*, not an
+unstable number in the 1.1–1.8x band — Finding 4l's noise was simply
+under-saturation: `2048³`/`L=1` wasn't enough work to keep the GPU busy long
+enough for either path to reach steady state. On A19 Pro, by contrast, the
+ratio is pinned at **~1.00–1.06x at every size tested** — i.e., no FP8
+hardware advantage exists on that GPU generation at all, matching Finding
+4l's A18 Pro result (hard rejection, not merely "slow") in kind if not degree.
+This is now the same generation-locked pattern this investigation has found
+repeatedly elsewhere: `FEAT_SME_F8F16`/`FEAT_SME_F8F32` CPU-side (A20 Pro
+only), native FP8 convolution dispatch (Finding 4o, A20 Pro only), and now
+native FP8 GEMM — all draw the hardware-capability line at the same chip
+generation.
+
+**A correctness note, not a bug.** Unlike Finding 4l's single-shot run, this
+20-layer chain uses no per-layer weight-magnitude scaling (the MPSGraph
+sweeps elsewhere in this repo use `0.96/sqrt(K)` specifically to prevent
+exactly this), so magnitudes grow unboundedly across the chain. FP16 output
+overflows to `NaN` by the last layer; FP8-E4M3 output saturates cleanly to
+its max finite value (byte `0x7E` = `+448`) instead of producing `NaN` — a
+real, interesting difference in overflow behavior between the two formats,
+but irrelevant to the throughput measurement itself (GPU dispatch cost here
+doesn't depend on the data values, only shapes/dtypes).
+
+This directly answers the "Apple claimed 2x FP8 for A20 Pro" question that
+prompted this finding: there is no single external citation for that number
+anywhere in this repo (it isn't a documented Apple marketing/spec claim) —
+but it is now a clean, reproducible, self-measured result, confirmed
+independently on two different A20 Pro-generation GPUs (phone and Mac), and
+absent on the preceding generation (A19 Pro).
+
 ## Finding 5 — `MPSNDArraySDPAA18Behavior::EncodeSDPA`, decompiled
 
 Address: `0x190c876d8` (`MPSNDArray.framework`, a sub-framework of

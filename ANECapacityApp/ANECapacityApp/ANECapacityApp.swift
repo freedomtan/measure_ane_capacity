@@ -4,8 +4,17 @@ import SwiftUI
 struct ANECapacityApp: App {
     init() {
         if ProcessInfo.processInfo.arguments.contains("--native-int8-gemm") {
+            let args = ProcessInfo.processInfo.arguments
+            var size = 2048
+            var layers = 1
+            if let sIdx = args.firstIndex(of: "--size"), sIdx + 1 < args.count, let s = Int(args[sIdx + 1]) {
+                size = s
+            }
+            if let lIdx = args.firstIndex(of: "--layers"), lIdx + 1 < args.count, let l = Int(args[lIdx + 1]) {
+                layers = l
+            }
             DispatchQueue.global().async {
-                NativeInt8GEMMProbe.run()
+                NativeInt8GEMMProbe.run(size: size, layers: layers)
                 exit(0)
             }
         }
