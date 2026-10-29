@@ -6,21 +6,25 @@ Three devices, same app (`ANECapacityApp`), same benchmark path (`ANECapacityEng
 bypassing MPSGraph's non-accelerating public `matrixMultiplication` — see
 `docs/GPU_MXU_And_Convolution_Dispatch_Investigation.md` Findings 4e/4l/4q for why that bypass matters):
 
-| Device | Chip | GPU Metal family |
+| Device | Chip | `device.supportsFamily(...)`, directly queried on-device |
 |---|---|---|
-| iPhone 16 Pro | A18 Pro | `Apple9` |
-| iPhone 17 Pro | A19 Pro | `Apple10` (inferred — see below) |
-| iPhone 18 Pro | A20 Pro | `Apple11` (inferred — see below) |
+| iPhone 16 Pro | A18 Pro | apple9=true, apple10=**false**, apple11=false |
+| iPhone 17 Pro | A19 Pro | apple9=true, apple10=**true**, apple11=**false** |
+| iPhone 18 Pro | A20 Pro | apple9=true, apple10=true, apple11=**true** |
 
-The `Apple9`/`Apple10`/`Apple11` family boundary is taken directly from
-`MTLDevice.h` in the iOS 27 SDK, which defines all three constants. `Apple9`
-is documented Apple-side as covering A17 Pro through A18 Pro; the two newer
-constants didn't exist before this SDK and line up chip-generation-for-generation
-with A19 and A20. iPhone 17 Pro's `supportsFamily(.apple10)` was not directly
-queried in code today, but its FP8 behavior (runs, no crash, no speedup) is
-consistent with `Apple10`, and iPhone 18 Pro's native FP8 success is consistent
-with `Apple11` (confirmed indirectly: it runs the native kernel that iPhone 16
-Pro hard-crashes on without the `supportsFamily(.apple10)` guard added below).
+All three queried directly on-device via a small `--gpu-family` diagnostic
+added to `ANECapacityApp.swift` (prints `MTLDevice.supportsFamily` for
+`.apple7`–`.apple11` and exits — `GPU: Apple A18/A19/A20 Pro GPU` confirms the
+chip identity each time). The `Apple9`/`Apple10`/`Apple11` constants are
+defined in `MTLDevice.h` in the iOS 27 SDK; `Apple9` is documented Apple-side
+as covering A17 Pro through A18 Pro, and the measured results line up
+chip-generation-for-generation with no gaps or surprises: iPhone 16 Pro (A18
+Pro) tops out at `Apple9` — exactly the boundary where native FP8 GEMM
+hard-crashes — iPhone 17 Pro (A19 Pro) is the first to report `Apple10` (and
+the last to report `Apple11 = false`), and iPhone 18 Pro (A20 Pro) is the
+first to report `Apple11 = true`, matching the earlier FP8 observation that
+it's the only one of the three where the native FP8 kernel is both supported
+*and* accelerated.
 
 ## Peak GPU TOPS, Matrix Dimension Sweep (128³–4096³, L=20 for FP16/FP8, L=1 for INT8)
 
@@ -136,11 +140,6 @@ GEMMs. Fixed by sizing the readback buffer off the actual destination dtype.
 
 ## Gaps
 
-- iPhone 17 Pro's `supportsFamily(.apple10)` was not directly queried in code
-  on iPhone 17 Pro hardware; its `Apple10` family membership is inferred from
-  (a) the SDK's `Apple9`/`Apple10`/`Apple11` three-tier layout matching three
-  chip generations and (b) its FP8 kernel running without the crash A18 Pro
-  hits.
 - 8192³ is intentionally excluded from the app's default sweep (see
   `BenchmarkViewModel.swift`'s `customMatMulSteps`): on iPhone-class GPUs it
   trips a GPU watchdog reset (command buffers discarded as "innocent victim"

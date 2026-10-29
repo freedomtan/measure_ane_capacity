@@ -1,4 +1,5 @@
 import SwiftUI
+import Metal
 
 @main
 struct ANECapacityApp: App {
@@ -27,6 +28,22 @@ struct ANECapacityApp: App {
         if ProcessInfo.processInfo.arguments.contains("--supports-mxu") {
             DispatchQueue.global().async {
                 SupportsMXUProbe.run()
+                exit(0)
+            }
+        }
+        if ProcessInfo.processInfo.arguments.contains("--gpu-family") {
+            DispatchQueue.global().async {
+                if let device = MTLCreateSystemDefaultDevice() {
+                    print("GPU: \(device.name)")
+                    for (name, family) in [
+                        ("apple7", MTLGPUFamily.apple7), ("apple8", .apple8), ("apple9", .apple9),
+                        ("apple10", .apple10), ("apple11", .apple11)
+                    ] {
+                        print("supportsFamily(.\(name)) = \(device.supportsFamily(family))")
+                    }
+                } else {
+                    print("No MTLDevice available.")
+                }
                 exit(0)
             }
         }
