@@ -157,3 +157,17 @@ GEMMs. Fixed by sizing the readback buffer off the actual destination dtype.
   trips a GPU watchdog reset (command buffers discarded as "innocent victim"
   mid-sweep), and peak TOPS is already reached by 4096³ on both tested
   iPhones. M6's GPU handles 8192³ without issue (see Finding 4q).
+
+## Verification: the other two matmul sweeps
+
+This report only shows `matmulDimensions` data, but `runSingle`'s native-kernel
+bypass triggers on any `dims.opType == .matmul && target == .gpu`, not just
+that one sweep — so `matmulDepth` (fixed 1024³, `layers` swept 1–100) and
+`matmulAsymmetric` (fixed K=N=1024, `M` swept 512–8192) go through the same
+code path. Both were smoke-tested with `--all` (FP16+FP8+INT8) on iPhone 18
+Pro (fast, all-native) and iPhone 16 Pro (the risky case: FP8 forced onto the
+MPSGraph fallback, and `matmulAsymmetric` includes `M=8192`, the size that
+causes a GPU watchdog reset in the *cubic* `matmulDimensions` sweep). Neither
+sweep crashed or hung on either device — `matmulAsymmetric`'s `M=8192` is a
+thin rectangular GEMM (`8192×1024×1024`), not the much larger cubic `8192³`
+workload, so it doesn't trip the same watchdog.
