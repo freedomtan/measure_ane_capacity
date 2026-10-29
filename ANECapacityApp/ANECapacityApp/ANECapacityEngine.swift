@@ -1,5 +1,6 @@
 import Foundation
 import Metal
+import MetalPerformanceShaders
 import MetalPerformanceShadersGraph
 
 // MARK: - Benchmark Errors
@@ -189,7 +190,26 @@ final class ANECapacityEngine {
         }
         
         if Task.isCancelled { throw BenchmarkError.executionCancelled }
-        
+
+        // GPU GEMM: bypass MPSGraph's public matrixMultiplication (which only
+        // ever runs plain FP16 math underneath a quantize/dequantize wrapper --
+        // Finding 4e) and dispatch the real native MPSNDArrayMatrixMultiplication/
+        // MPSNDArrayQuantizedMatrixMultiplication kernels directly. This is the
+        // only path that actually reaches A20 Pro's native FP8 ALUs; see
+        // docs/GPU_MXU_And_Convolution_Dispatch_Investigation.md Finding 4l/4q.
+        if dims.opType == .matmul && target == .gpu {
+            return try await runNativeGPUMatmul(
+                dims: dims,
+                precision: precision,
+                iterations: iterations,
+                sweepType: sweepType,
+                sweepValue: sweepValue,
+                sweepLabel: sweepLabel,
+                logHandler: logHandler,
+                device: device
+            )
+        }
+
         let mpsType = precision.mpsDataType
         let elementSize = precision.elementSize
 
@@ -223,70 +243,7 @@ final class ANECapacityEngine {
         let spatialH: Int
         let spatialW: Int
         
-        if dims.opType == .matmul && target == .gpu {
-            // MatMul (GEMM: [B, 1, M, K] x [B, 1, K, N] -> [B, 1, M, N]) on GPU MXU:
-            // Native matrixMultiplication dispatches directly to gemm_a18 / matrixMultiplyA18FC,
-            // avoiding the conv2d_a18 spatial coordinate tracking and bounds-checking pipeline.
-            spatialH = 1
-            spatialW = 1
-            inShape = [
-                NSNumber(value: dims.batch),
-                1,
-                NSNumber(value: dims.m),
-                NSNumber(value: dims.k)
-            ]
-            let wShape: [NSNumber] = [
-                NSNumber(value: dims.batch),
-                1,
-                NSNumber(value: dims.k),
-                NSNumber(value: dims.n)
-            ]
-            input = graph.placeholder(shape: inShape, dataType: mpsType, name: "in")
-            cur = input
-            
-            let weightMag = Float(0.96 / sqrt(Double(max(dims.k, 1))))
-            
-            if precision.isFP8 {
-                guard #available(iOS 27.0, macOS 27.0, *) else {
-                    throw BenchmarkError.executionFailed("FP8 requires iOS 27.0 / macOS 27.0 or newer.")
-                }
-                let wLength = dims.batch * dims.k * dims.n * 1
-                let wData = createNonZeroData(byteCount: wLength, dataType: mpsType)
-                let wFP8 = graph.constant(wData, shape: wShape, dataType: mpsType)
-                let fp8Scale: Double = 1.0
-                let w = graph.dequantize(wFP8, scale: fp8Scale, zeroPoint: 0.0, dataType: .float16, name: "w_dequant")
-                for _ in 0..<dims.layers {
-                    let lhs = graph.dequantize(cur, scale: fp8Scale, zeroPoint: 0.0, dataType: .float16, name: "act_dequant")
-                    let outFP16 = graph.matrixMultiplication(primary: lhs, secondary: w, name: nil)
-                    cur = graph.quantize(outFP16, scale: fp8Scale, zeroPoint: 0.0, dataType: mpsType, name: "act_quant")
-                }
-            } else if mpsType == .int8 {
-                let wLength = dims.batch * dims.k * dims.n * 2
-                let wData = createNonZeroData(byteCount: wLength, dataType: .float16, magnitude: weightMag)
-                let w = graph.constant(wData, shape: wShape, dataType: .float16)
-                let int8Scale: Double = 1.0 / 32.0
-                for _ in 0..<dims.layers {
-                    let lhs = graph.dequantize(cur, scale: int8Scale, zeroPoint: 0.0, dataType: .float16, name: "act_dequant")
-                    let outFP16 = graph.matrixMultiplication(primary: lhs, secondary: w, name: nil)
-                    cur = graph.quantize(outFP16, scale: int8Scale, zeroPoint: 0.0, dataType: mpsType, name: "act_quant")
-                }
-            } else {
-                let wLength = dims.batch * dims.k * dims.n * elementSize
-                let wData = createNonZeroData(byteCount: wLength, dataType: mpsType, magnitude: weightMag)
-                let w = graph.constant(wData, shape: wShape, dataType: mpsType)
-                for _ in 0..<dims.layers {
-                    cur = graph.matrixMultiplication(primary: cur, secondary: w, name: nil)
-                }
-            }
-            inputBufferLen = dims.batch * dims.m * dims.k * elementSize
-            outputBufferLen = dims.batch * dims.m * dims.n * elementSize
-            outShape = [
-                NSNumber(value: dims.batch),
-                1,
-                NSNumber(value: dims.m),
-                NSNumber(value: dims.n)
-            ]
-        } else if dims.opType == .matmul {
+        if dims.opType == .matmul {
             // MatMul (GEMM: [B, M, K] x [B, K, N] -> [B, M, N]) is mapped as a 1x1 2D Convolution on ANE:
             //   Input:   [B, K, H, W] where H * W = M
             //   Weights: [N, K, 1, 1]
@@ -780,6 +737,221 @@ final class ANECapacityEngine {
         )
     }
     
+    /**
+     * GPU GEMM via the native MPSNDArrayMatrixMultiplication /
+     * MPSNDArrayQuantizedMatrixMultiplication kernels, bypassing MPSGraph's
+     * public matrixMultiplication op entirely. Finding 4e (docs/GPU_MXU_And_
+     * Convolution_Dispatch_Investigation.md) showed MPSGraph's quantize/
+     * dequantize-wrapped matmul never reaches native low-precision hardware --
+     * it's plain FP16 math underneath regardless of the wrapper dtype. This is
+     * the path that actually dispatches to A20 Pro's native FP8 ALUs
+     * (Finding 4l/4q), confirmed ~2x over FP16 once the GEMM is large/deep
+     * enough (L=20 chained) to saturate the GPU.
+     *
+     * FP16/FP8 chain L layers deep (homogeneous dtype in/out, ping-ponging two
+     * destination buffers -- layer n's output feeds layer n+1). INT8-affine
+     * stays at L=1 regardless of dims.layers: MPSNDArrayQuantizedMatrixMultiplication
+     * always dequantizes on write (destination dtype float16 != input dtype
+     * int8), so there's no way to chain it without a requantize step this
+     * plain NDArray API doesn't expose.
+     */
+    private func runNativeGPUMatmul(
+        dims: ConvDimensions,
+        precision: PrecisionMode,
+        iterations: Int,
+        sweepType: SweepType,
+        sweepValue: Double,
+        sweepLabel: String,
+        logHandler: @escaping (String) -> Void,
+        device: MTLDevice
+    ) async throws -> BenchmarkResult {
+        let mpsType = precision.mpsDataType
+        let elementSize = precision.elementSize
+        let B = dims.batch, M = dims.m, K = dims.k, N = dims.n
+        let L = max(dims.layers, 1)
+
+        logHandler("[GPU \(precision.rawValue)] Building native MPSNDArray GEMM (bypassing MPSGraph): \(dims.shortDescription)...")
+
+        guard let queue = device.makeCommandQueue() else {
+            throw BenchmarkError.commandQueueCreationFailed
+        }
+
+        func ndArray(_ dataType: MPSDataType, _ shape: [Int]) -> MPSNDArray {
+            let desc = MPSNDArrayDescriptor(dataType: dataType, shape: shape.map { NSNumber(value: $0) })
+            return MPSNDArray(device: device, descriptor: desc)
+        }
+        func fillND(_ arr: MPSNDArray, byteCount: Int, dataType: MPSDataType, magnitude: Float = 1.0) {
+            var data = createNonZeroData(byteCount: byteCount, dataType: dataType, magnitude: magnitude)
+            data.withUnsafeMutableBytes { raw in
+                if let base = raw.baseAddress { arr.writeBytes(base, strideBytes: nil) }
+            }
+        }
+
+        if Task.isCancelled { throw BenchmarkError.executionCancelled }
+
+        var effectiveLayers = L
+        var outputCount = 0
+        var finalDest: MPSNDArray! = nil
+        var dispatchBody: ((MTLCommandBuffer) -> Void)!
+
+        if precision.isFP8 {
+            guard #available(iOS 27.0, macOS 27.0, *) else {
+                throw BenchmarkError.executionFailed("FP8 requires iOS 27.0 / macOS 27.0 or newer.")
+            }
+            let lhs = ndArray(mpsType, [B, 1, M, K])
+            let rhs = ndArray(mpsType, [B, 1, K, N])
+            fillND(lhs, byteCount: B * M * K * elementSize, dataType: mpsType)
+            fillND(rhs, byteCount: B * K * N * elementSize, dataType: mpsType)
+            let destA = ndArray(mpsType, [B, 1, M, N])
+            let destB = ndArray(mpsType, [B, 1, M, N])
+            let mm = MPSNDArrayMatrixMultiplication(device: device, sourceCount: 2)
+            finalDest = (L % 2 == 1) ? destA : destB
+            outputCount = B * M * N
+            dispatchBody = { cb in
+                var cur = lhs
+                let pingPong = [destA, destB]
+                for layer in 0..<L {
+                    let dst = pingPong[layer % 2]
+                    mm.encode(to: cb, sourceArrays: [cur, rhs], destinationArray: dst)
+                    cur = dst
+                }
+            }
+        } else if mpsType == .int8 {
+            guard #available(iOS 18.0, macOS 15.0, *) else {
+                throw BenchmarkError.executionFailed("MPSNDArrayQuantizedMatrixMultiplication requires iOS 18.0 / macOS 15.0 or newer.")
+            }
+            let lhs = ndArray(.int8, [B, 1, M, K])
+            let rhs = ndArray(.int8, [B, 1, K, N])
+            fillND(lhs, byteCount: B * M * K, dataType: .int8)
+            fillND(rhs, byteCount: B * K * N, dataType: .int8)
+
+            let lhsScale = ndArray(.float16, [1, 1, 1, 1])
+            let lhsZero = ndArray(.int8, [1, 1, 1, 1])
+            let rhsScale = ndArray(.float16, [1, 1, 1, 1])
+            let rhsZero = ndArray(.int8, [1, 1, 1, 1])
+            var scaleBits = Float16(1.0 / 32.0).bitPattern
+            withUnsafeBytes(of: &scaleBits) { raw in
+                lhsScale.writeBytes(UnsafeMutableRawPointer(mutating: raw.baseAddress!), strideBytes: nil)
+                rhsScale.writeBytes(UnsafeMutableRawPointer(mutating: raw.baseAddress!), strideBytes: nil)
+            }
+            var zeroByte: Int8 = 0
+            withUnsafeBytes(of: &zeroByte) { raw in
+                lhsZero.writeBytes(UnsafeMutableRawPointer(mutating: raw.baseAddress!), strideBytes: nil)
+                rhsZero.writeBytes(UnsafeMutableRawPointer(mutating: raw.baseAddress!), strideBytes: nil)
+            }
+
+            let leftQuantDesc = MPSNDArrayAffineQuantizationDescriptor(dataType: .int8, hasZeroPoint: true, hasMinValue: false)
+            let rightQuantDesc = MPSNDArrayAffineQuantizationDescriptor(dataType: .int8, hasZeroPoint: true, hasMinValue: false)
+            let qmm = MPSNDArrayQuantizedMatrixMultiplication(
+                device: device,
+                leftQuantizationDescriptor: leftQuantDesc,
+                rightQuantizationDescriptor: rightQuantDesc
+            )
+            let dest = ndArray(.float16, [B, 1, M, N])
+            let sourceArrays: [MPSNDArray] = [lhs, rhs, lhsScale, lhsZero, rhsScale, rhsZero]
+            finalDest = dest
+            outputCount = B * M * N
+            effectiveLayers = 1
+            dispatchBody = { cb in
+                qmm.encode(to: cb, sourceArrays: sourceArrays, destinationArray: dest)
+            }
+            if L != 1 {
+                logHandler("[GPU \(precision.rawValue)] Note: native INT8-affine kernel cannot chain layers (dequantizes to float16 on every call) -- running L=1, not the configured L=\(L).")
+            }
+        } else {
+            let weightMag = Float(0.96 / sqrt(Double(max(K, 1))))
+            let lhs = ndArray(mpsType, [B, 1, M, K])
+            let rhs = ndArray(mpsType, [B, 1, K, N])
+            fillND(lhs, byteCount: B * M * K * elementSize, dataType: mpsType)
+            fillND(rhs, byteCount: B * K * N * elementSize, dataType: mpsType, magnitude: weightMag)
+            let destA = ndArray(mpsType, [B, 1, M, N])
+            let destB = ndArray(mpsType, [B, 1, M, N])
+            let mm = MPSNDArrayMatrixMultiplication(device: device, sourceCount: 2)
+            finalDest = (L % 2 == 1) ? destA : destB
+            outputCount = B * M * N
+            dispatchBody = { cb in
+                var cur = lhs
+                let pingPong = [destA, destB]
+                for layer in 0..<L {
+                    let dst = pingPong[layer % 2]
+                    mm.encode(to: cb, sourceArrays: [cur, rhs], destinationArray: dst)
+                    cur = dst
+                }
+            }
+        }
+
+        logHandler("[GPU \(precision.rawValue)] Warming up pipeline...")
+        guard let warmupCb = queue.makeCommandBuffer() else {
+            throw BenchmarkError.commandQueueCreationFailed
+        }
+        dispatchBody(warmupCb)
+        warmupCb.commit()
+        warmupCb.waitUntilCompleted()
+
+        if Task.isCancelled { throw BenchmarkError.executionCancelled }
+
+        logHandler("[GPU \(precision.rawValue)] Benchmarking \(iterations) iterations...")
+        let startNanos = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW)
+        var lastCb: MTLCommandBuffer? = nil
+        for i in 0..<iterations {
+            if Task.isCancelled { throw BenchmarkError.executionCancelled }
+            guard let cb = queue.makeCommandBuffer() else {
+                throw BenchmarkError.commandQueueCreationFailed
+            }
+            dispatchBody(cb)
+            cb.commit()
+            lastCb = cb
+            if (i + 1) % 5 == 0 { await Task.yield() }
+        }
+        lastCb?.waitUntilCompleted()
+        let endNanos = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW)
+
+        let durationSec = Double(endNanos - startNanos) / 1e9
+        let avgSec = durationSec / Double(iterations)
+        let avgMs = avgSec * 1000.0
+
+        let opsPerIter = 2.0 * Double(B) * Double(M) * Double(K) * Double(N) * Double(effectiveLayers)
+        let tops = opsPerIter / (avgSec * 1e12)
+
+        // INT8-affine's destination is always float16 (it dequantizes on write,
+        // 2 bytes/element), never the nominal 1-byte int8 `elementSize` --
+        // sizing the readback buffer off `elementSize` here previously
+        // under-allocated by half for this path and overflowed on readBytes.
+        let readbackType: MPSDataType = (mpsType == .int8) ? .float16 : mpsType
+        let readbackElementSize = (mpsType == .int8) ? 2 : elementSize
+        let outputByteCount = outputCount * readbackElementSize
+        let outBuf = UnsafeMutableRawPointer.allocate(byteCount: max(outputByteCount, 1), alignment: 16)
+        defer { outBuf.deallocate() }
+        finalDest.readBytes(outBuf, strideBytes: nil)
+        let zeroCount = countZeroElements(buffer: outBuf, elementCount: outputCount, dataType: readbackType)
+
+        if zeroCount == outputCount {
+            logHandler("[GPU \(precision.rawValue)] WARNING: 100% zero output (\(outputCount)/\(outputCount) elements) -- this is not a real measurement.")
+        }
+
+        let resultMsg = String(
+            format: "[GPU %@] (native) Avg: %.2f ms, Throughput: %.4f TOPS (L=%d), Zeros: %ld/%ld (%.1f%%)",
+            precision.rawValue, avgMs, tops, effectiveLayers,
+            zeroCount, outputCount,
+            outputCount > 0 ? Double(zeroCount) * 100.0 / Double(outputCount) : 0.0
+        )
+        logHandler(resultMsg)
+
+        return BenchmarkResult(
+            dimensions: dims,
+            precision: precision,
+            target: .gpu,
+            avgDurationMs: avgMs,
+            tops: tops,
+            iterations: iterations,
+            sweepType: sweepType,
+            sweepValue: sweepValue,
+            sweepLabel: sweepLabel,
+            zeroOutputCount: zeroCount,
+            outputElementCount: outputCount
+        )
+    }
+
     static func formatCompact(_ val: UInt64) -> String {
         if val >= 1_000_000 {
             return String(format: "%.2fM", Double(val) / 1_000_000.0)
