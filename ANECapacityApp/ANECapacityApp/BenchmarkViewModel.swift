@@ -33,7 +33,10 @@ final class BenchmarkViewModel: ObservableObject {
     @Published var customChannelSteps: [Int] = [32, 64, 128, 256, 384, 512]
     @Published var customSpatialSteps: [Int] = [64, 128, 256, 384, 512, 768]
     @Published var customDepthSteps: [Int] = [1, 5, 10, 20, 40, 60, 80, 100]
-    @Published var customMatMulSteps: [Int] = [128, 256, 512, 1024, 2048, 4096, 8192]
+    // 8192^3 is excluded: it trips a GPU watchdog reset on iPhone-class GPUs
+    // (command buffers discarded as "innocent victim"), and peak TOPS is
+    // already reached by 4096^3 on iPhone 17 Pro / iPhone 18 Pro anyway.
+    @Published var customMatMulSteps: [Int] = [128, 256, 512, 1024, 2048, 4096]
     
     // Benchmark execution state
     @Published var isRunning: Bool = false {
