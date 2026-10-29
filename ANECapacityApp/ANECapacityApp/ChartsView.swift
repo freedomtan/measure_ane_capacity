@@ -94,6 +94,16 @@ struct ChartsView: View {
                     selectedSweepFilter = first
                 }
             }
+            // onAppear alone races an autorun sweep: if this tab mounts (e.g.
+            // via -selectedTab 1 at launch) before the first result lands,
+            // availableSweeps is empty, the onAppear guard above no-ops, and
+            // selectedSweepFilter is stuck on the stale default forever since
+            // onAppear doesn't refire as results stream in later.
+            .onChange(of: viewModel.results.count) { _ in
+                if let first = availableSweeps.first, !availableSweeps.contains(selectedSweepFilter) {
+                    selectedSweepFilter = first
+                }
+            }
         }
     }
     

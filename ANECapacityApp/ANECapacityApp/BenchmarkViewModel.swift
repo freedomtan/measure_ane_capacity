@@ -355,7 +355,8 @@ final class BenchmarkViewModel: ObservableObject {
             self.isRunning = false
             self.statusMessage = "Benchmark completed."
             self.log("=== Benchmark Run Finished ===")
-            if ProcessInfo.processInfo.arguments.contains("--autorun") {
+            if ProcessInfo.processInfo.arguments.contains("--autorun")
+                && !ProcessInfo.processInfo.arguments.contains("--keep-open") {
                 try? await Task.sleep(nanoseconds: 500_000_000)
                 exit(0)
             }
