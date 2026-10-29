@@ -798,6 +798,14 @@ final class ANECapacityEngine {
             guard #available(iOS 27.0, macOS 27.0, *) else {
                 throw BenchmarkError.executionFailed("FP8 requires iOS 27.0 / macOS 27.0 or newer.")
             }
+            // MPSNDArrayMatrixMultiplication hard-aborts (uncatchable assertion
+            // failure, not a Swift error) on FP8 input/output on Apple9-family
+            // GPUs (A17 Pro/A18/A18 Pro). FP8 GEMM is only safe from Apple10
+            // (A19-gen) onward, so this must be checked before encode(), not
+            // just the OS version.
+            guard device.supportsFamily(.apple10) else {
+                throw BenchmarkError.executionFailed("Native FP8 GEMM is not supported on this GPU (requires Apple10 GPU family or newer).")
+            }
             let lhs = ndArray(mpsType, [B, 1, M, K])
             let rhs = ndArray(mpsType, [B, 1, K, N])
             fillND(lhs, byteCount: B * M * K * elementSize, dataType: mpsType)
