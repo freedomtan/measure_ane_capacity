@@ -41,7 +41,7 @@ All three devices run the same app build, same sweep, same day.
 | 2048³ | 1.82 | **1.73** | 0.225 |
 | 4096³ | 1.19 | 1.66 | **0.224** |
 
-![iPhone 16 Pro — FP16/FP8/INT8 throughput vs matrix size, all precisions overlaid in the app's Figures tab](images/iphone16pro_fp16_fp8_int8_figures.png)
+<img src="images/iphone16pro_fp16_fp8_int8_figures.png" width="320" alt="iPhone 16 Pro — FP16/FP8/INT8 throughput vs matrix size, all precisions overlaid in the app's Figures tab">
 
 *In-app screenshot (`--autorun --gpu --mps --all --sweep matmulDimensions`, Figures tab, "All Precisions"): FP16 and FP8 nearly overlap, FP8 edging slightly ahead purely because it's running the slower, differently-mapped MPSGraph fallback kernel (see "The A18 Pro wrinkle" below) — not real acceleration. INT8 stays near zero throughout.*
 
@@ -56,7 +56,7 @@ All three devices run the same app build, same sweep, same day.
 | 2048³ | **7.51** | 7.43 | 5.569 |
 | 4096³ | 7.33 | **7.42** | **5.836** |
 
-![iPhone 17 Pro — FP16/FP8/INT8 throughput vs matrix size, all precisions overlaid in the app's Figures tab](images/iphone17pro_fp16_fp8_int8_figures.png)
+<img src="images/iphone17pro_fp16_fp8_int8_figures.png" width="320" alt="iPhone 17 Pro — FP16/FP8/INT8 throughput vs matrix size, all precisions overlaid in the app's Figures tab">
 
 *FP16 and FP8 curves track each other almost exactly all the way to peak — the visual signature of "runs, but no hardware acceleration."*
 
@@ -71,7 +71,7 @@ All three devices run the same app build, same sweep, same day.
 | 2048³ | **10.78** | 20.57 | 8.142 |
 | 4096³ | 10.09 | **20.70** | **10.49** |
 
-![iPhone 18 Pro — FP16/FP8/INT8 throughput vs matrix size, all precisions overlaid in the app's Figures tab](images/iphone18pro_fp16_fp8_int8_figures.png)
+<img src="images/iphone18pro_fp16_fp8_int8_figures.png" width="320" alt="iPhone 18 Pro — FP16/FP8/INT8 throughput vs matrix size, all precisions overlaid in the app's Figures tab">
 
 *The FP8 curve visibly separates above FP16 across the whole sweep — this is what the ~2x claim looks like on the one generation where it's real.*
 
