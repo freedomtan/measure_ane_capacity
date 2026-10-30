@@ -849,11 +849,24 @@ static NSDictionary *gActiveLoadOpts = nil;
                 }
             }
         }
+        if (getenv("ANE_PMU_DEBUG")) {
+            fprintf(stderr, "[PMU_DEBUG] live performanceCounters dict has %lu keys; DMA keys present live: RW=%d READ=%d\n",
+                  (unsigned long)finalCounters.count,
+                  finalCounters[@"kANE_DMA_READWRITE_BYTES"] != nil,
+                  finalCounters[@"kANE_DMA_READ_BYTES"] != nil);
+        }
         if (perfCounterData && perfCounterData.length >= sizeof(uint64_t)) {
             const uint64_t *fRegs = (const uint64_t *)perfCounterData.bytes;
             size_t fCount = perfCounterData.length / sizeof(uint64_t);
+            if (getenv("ANE_PMU_DEBUG")) {
+                fprintf(stderr, "[PMU_DEBUG] raw perfCounterData has %lu uint64 slots (%lu bytes)\n", (unsigned long)fCount, (unsigned long)perfCounterData.length);
+            }
             for (size_t i = 0; i < fCount && i < 29; i++) {
                 NSString *regName = [self nameForPerfCounter:(int32_t)i];
+                if (getenv("ANE_PMU_DEBUG")) {
+                    fprintf(stderr, "[PMU_DEBUG] raw[%lu] name=%s value=%llu%s\n", (unsigned long)i, regName.UTF8String, fRegs[i],
+                          finalCounters[regName] ? " (SHADOWED by live dict, fallback skipped)" : " (USED as fallback)");
+                }
                 if (!finalCounters[regName]) {
                     finalCounters[regName] = @(fRegs[i]);
                 }
@@ -1381,8 +1394,18 @@ static NSArray<NSString *> *getANETempBaseDirectories(void) {
     }
     
     size_t numRegs = (d1 && d1.length >= sizeof(uint64_t)) ? MIN(d1.length / sizeof(uint64_t), (size_t)29) : 24;
+    if (getenv("ANE_PMU_DEBUG")) {
+        fprintf(stderr, "[PMU_DEBUG] d1.length=%lu numRegs=%lu live-finalCounters-keys=%lu DMA-live: RW=%d READ=%d\n",
+                (unsigned long)(d1 ? d1.length : 0), (unsigned long)numRegs, (unsigned long)finalCounters.count,
+                finalCounters[@"kANE_DMA_READWRITE_BYTES"] != nil, finalCounters[@"kANE_DMA_READ_BYTES"] != nil);
+    }
     for (size_t i = 0; i < numRegs; i++) {
         NSString *name = [self nameForPerfCounter:(int32_t)i];
+        if (getenv("ANE_PMU_DEBUG")) {
+            fprintf(stderr, "[PMU_DEBUG] raw[%lu] name=%s finalReg=%llu initReg=%llu%s\n",
+                    (unsigned long)i, name.UTF8String, finalRegs[i], initRegs[i],
+                    finalCounters[name] ? " (SHADOWED, fallback skipped)" : " (fallback USED)");
+        }
         if (!finalCounters[name]) {
             finalCounters[name] = @(finalRegs[i]);
         }

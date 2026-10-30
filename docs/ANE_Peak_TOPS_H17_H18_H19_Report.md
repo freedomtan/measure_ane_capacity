@@ -140,14 +140,41 @@ iPhone 18 Pro `DMA=+1.5 MB` — physically plausible — but iPhone 17 Pro repor
 number keeps growing into the gigabyte-to-petabyte range as size increases
 (`+18766197.8 MB` at 4096³). Whatever `kANE_DMA_READWRITE_BYTES`/
 `kANE_DMA_READ_BYTES` mean on H18 specifically, it isn't bytes-of-DMA-traffic
-at the same scale as H17/H19 — possibly a different PMU register
-layout/unit for this counter on that generation that the app doesn't account
-for. (`ALU Saturation` exceeding 100% at larger sizes on iPhone 18 Pro, e.g.
-`163.6%` at 2048³, is a second, smaller sign that these derived PMU-based
-metrics are approximate and shouldn't be over-trusted as literal hardware
-utilization.) Net result: the SRAM-spill hypothesis for the FP16 roll-off
-remains untested — the one counter that could have confirmed or killed it
-isn't trustworthy on the one device (H18) where the comparison matters most.
+at the same scale as H17/H19. (`ALU Saturation` exceeding 100% at larger
+sizes on iPhone 18 Pro, e.g. `163.6%` at 2048³, is a second, smaller sign that
+these derived PMU-based metrics are approximate and shouldn't be over-trusted
+as literal hardware utilization.) Net result: the SRAM-spill hypothesis for
+the FP16 roll-off remains untested — the one counter that could have
+confirmed or killed it isn't trustworthy on the one device (H18) where the
+comparison matters most.
+
+**Root-cause follow-up**: added a `ANE_PMU_DEBUG` env-var-gated diagnostic to
+`ANEClientBridge.mm`'s `profileANECIRBundleAtURL:` (the method
+`ANECapacityEngine.swift` actually calls for ANE PMU data — a separate,
+unrelated method earlier in the same file handles a different, CoreML-only
+code path and was a dead end first checked by mistake) that dumps, per raw
+register index, whether the value came from Apple's live-named
+`performanceCounters` dictionary or this app's index-based fallback table,
+plus the raw final/initial register values before any delta math. Run via
+`DEVICECTL_CHILD_ANE_PMU_DEBUG=1 xcrun devicectl device process launch
+--console ...` (the `DEVICECTL_CHILD_` prefix is `devicectl`'s documented way
+to set an env var in the launched process). Result: **this is not an app-side
+naming/indexing bug** — `kANE_DMA_READWRITE_BYTES` and `kANE_DMA_READ_BYTES`
+are present with those exact names in Apple's own live `performanceCounters`
+dictionary on iPhone 17 Pro (`DMA-live: RW=1 READ=1` in the debug dump), so no
+fallback guessing is involved. The raw absolute register values themselves
+are the anomaly: ~15 quadrillion and ~670 billion respectively, both clearly
+free-running accumulators rather than per-inference values. Checking whether
+the *delta* at least scales cleanly with either elapsed wall-time (ambient
+background-traffic theory) or workload size (unit-scale theory) across
+128³→1024³: it does neither cleanly (computed bytes-delta-per-ms across the
+four smallest sweep sizes: ~3.9M, 9.0M, 44.7M, 55.7M KB/ms — not flat, but not
+proportional to the ~8x MAC growth between steps either). Conclusion: this is
+a genuine hardware/firmware counter-semantics difference on H18 specifically
+— the value is real silicon telemetry, correctly named, but not validly
+interpretable as this inference's DMA byte count with the scale/attribution
+this app assumes. Further root-causing would need non-public documentation
+of this register's H18 encoding, which is out of scope here.
 
 ## Verification: `matmulDepth` and `matmulAsymmetric` on ANE
 
@@ -176,6 +203,8 @@ contradiction of them.
   iPhone 17 Pro and iPhone 18 Pro data; only iPhone 16 Pro was the genuinely
   missing data point there, and this report's GEMM numbers (not conv numbers)
   fill a different gap, not that one.
-- The PMU DMA-counter bug on iPhone 17 Pro (above) isn't root-caused — only
-  confirmed as a bug via cross-device comparison, not traced into
-  `ANEClientBridge`/the PMU key definitions to find why H18 differs.
+- The PMU DMA-counter anomaly on iPhone 17 Pro (above) is traced as far as
+  "real silicon register, correctly named, with H18-specific scale/semantics
+  this app doesn't account for" — it is not root-caused all the way to *why*
+  H18's encoding differs, which would need Apple's non-public register
+  documentation.
