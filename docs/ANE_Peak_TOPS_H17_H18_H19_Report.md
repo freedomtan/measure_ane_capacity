@@ -128,11 +128,29 @@ finding. (The companion GPU report's L2 SRAM framing in `matmulAsymmetric`'s
 sweep design is the closest existing investigation of this general class of
 effect, just not for ANE specifically.)
 
+**Attempted and abandoned**: tried to confirm the SRAM-spill hypothesis via
+the app's per-step PMU DMA counter (`ANECapacityEngine.swift`'s
+`dmaRwBytes = pmuCounters["kANE_DMA_READWRITE_BYTES"] + pmuCounters["kANE_DMA_READ_BYTES"]`,
+logged as `DMA=+... MB`) — if the hypothesis were right, DMA traffic should
+jump sharply at the same size FP16 rolls off. Instead this surfaced a
+separate, confirmed bug: **the DMA counter is nonsensical on iPhone 17 Pro**.
+At 128³ (16KB-scale tensors), iPhone 16 Pro reports `DMA=+406.2 KB` and
+iPhone 18 Pro `DMA=+1.5 MB` — physically plausible — but iPhone 17 Pro reports
+`DMA=+4825.4 MB` for the *identical* 128³ shape, a ~10,000x outlier, and the
+number keeps growing into the gigabyte-to-petabyte range as size increases
+(`+18766197.8 MB` at 4096³). Whatever `kANE_DMA_READWRITE_BYTES`/
+`kANE_DMA_READ_BYTES` mean on H18 specifically, it isn't bytes-of-DMA-traffic
+at the same scale as H17/H19 — possibly a different PMU register
+layout/unit for this counter on that generation that the app doesn't account
+for. (`ALU Saturation` exceeding 100% at larger sizes on iPhone 18 Pro, e.g.
+`163.6%` at 2048³, is a second, smaller sign that these derived PMU-based
+metrics are approximate and shouldn't be over-trusted as literal hardware
+utilization.) Net result: the SRAM-spill hypothesis for the FP16 roll-off
+remains untested — the one counter that could have confirmed or killed it
+isn't trustworthy on the one device (H18) where the comparison matters most.
+
 ## Gaps
 
-- The FP16-rolloff-at-4096³ pattern above is observed, not explained — no PMU
-  SRAM-residency counter was checked to confirm the working-set-spill
-  hypothesis.
 - This report only covers the GEMM-as-1×1-conv path (`matmulDimensions`
   sweep). The companion GPU report also smoke-tested `matmulDepth`/
   `matmulAsymmetric` on GPU; those weren't re-verified here for ANE target.
@@ -143,3 +161,6 @@ effect, just not for ANE specifically.)
   iPhone 17 Pro and iPhone 18 Pro data; only iPhone 16 Pro was the genuinely
   missing data point there, and this report's GEMM numbers (not conv numbers)
   fill a different gap, not that one.
+- The PMU DMA-counter bug on iPhone 17 Pro (above) isn't root-caused — only
+  confirmed as a bug via cross-device comparison, not traced into
+  `ANEClientBridge`/the PMU key definitions to find why H18 differs.
