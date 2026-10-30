@@ -149,11 +149,26 @@ utilization.) Net result: the SRAM-spill hypothesis for the FP16 roll-off
 remains untested — the one counter that could have confirmed or killed it
 isn't trustworthy on the one device (H18) where the comparison matters most.
 
+## Verification: `matmulDepth` and `matmulAsymmetric` on ANE
+
+Same follow-up as the companion GPU report: `runSingle`'s ANE-as-1×1-conv
+mapping triggers for any `dims.opType == .matmul` with `target == .ane`
+regardless of sweep type, so `matmulDepth` (fixed 1024³, `layers` 1–100) and
+`matmulAsymmetric` (fixed K=N=1024, `M` 512–8192) go through the same code
+path as `matmulDimensions`. Both were smoke-tested with `--all`
+(FP16+FP8+INT8) on all three devices — including iPhone 16 Pro, the case
+where FP8 silently falls back to GPU on every single step. All six runs
+(2 sweeps × 3 devices) completed with no crash, hang, or watchdog reset, exit
+code 0 throughout. Peak numbers from these runs (not independently
+interesting beyond "it works," since they're the same GEMM-as-1×1-conv path
+measured at fixed size/varying depth or fixed depth/varying M rather than a
+new shape): iPhone 18 Pro reached 47.9 TOPS FP8 / 48.1 TOPS INT8 at
+`matmulAsymmetric`'s `M=8192` step, both again far above its FP16 ceiling —
+consistent with the main `matmulDimensions` findings above, not a
+contradiction of them.
+
 ## Gaps
 
-- This report only covers the GEMM-as-1×1-conv path (`matmulDimensions`
-  sweep). The companion GPU report also smoke-tested `matmulDepth`/
-  `matmulAsymmetric` on GPU; those weren't re-verified here for ANE target.
 - Existing ANE conv (3×3, not 1×1-mapped-GEMM) peak-TOPS numbers already
   documented elsewhere in this repo (`ANE_H19_Theoretical_Peak_and_Winograd_FP8_Analysis.md`,
   `FP8_BENCHMARKING_AND_ANE_ARCHITECTURE.md`) were not re-run — they use a
