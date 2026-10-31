@@ -338,9 +338,9 @@ graph TD
 | `[18]` | `kANE_DMA_READ_BYTES` | Unified Memory Bus| Bytes read from Unified RAM (Input tensors + weights) |
 | `[19]` | `kANE_DPE_ENERGY` | Power Management | Free-running energy accumulator, **nanojoules (nJ)** on H18 — genuinely unpopulated (hard zero) on iPhone 16 Pro (H17); nonzero but slow/coarse-updating on an M6 Mac mini; see §8.1-8.4 |
 | `[20]` | `kANE_L2_NOMINAL_CYCLES` | L2 SRAM Bus | L2 controller operational nominal cycles |
-| **`[21]`** | **`kANE_L2PE_COMPUTE_CYCLES`** | **Planar Engine (PE)**| **Active vector ALU compute cycles (activations, pooling, casts)** |
+| **`[21]`** | **`kANE_L2PE_COMPUTE_CYCLES`** | **Planar Engine (PE)**| **Active vector ALU compute cycles — but coarse-cadence/frozen on sub-2s windows, see §9** |
 | `[22]` | `kANE_L2PE_INPUT_STALL_CYCLES`| Planar Engine (PE) | Planar Engine vector operand starvation stalls |
-| `[23]` | `kANE_L2PE_OUTPUT_STALL_CYCLES`| Planar Engine (PE) | Planar Engine result write-back stalls |
+| `[23]` | `kANE_L2PE_OUTPUT_STALL_CYCLES`| Planar Engine (PE) | Planar Engine result write-back stalls — same coarse-cadence caveat, see §9 |
 | `[24-28]`| `kANE_UNKNOWN` | Reserved / Internal | Hardware diagnostic and firmware telemetry registers |
 
 ### 8.1 Determining `kANE_DPE_ENERGY`'s unit (nanojoules)
@@ -533,3 +533,93 @@ would imply microwatt-scale ANE power (contradicted by this measurement), and
 a microjoule reading would imply kilowatt-scale ANE power (also contradicted).
 This is the first validation in this investigation that doesn't rely on any
 private/reverse-engineered API.
+
+## 9. `kANE_L2PE_COMPUTE_CYCLES` ([21]) and `kANE_L2PE_OUTPUT_STALL_CYCLES` ([23]): a second coarse-cadence counter pair
+
+Prompted by the independent `ane_pmu_profiler` report's M1-vs-M4 table (§8.3),
+where register `[23]` showed a comparably implausible M4 absolute value
+(35,423,785,983 "cycles" for a single sub-millisecond inference) alongside
+`[19]`'s own anomaly — worth checking whether the Planar/L2PE block shares
+`kANE_DPE_ENERGY`'s "coarse background tick" problem rather than being a
+clean per-inference cycle counter, since this repo's companion research
+(`ANE_Performance_PMU_Technical_Report.md` §5) leans on these two registers
+to explain ResNet-50 vs. MobileNetV2's Planar Engine efficiency difference.
+
+### 9.1 Within a single run, both registers are frozen
+
+Re-examined the original iPhone 17 Pro (H18) `ANE_PMU_DEBUG` dump from §8.1
+(matmulDimensions, 128³–4096³, L=20, 5 iterations, all 6 sizes in one process):
+
+| Size | `[21]` `kANE_L2PE_COMPUTE_CYCLES` Δ | `[23]` `kANE_L2PE_OUTPUT_STALL_CYCLES` Δ | Step duration (avgMs×5) |
+|---|---|---|---|
+| 128³ | 0 | 0 | 6.1 ms |
+| 256³ | 0 | 0 | 6.5 ms |
+| 512³ | 0 | 0 | 7.8 ms |
+| 1024³ | 0 | 0 | 20.65 ms |
+| 2048³ | 0 | 0 | 109.15 ms |
+| 4096³ | 0 | **81,920** | 1,532.6 ms |
+
+`[21]` never moves across any of the 6 steps, even the 1.5-second-long 4096³
+one. `[23]` is also frozen everywhere **except** the single longest step,
+where it finally shows a (tiny, relative to its own absolute scale of ~10^14)
+nonzero delta. Meanwhile the genuinely per-inference registers in the same
+dump — `[10]` `kANE_NE_NOMINAL_CYCLES`, `[13]` `kANE_NE_COMPUTE_CYCLES`, `[15]`
+`kANE_NE_OUTPUT_STALL_CYCLES` — scale cleanly with every single step,
+including the smallest 128³ one. So the sampling/decoding machinery is fine;
+it's specifically these two registers that don't respond on sub-second
+timescales.
+
+### 9.2 Confirmed again across 3 freshly spaced runs
+
+Re-ran matmulDimensions (128³–4096³, FP16, L=20, 3 iterations) on iPhone 17
+Pro three more times, each a fresh process launch spaced ~23s apart (same
+multi-run protocol that caught the `kANE_DPE_ENERGY`/M6 mistake in §8.4):
+
+```
+run 1: raw[21] finalReg=initReg=26,845,201,699
+run 2: raw[21] finalReg=initReg=26,845,201,699
+run 3: raw[21] finalReg=initReg=26,845,201,699
+```
+
+Identical across all three launches — `[21]` doesn't even move across
+*separate process launches* a few seconds apart, let alone within one. But
+it **is** a live counter, not a build-time constant: its absolute value today
+(26,845,201,699) differs from the value captured in the original §8.1 session
+hours earlier (25,711,562,514) on the same physical device. So `[21]` updates
+on a cadence coarser than anything this investigation's testing windows (up
+to ~1.5s within a run, ~23s between runs) can catch — plausibly on the order
+of minutes, or only on ANE driver re-initialization — while `[23]` sits one
+tier faster, catching occasional increments only on the longest (~1.5s)
+single steps.
+
+### 9.3 Implication for this repo's companion research
+
+`ANE_Performance_PMU_Technical_Report.md` §5.1 reports `[21]`
+(`kANE_L2PE_COMPUTE_CYCLES`) deltas of 963,072 (ResNet-50) and 139,568
+(MobilenetV2) "per iteration" on an M4, and uses the 6.9x difference between
+them as direct evidence of Planar Engine efficiency gains from *Linear
+Bottleneck* architectures (§5.2.B). Given this register was observed frozen
+across every single-digit-millisecond-to-1.5-second window tested on H18, a
+~0.6-1.4ms single-inference delta on M4 (per that report's own latency
+numbers) is very likely sampling the same kind of coarse-tick artifact, not a
+true per-inference Planar Engine cycle count. This doesn't necessarily mean
+that report's qualitative conclusion (depthwise convs use the Planar Engine
+less) is wrong — it means the *specific numbers* used to support it may not
+mean what they're presented as meaning, the same caveat already attached to
+`kANE_DMA_READWRITE_BYTES` (companion GPU/ANE reports) and `kANE_DPE_ENERGY`
+(§8 above) elsewhere in this investigation.
+
+### 9.4 Net conclusion
+
+`[19]` `kANE_DPE_ENERGY`, `[21]` `kANE_L2PE_COMPUTE_CYCLES`, and `[23]`
+`kANE_L2PE_OUTPUT_STALL_CYCLES` form a pattern: counters whose *absolute*
+values are real and change over long timescales, but whose *per-inference
+deltas* are frequently zero or artifactual on sub-2-second measurement
+windows — as opposed to the Convolution Engine block (`[10]`, `[13]`–`[16]`)
+and DMA block (`[17]`, `[18]`), which respond immediately and proportionally
+at every size tested, including the smallest. Any per-inference analysis
+using `[19]`, `[21]`, or `[23]` on H18 should first confirm the delta is
+actually nonzero and plausible for the specific workload duration involved —
+not assume it behaves like the Convolution Engine registers do. `[20]`
+`kANE_L2_NOMINAL_CYCLES` (the L2PE block's own clock/timebase register) was
+not separately investigated here and may warrant the same scrutiny.
