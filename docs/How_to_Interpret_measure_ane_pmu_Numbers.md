@@ -336,7 +336,7 @@ graph TD
 | `[16]` | `kANE_NE_KERNEL_STALL_CYCLES`| Pipeline Stall | Weight coefficient fetch stalls |
 | **`[17]`** | **`kANE_DMA_READWRITE_BYTES`** | **Unified Memory Bus**| **Total bytes transferred between Unified RAM and ANE over DMA** |
 | `[18]` | `kANE_DMA_READ_BYTES` | Unified Memory Bus| Bytes read from Unified RAM (Input tensors + weights) |
-| `[19]` | `kANE_DPE_ENERGY` | Power Management | Free-running energy accumulator, **nanojoules (nJ)** on H18 — see §8.1-8.3; scale not confirmed portable across ANE generations |
+| `[19]` | `kANE_DPE_ENERGY` | Power Management | Free-running energy accumulator, **nanojoules (nJ)** on H18 — but a hard zero on iPhone 16 Pro (H17) and an M6 Mac mini; see §8.1-8.4 |
 | `[20]` | `kANE_L2_NOMINAL_CYCLES` | L2 SRAM Bus | L2 controller operational nominal cycles |
 | **`[21]`** | **`kANE_L2PE_COMPUTE_CYCLES`** | **Planar Engine (PE)**| **Active vector ALU compute cycles (activations, pooling, casts)** |
 | `[22]` | `kANE_L2PE_INPUT_STALL_CYCLES`| Planar Engine (PE) | Planar Engine vector operand starvation stalls |
@@ -449,3 +449,37 @@ should **not** be assumed portable across ANE generations without re-deriving
 it per chip, exactly like the DMA counters. Apple's own register semantics for
 `[19]` (and possibly `[23]`) appear to change across H13g→H16g→H17→H18→H19 in
 ways this repo cannot fully explain without non-public documentation.
+
+### 8.4 Two more direct measurements: the register is a hard zero on two more chips
+
+Re-ran this app's own `ANE_PMU_DEBUG` dump (same matmulDimensions sweep,
+128³–4096³, FP16, L=20, 5 iterations) on two more devices to get first-party
+data points beyond H18:
+
+| Device | ANE gen | `kANE_DPE_ENERGY` across all 6 sizes |
+|---|---|---|
+| iPhone 16 Pro | H17 | `finalReg = initReg = 0` at every size — hard zero, never increments |
+| M6 Mac mini | (newer than H19) | `finalReg = initReg = 0` at every size (verified separately via `measure_ane_pmu --size/--channels` sweep, FP16/INT8/QDQ) — hard zero, never increments |
+
+This sharpens §8.3's conclusion considerably. It's not merely that the scale
+differs across generations — on **two separate chips** (one older than H18,
+one newer) the register simply never leaves zero, meaning it isn't populated
+by that silicon/firmware at all. Combined with the independent M1/M4 data in
+§8.3, the full known picture is:
+
+| Chip | ANE gen | `kANE_DPE_ENERGY` behavior |
+|---|---|---|
+| Apple M1 | H13g | nonzero, ~38 billion/inference (implausibly huge) |
+| Apple M4 | H16g | nonzero, ~121,869/inference (same order of magnitude as H18's deltas) |
+| iPhone 16 Pro | H17 | hard zero, always |
+| iPhone 17 Pro | H18 | nonzero, time-proportional, nJ-consistent (§8.1) |
+| M6 Mac mini | newer | hard zero, always |
+
+There's no clean monotonic story here (H17 zero, H18 populated, M6-newer zero
+again) — it looks less like a steady unit-scale drift and more like this
+counter being wired up, unwired, and rewired differently release to release,
+possibly tied to whether a given OS build's power daemon (`aned`/`powerd`)
+actively drives this specific register on that SoC. Treat any single-device
+reading of `kANE_DPE_ENERGY` as device/firmware-specific until proven
+otherwise on that exact chip — this is the most conservative honest summary
+this repo can give without Apple's internal register documentation.
