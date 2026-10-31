@@ -336,9 +336,63 @@ graph TD
 | `[16]` | `kANE_NE_KERNEL_STALL_CYCLES`| Pipeline Stall | Weight coefficient fetch stalls |
 | **`[17]`** | **`kANE_DMA_READWRITE_BYTES`** | **Unified Memory Bus**| **Total bytes transferred between Unified RAM and ANE over DMA** |
 | `[18]` | `kANE_DMA_READ_BYTES` | Unified Memory Bus| Bytes read from Unified RAM (Input tensors + weights) |
-| `[19]` | `kANE_DPE_ENERGY` | Power Management | Dynamic energy consumption metric (active with power daemon) |
+| `[19]` | `kANE_DPE_ENERGY` | Power Management | Free-running energy accumulator, units **nanojoules (nJ)** — see §8.1 for derivation |
 | `[20]` | `kANE_L2_NOMINAL_CYCLES` | L2 SRAM Bus | L2 controller operational nominal cycles |
 | **`[21]`** | **`kANE_L2PE_COMPUTE_CYCLES`** | **Planar Engine (PE)**| **Active vector ALU compute cycles (activations, pooling, casts)** |
 | `[22]` | `kANE_L2PE_INPUT_STALL_CYCLES`| Planar Engine (PE) | Planar Engine vector operand starvation stalls |
 | `[23]` | `kANE_L2PE_OUTPUT_STALL_CYCLES`| Planar Engine (PE) | Planar Engine result write-back stalls |
 | `[24-28]`| `kANE_UNKNOWN` | Reserved / Internal | Hardware diagnostic and firmware telemetry registers |
+
+### 8.1 Determining `kANE_DPE_ENERGY`'s unit (nanojoules)
+
+This register's unit was never documented anywhere Apple-side found in this repo's
+research, and the app never converted it to a physical unit before — it was only
+ever logged as a raw counter in `kANE_DPE_ENERGY`'s category ("Digital Power &
+Energy"). Root-caused empirically (iPhone 17 Pro, `ANE_PMU_DEBUG=1`, matmulDimensions
+sweep, 128³–4096³, L=20, 5 iterations) by taking the raw register delta
+(`finalReg - initReg`, before this app's own per-iteration averaging) at each size
+and comparing it against two candidate explanations:
+
+| Size | Δ`kANE_DPE_ENERGY` | Total elapsed (avgMs×5 iters) | Δ / elapsed ms |
+|---|---|---|---|
+| 128³ | 1,848,939 | 6.10 ms | 303,105 |
+| 256³ | 1,963,479 | 6.50 ms | 302,074 |
+| 512³ | 2,444,690 | 7.80 ms | 313,422 |
+| 1024³ | 27,359,536 | 20.65 ms | 1,324,868 |
+| 2048³ | 177,355,042 | 109.15 ms | 1,625,068 |
+| 4096³ | 2,364,058,200 | 1,532.60 ms | 1,542,798 |
+
+The delta tracks **elapsed time**, not workload size — it forms two clean plateaus
+(~300K/ms while latency-bound at 2–13% ALU saturation, ~1.3–1.6M/ms once
+compute-saturated at 54–89% ALU saturation) across a 27,000x range in GEMM size,
+and its ratio to `kANE_NE_NOMINAL_CYCLES`' own delta is flat (≈0.04–0.05) across
+every size tested. That is exactly the signature of a true energy accumulator
+under roughly constant average power, not a workload-proportional counter like
+`kANE_DMA_READWRITE_BYTES`.
+
+Treating the register as **nanojoules** and dividing by elapsed wall-clock time
+recovers an implied ANE power draw:
+
+| Size | Energy | Elapsed | Implied power |
+|---|---|---|---|
+| 128³ | 1.849 mJ | 6.10 ms | 0.30 W |
+| 512³ | 2.445 mJ | 7.80 ms | 0.31 W |
+| 1024³ | 27.36 mJ | 20.65 ms | 1.32 W |
+| 2048³ | 177.4 mJ | 109.2 ms | 1.63 W |
+| 4096³ | 2.364 J | 1,532.6 ms | 1.54 W |
+
+This is a physically sane curve for a mobile SoC's Neural Engine: ~0.3 W while
+idle/latency-bound, stepping up to ~1.3–1.6 W once compute-saturated. Picojoules
+would imply microwatt-scale power (impossible for an active compute engine);
+microjoules would imply kilowatt-scale power (impossible for a phone). Nanojoules
+is the only scale consistent with real ANE power envelopes, so:
+
+```
+average_power_watts = (Δ kANE_DPE_ENERGY in nJ) / (Δ wall_time in seconds) / 1e9
+```
+
+"DPE" most likely stands for Dynamic Power Estimate/Element, consistent with this
+table's original "active with power daemon" note. Caveat: this was derived on one
+device (iPhone 17 Pro / H18) and not cross-checked against an independent
+ground-truth power meter — it is the best fit among physically plausible unit
+scales, not an Apple-confirmed specification.
