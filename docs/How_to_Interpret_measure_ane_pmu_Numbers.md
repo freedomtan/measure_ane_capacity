@@ -483,3 +483,35 @@ actively drives this specific register on that SoC. Treat any single-device
 reading of `kANE_DPE_ENERGY` as device/firmware-specific until proven
 otherwise on that exact chip — this is the most conservative honest summary
 this repo can give without Apple's internal register documentation.
+
+### 8.5 Ground-truth validation via `powermetrics` on M6 Mac mini
+
+`kANE_DPE_ENERGY` reads a hard zero on M6 (§8.4), so it can't be checked
+directly there — but Apple's own documented, non-reverse-engineered
+`powermetrics` tool reports ANE power on any Apple Silicon Mac under its
+default sampler set (`ANE Power: ### mW`, no `--samplers` flag needed), which
+gives an independent way to sanity-check the *magnitude* (not the specific
+register) of real-world ANE power draw.
+
+Measured on M6 Mac mini while driving a sustained GEMM loop
+(`measure_matmul_universal --size 2048 --layers 20`, repeated back-to-back,
+`sudo powermetrics -i 200 -n 100`, 100 samples @ 200ms):
+
+| Metric | Value |
+|---|---|
+| Peak `ANE Power` | 17.47 W |
+| Mean while active (54/100 samples > 0.5 W) | 10.1 W |
+| Mean across all 100 samples (incl. idle gaps between invocations) | 5.5 W |
+
+This is an order of magnitude above the 0.3–1.6 W implied-power curve derived
+for iPhone 17 Pro in §8.1 — expected, since a Mac mini's ANE has a far larger
+thermal/power budget than a phone's battery- and heat-constrained one, and can
+sustain higher clocks under continuous load. The point isn't that the two
+numbers match — they shouldn't — it's that **both land in the same
+single-to-double-digit-watt regime**, nowhere near microwatt or kilowatt
+territory. That's exactly the scale that makes nanojoules the only physically
+sane unit for `kANE_DPE_ENERGY`'s raw ticks on H18 (§8.1): a picojoule reading
+would imply microwatt-scale ANE power (contradicted by this measurement), and
+a microjoule reading would imply kilowatt-scale ANE power (also contradicted).
+This is the first validation in this investigation that doesn't rely on any
+private/reverse-engineered API.
