@@ -336,7 +336,7 @@ graph TD
 | `[16]` | `kANE_NE_KERNEL_STALL_CYCLES`| Pipeline Stall | Weight coefficient fetch stalls |
 | **`[17]`** | **`kANE_DMA_READWRITE_BYTES`** | **Unified Memory Bus**| **Total bytes transferred between Unified RAM and ANE over DMA** |
 | `[18]` | `kANE_DMA_READ_BYTES` | Unified Memory Bus| Bytes read from Unified RAM (Input tensors + weights) |
-| `[19]` | `kANE_DPE_ENERGY` | Power Management | Free-running energy accumulator, units **nanojoules (nJ)** — see §8.1 for derivation |
+| `[19]` | `kANE_DPE_ENERGY` | Power Management | Free-running energy accumulator, **nanojoules (nJ)** on H18 — see §8.1-8.3; scale not confirmed portable across ANE generations |
 | `[20]` | `kANE_L2_NOMINAL_CYCLES` | L2 SRAM Bus | L2 controller operational nominal cycles |
 | **`[21]`** | **`kANE_L2PE_COMPUTE_CYCLES`** | **Planar Engine (PE)**| **Active vector ALU compute cycles (activations, pooling, casts)** |
 | `[22]` | `kANE_L2PE_INPUT_STALL_CYCLES`| Planar Engine (PE) | Planar Engine vector operand starvation stalls |
@@ -396,3 +396,56 @@ table's original "active with power daemon" note. Caveat: this was derived on on
 device (iPhone 17 Pro / H18) and not cross-checked against an independent
 ground-truth power meter — it is the best fit among physically plausible unit
 scales, not an Apple-confirmed specification.
+
+### 8.2 Direct binary evidence from `ANECompiler.framework`
+
+Searched the extracted dyld shared cache (`ANECompiler`, `AppleNeuralEngine`,
+`ANEServices`, `ANEClientSignals` — macOS 18F/18D) for corroborating strings:
+
+- `ANECompiler` contains a static cost-model CSV header (used by the compiler's
+  own internal performance *estimator*, not the live runtime PMU) listing, among
+  other fields: `...,mem_access_energy_in_joule,mem_access_power_in_watt,...`.
+  This confirms Apple's own convention is to express energy in **joules** and
+  power in **watts** when a field name states its unit explicitly — and the
+  `_in_joule` suffix (rather than just `mem_access_energy`) implies the
+  underlying raw value is *not already* joule-scaled and needs conversion,
+  consistent with a raw register in a joule sub-unit (nJ) rather than joules
+  directly. This is suggestive, not conclusive — it documents the compiler's
+  static simulator vocabulary, not `kANE_DPE_ENERGY`'s live hardware semantics.
+- `AppleNeuralEngine` contains the string `Error: Oplayer %s could not set DPE.`
+  alongside the `kANE_DPE_ENERGY` string itself, confirming "DPE" names a real,
+  distinct, per-oplayer-configurable hardware/firmware concept (consistent with
+  "Dynamic Power Estimator/Estimate"), not an arbitrary debug label.
+
+### 8.3 Cross-generation caveat (independent corroboration of a scale mismatch)
+
+A separate, independent reverse-engineering project
+(`/Users/freedom/work/ios-hacking/ane_pmu_profiler`, `ANE_Performance_PMU_Technical_Report.md`)
+measured `kANE_DPE_ENERGY`'s calibrated per-inference delta (same two-phase
+warm-up/baseline-subtraction protocol as this app's) for the **identical**
+ResNet-50 FP16 model on two ANE generations:
+
+| Device | ANE gen | `kANE_DPE_ENERGY` Δ/inference |
+|---|---|---|
+| Apple M1 | H13g | 38,393,741,721 |
+| Apple M4 | H16g | 121,869 |
+
+A ~315,000x gap for the same model is not explainable by any real energy
+difference — it is the same class of problem this report's companion
+(`docs/ANE_Peak_TOPS_H17_H18_H19_Report.md`) already found and root-caused for
+`kANE_DMA_READWRITE_BYTES`/`kANE_DMA_READ_BYTES` on iPhone 17 Pro (H18): **this
+register's raw scale/semantics are not consistent across ANE hardware
+generations.** The same independent report's register `[23]`
+(`kANE_L2PE_OUTPUT_STALL_CYCLES`) shows a comparably implausible M4 value
+(35,423,785,983 "cycles" for one inference — tens of seconds at GHz clocks for
+a sub-millisecond op), suggesting whatever causes `[19]` and `[23]` to misbehave
+is a shared quirk, not isolated to one register.
+
+**Net conclusion**: the nanojoule interpretation and the implied-power sanity
+check in §8.1 hold *self-consistently within one device/generation* (iPhone 17
+Pro / H18) — the two-plateau, time-proportional pattern and the resulting
+0.3–1.6 W power curve are real and internally coherent. But the unit/scale
+should **not** be assumed portable across ANE generations without re-deriving
+it per chip, exactly like the DMA counters. Apple's own register semantics for
+`[19]` (and possibly `[23]`) appear to change across H13g→H16g→H17→H18→H19 in
+ways this repo cannot fully explain without non-public documentation.
