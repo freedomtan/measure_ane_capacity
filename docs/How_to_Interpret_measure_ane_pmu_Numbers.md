@@ -707,6 +707,38 @@ the cross-unit tax as output-stall cycles do — consistent with compute being
 largely local to each unit's own data while writeback/stall synchronization
 is exactly where a bonded-network cost would show up.
 
+### 9.5.2 iPhone 16 Pro (H17) vs. iPhone 17 Pro (H18): the older chip updates faster
+
+This data was already sitting in the two original matmulDimensions dumps
+(`/tmp/dpe_run_16pro.log` for H17 in §8.4, `/tmp/dpe_run.log` for H18 in
+§9.1) — no new device access needed, just re-reading `[21]`/`[23]` instead
+of only `[19]`:
+
+| Size | Window (avgMs×5) | H17 `[21]` Δ | H17 `[23]` Δ | H18 `[21]` Δ | H18 `[23]` Δ |
+|---|---|---|---|---|---|
+| 128³ | 6.3–6.1ms | 23,040 | 19,823,734,764 | 0 | 0 |
+| 256³ | 3.65–6.5ms | 51,200 | 49,177,698,526 | 0 | 0 |
+| 512³ | 6.4–7.8ms | 204,800 | 284,857,993,487 | 0 | 0 |
+| 1024³ | 23.3–20.65ms | 13,107,200 | 1,556,017,223,680 | 0 | 0 |
+| 2048³ | 132.1–109.15ms | 131,072,000 | 17,300,393,822,502 | 0 | 0 |
+| 4096³ | 1,957.2–1,532.6ms | 1,782,579,200 | 157,451,733,977,054 | 0 | 81,920 |
+
+This is the opposite of the naive assumption that newer silicon would have
+better-behaved telemetry: **H17 (one generation older) updates `[21]`/`[23]`
+at every single size tested, including the fastest 3.65ms window, while H18
+needs the workload to stretch past ~1.5s before either register moves at
+all.** H17's deltas aren't perfectly workload-proportional either (step-to-
+step ratios for `[21]` across the six sizes: 2.2x, 4.0x, 64x, 10.0x, 13.6x —
+not the clean ~8x-per-doubling a cubic GEMM would imply), so this isn't a
+claim that H17's L2PE telemetry is *fully* trustworthy as a precise
+per-inference metric — but it is unambiguously finer-grained/faster-updating
+than H18's, which is itself a real, useful, and previously undocumented
+cross-generation difference. Combined with §9.4's M6 cross-check, the
+emerging picture is that this coarse-cadence behavior is chip/firmware-
+specific in both direction and degree — not a simple "gets coarser with each
+new generation" trend — so each new chip checked should be measured fresh
+rather than assumed to follow a pattern from the previous one.
+
 ### 9.6 Net conclusion
 
 `[19]` `kANE_DPE_ENERGY`, `[21]` `kANE_L2PE_COMPUTE_CYCLES`, and `[23]`
