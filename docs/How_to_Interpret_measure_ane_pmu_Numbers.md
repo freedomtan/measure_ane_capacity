@@ -683,6 +683,30 @@ absolute register value across chips; (3) compare *ratios between two
 workloads measured on the same chip*, and only trust `[21]`-based ratios,
 not `[23]`-based ones, until further validated.
 
+### 9.5.1 A hardware-topology reason `[23]` might genuinely differ, not just be noisy
+
+M4 has a single ANE unit with 4 MiB of on-chip L2 SRAM. M6 is reported to
+combine **two** ANE units, each with its own 4 MiB L2 (8 MiB total), bonded
+together over an inter-unit network so they present as one larger logical
+ANE. This reframes the `[23]` (`kANE_L2PE_OUTPUT_STALL_CYCLES`) ratio
+mismatch in §9.5 (16.3x on M4 vs. 36.9x on M6 for the same 4x channel
+increase): rather than concluding `[23]` is simply unreliable, the extra
+stall overhead on M6 could be **real inter-ANE-unit bonded-network traffic**
+that M4's single-unit topology has no equivalent of — e.g. work partitioned
+across two physically separate L2 blocks needing cross-unit synchronization
+that scales super-linearly with channel count as more of the tensor spans
+both units. If true, `[23]`'s larger ratio on M6 isn't an artifact to
+discard, it's a real, interesting architectural signal about the cost of
+M6's bonded two-unit design — but this repo has no independent way to
+confirm that attribution (no access to per-unit telemetry, no way to force
+a workload onto a single bonded half) and it should be treated as a
+plausible hypothesis contributed from the M4/M6 hardware topology, not a
+proven mechanism. `[21]`'s much closer ratio (15.5x vs. 19.1x) would, under
+this same hypothesis, suggest Planar *compute* cycles don't pay as much of
+the cross-unit tax as output-stall cycles do — consistent with compute being
+largely local to each unit's own data while writeback/stall synchronization
+is exactly where a bonded-network cost would show up.
+
 ### 9.6 Net conclusion
 
 `[19]` `kANE_DPE_ENERGY`, `[21]` `kANE_L2PE_COMPUTE_CYCLES`, and `[23]`
