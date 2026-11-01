@@ -1345,7 +1345,21 @@ static NSArray<NSString *> *getANETempBaseDirectories(void) {
     if (res.meanLatencyMs > 0.0) {
         res.throughputFps = 1000.0 / res.meanLatencyMs;
     }
-    
+
+    // Optional idle settle delay before reading the final PMU snapshot --
+    // tests whether a coarse-cadence counter ticks purely on elapsed wall time
+    // (even with no further ANE dispatch) vs. only while actively dispatching.
+    const char *settleEnv = getenv("ANE_PMU_SETTLE_SECONDS");
+    if (settleEnv) {
+        double settleSeconds = atof(settleEnv);
+        if (settleSeconds > 0.0) {
+            if (getenv("ANE_PMU_DEBUG")) {
+                fprintf(stderr, "[PMU_DEBUG] settling %.2fs before final PMU snapshot (ANE_PMU_SETTLE_SECONDS)\n", settleSeconds);
+            }
+            usleep((useconds_t)(settleSeconds * 1e6));
+        }
+    }
+
     // Final registers & stats
     _ANEPerformanceStats *finalPerfStats = req.perfStats;
     if (finalPerfStats && [finalPerfStats respondsToSelector:@selector(hwExecutionTime)]) {

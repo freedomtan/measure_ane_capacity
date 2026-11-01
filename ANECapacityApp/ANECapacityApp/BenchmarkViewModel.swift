@@ -131,6 +131,12 @@ final class BenchmarkViewModel: ObservableObject {
                     customChannelSteps = parts
                 }
             }
+            if let mIdx = args.firstIndex(of: "--matmul-sizes"), mIdx + 1 < args.count {
+                let parts = args[mIdx + 1].split(separator: ",").compactMap { Int($0.trimmingCharacters(in: .whitespaces)) }
+                if !parts.isEmpty {
+                    customMatMulSteps = parts
+                }
+            }
             if let itIdx = args.firstIndex(of: "--iterations"), itIdx + 1 < args.count, let it = Int(args[itIdx + 1]) {
                 iterations = it
             }

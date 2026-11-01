@@ -739,6 +739,43 @@ specific in both direction and degree — not a simple "gets coarser with each
 new generation" trend — so each new chip checked should be measured fresh
 rather than assumed to follow a pattern from the previous one.
 
+### 9.5.3 Idle-wait test: the tick needs activity, not just elapsed wall time
+
+§9.5/§9.5.2 established that `[21]`/`[23]` need long *busy* windows (seconds
+of actual dispatched ANE work) to move. The natural next question: would the
+same elapsed time pass with the ANE sitting *idle* instead? If these are
+simply a periodic background-daemon timer, idle time should count the same
+as busy time. If they're gated on NE pipeline activity, it shouldn't.
+
+Added an env-var-gated settle delay to `ANEClientBridge.mm`'s
+`profileANECIRBundleAtURL:` (`ANE_PMU_SETTLE_SECONDS`, read via `getenv`,
+`usleep`'d *after* the benchmark loop finishes but *before* the final PMU
+snapshot is read) and a `--matmul-sizes` CLI override on `BenchmarkViewModel`
+(comma-separated list, same pattern as the existing `--channels` flag) so a
+single GEMM size can be tested in isolation without running the whole
+128³–4096³ sweep. Ran iPhone 17 Pro with `ANE_PMU_SETTLE_SECONDS=3`,
+`--matmul-sizes 1024`, FP16, 3 iterations:
+
+```
+[PMU_DEBUG] settling 3.00s before final PMU snapshot (ANE_PMU_SETTLE_SECONDS)
+[PMU_DEBUG] raw[10] kANE_NE_NOMINAL_CYCLES    finalReg=13423143515616 initReg=13422822289152  (Δ=321,226,464 — real, from the benchmark itself)
+[PMU_DEBUG] raw[21] kANE_L2PE_COMPUTE_CYCLES  finalReg=26851180758    initReg=26851180758     (Δ=0)
+[PMU_DEBUG] raw[23] kANE_L2PE_OUTPUT_STALL_CYCLES finalReg=129736886107080 initReg=129736886107080 (Δ=0)
+```
+
+`[10]` (a genuinely per-dispatch register) correctly reflects the 3 real
+GEMM iterations, latched before the 3-second idle wait began — proving the
+settle delay didn't corrupt anything. But `[21]`/`[23]` are **still exactly
+frozen** after those 3 idle seconds, even though §9.1 showed `[23]` *did*
+move during a comparable-duration (~1.5s) span of continuous busy GEMM
+dispatch. This rules out a simple periodic wall-clock timer as the
+mechanism: **elapsed time alone isn't sufficient — the tick appears gated on
+sustained NE pipeline activity**, not just the clock. The exact activity
+threshold (how much dispatched work, not just how much time) wasn't
+isolated further here, but "idle time doesn't count the same as busy time"
+is itself a concrete, useful constraint on any future hypothesis about this
+counter family's actual update mechanism.
+
 ### 9.6 Net conclusion
 
 `[19]` `kANE_DPE_ENERGY`, `[21]` `kANE_L2PE_COMPUTE_CYCLES`, and `[23]`
