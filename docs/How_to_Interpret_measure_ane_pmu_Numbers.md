@@ -609,7 +609,23 @@ mean what they're presented as meaning, the same caveat already attached to
 `kANE_DMA_READWRITE_BYTES` (companion GPU/ANE reports) and `kANE_DPE_ENERGY`
 (§8 above) elsewhere in this investigation.
 
-### 9.4 Net conclusion
+### 9.4 Cross-check on M6 Mac mini: same pattern, not H18-specific
+
+Ran `measure_ane_pmu --size 256 --channels 512 --iterations 10 --verbose-pmu`
+on M6. The FP16 variant (336.9 ms/iter × 10 iterations ≈ 3.37s measurement
+window — longer than any single H18 step in §9.1) showed real, large, nonzero
+deltas for both registers: `[21]` Δ=14,651,592,355,297, `[23]`
+Δ=67,331,737,600. This is consistent with — not contradicting — the
+coarse-cadence model: H18's `[23]` only moved at its single longest (~1.5s)
+step; M6's ~3.4s window is long enough that both registers caught at least
+one tick. (The same run's INT8 variant hung during ANE compilation and had to
+be killed after a 30s timeout — a separate, already-documented M6 ANE-compile
+stall unrelated to this register investigation, see the earlier
+`measure_matmul_universal --size 4096` compile-hang note in this session.)
+So this isn't an H18 idiosyncrasy — the same slow-tick behavior for `[21]`/
+`[23]` shows up on a completely different chip generation too.
+
+### 9.5 Net conclusion
 
 `[19]` `kANE_DPE_ENERGY`, `[21]` `kANE_L2PE_COMPUTE_CYCLES`, and `[23]`
 `kANE_L2PE_OUTPUT_STALL_CYCLES` form a pattern: counters whose *absolute*
