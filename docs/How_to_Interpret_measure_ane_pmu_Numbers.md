@@ -625,7 +625,65 @@ stall unrelated to this register investigation, see the earlier
 So this isn't an H18 idiosyncrasy — the same slow-tick behavior for `[21]`/
 `[23]` shows up on a completely different chip generation too.
 
-### 9.5 Net conclusion
+### 9.5 A more reasonable M4-vs-M6 comparison, now that the coarse-cadence issue is known
+
+The obvious follow-up: now that we know `[21]`/`[23]` need a long-enough
+window to give a real (not single-tick-artifact) reading, can M4 and M6 be
+compared more fairly than the M1-vs-M4 table in §8.3 managed? (M1 wasn't
+reachable to re-test this session.)
+
+**Step 1 — confirm the reading is real, not luck.** Ran the identical conv
+workload (`--size 256 --channels 512 --iterations 30`, FP16) twice on each
+machine:
+
+| Chip | Run 1 `[21]` Δ/iter | Run 2 `[21]` Δ/iter | Run 1 `[23]` Δ/iter | Run 2 `[23]` Δ/iter |
+|---|---|---|---|---|
+| M4 | 163,020,800 | 163,020,800 (exact) | 61,660,854,154,592 | 61,621,705,002,134 (±0.06%) |
+| M6 | 14,228,329,798,593 | 14,039,176,112,607 (±1.3%) | 65,087,346,346 | 65,190,245,818 (±0.16%) |
+
+Both chips reproduce tightly within a single workload — this is real signal,
+not tick noise, on *either* chip at these window lengths (M4: ~3.3s for 30
+iterations; M6: ~10s for 30 iterations, since M6's per-iteration latency here
+is ~3x M4's).
+
+**Step 2 — the absolute values still aren't comparable.** `[21]`'s
+per-iteration value is ~14 trillion on M6 vs. ~163 million on M4 for the
+*identical* workload — an **~87,000x gap**. This is the same class of
+cross-generation register-scale mismatch already documented for
+`kANE_DPE_ENERGY` (§8.3's M1-vs-M4 ~315,000x gap) and `kANE_DMA_READWRITE_BYTES`
+(iPhone 17 Pro). Raw `[21]`/`[23]` values must never be compared directly
+across chip generations.
+
+**Step 3 — but within-chip ratios hold up, at least for `[21]`.** Repeated
+the same workload at `--channels 128` (4x fewer channels) on both machines
+and took the ratio against the `--channels 512` result above:
+
+| Register | M4 ratio (ch512 / ch128) | M6 ratio (ch512 / ch128) |
+|---|---|---|
+| `[21]` `kANE_L2PE_COMPUTE_CYCLES` | 163,020,800 / 10,494,464 = **15.5x** | 14,228,329,798,593 / 746,059,510,352 = **19.1x** |
+| `[23]` `kANE_L2PE_OUTPUT_STALL_CYCLES` | ~61.5T / 3,761,026,322,907 = **16.3x** | ~65.1B / 1,765,859,840 = **36.9x** |
+
+`[21]`'s ratio is in the same ballpark on both chips (15.5x vs. 19.1x for a
+4x channel increase) despite the ~87,000x absolute-scale gap — meaning
+`[21]` genuinely does respond to workload size in a roughly consistent way
+on *both* chips, so a **within-chip ratio** (e.g. workload A's `[21]` ÷
+workload B's `[21]`, both measured on the same machine) is a defensible way
+to compare architectural behavior across M4 and M6, even though the raw
+numbers themselves are not. `[23]` does **not** hold up the same way (16.3x
+vs. 36.9x — not close) — treat `[23]`-based ratios as unreliable even when
+`[21]`-based ones are usable, likely because output-stall cycles are more
+sensitive to chip-specific memory/congestion behavior than planar compute
+cycles are.
+
+**Practical recipe for any future M4-vs-M6 (or any cross-generation) `[21]`
+comparison**: (1) pick a window long enough that two repeated runs of the
+same workload agree within a few percent (§9.4's reproducibility check,
+not merely "one run completed without error"); (2) never compare the raw
+absolute register value across chips; (3) compare *ratios between two
+workloads measured on the same chip*, and only trust `[21]`-based ratios,
+not `[23]`-based ones, until further validated.
+
+### 9.6 Net conclusion
 
 `[19]` `kANE_DPE_ENERGY`, `[21]` `kANE_L2PE_COMPUTE_CYCLES`, and `[23]`
 `kANE_L2PE_OUTPUT_STALL_CYCLES` form a pattern: counters whose *absolute*
