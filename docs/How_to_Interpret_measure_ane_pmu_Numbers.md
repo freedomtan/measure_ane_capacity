@@ -769,12 +769,45 @@ settle delay didn't corrupt anything. But `[21]`/`[23]` are **still exactly
 frozen** after those 3 idle seconds, even though §9.1 showed `[23]` *did*
 move during a comparable-duration (~1.5s) span of continuous busy GEMM
 dispatch. This rules out a simple periodic wall-clock timer as the
-mechanism: **elapsed time alone isn't sufficient — the tick appears gated on
-sustained NE pipeline activity**, not just the clock. The exact activity
-threshold (how much dispatched work, not just how much time) wasn't
-isolated further here, but "idle time doesn't count the same as busy time"
-is itself a concrete, useful constraint on any future hypothesis about this
-counter family's actual update mechanism.
+mechanism: elapsed time alone isn't sufficient — but §9.5.4 below shows
+"sustained activity" isn't the right refinement either.
+
+### 9.5.4 Cumulative busy time isn't the trigger either — it's single-dispatch duration
+
+Tested whether *cumulative* busy time (many small dispatches back-to-back,
+same total duration as the one big dispatch that worked) could substitute
+for one long single dispatch. Checked for thermal throttling confounds
+along the way, since sustaining the ANE at high utilization for several
+seconds was a reasonable concern raised before running this.
+
+Ran `--matmul-sizes 1024` (same shape repeated, not growing) at increasing
+iteration counts on iPhone 17 Pro:
+
+| Iterations | Total busy window | `[21]` Δ | `[23]` Δ | Clock | Cumulative DMA |
+|---|---|---|---|---|---|
+| 450 | 1.35s (3.00ms/iter) | 0 | 0 | 1.94 GHz | 402,088.6 MB |
+| 1000 | 3.13s (3.13ms/iter) | 0 | 0 | 1.83 GHz | 375,134.8 MB |
+
+Both frozen — **even 3.13 continuous seconds of busy dispatch** doesn't tick
+either register, despite moving far more cumulative data (375 GB total DMA)
+than the single 4096³ step in §9.1 that *did* tick `[23]` (only ~611 MB
+total, over a ~1.5–2s window). This rules out both "cumulative busy time"
+and "cumulative bytes moved" as the trigger. What's left standing: the tick
+appears to require a **single dispatch** whose own individual duration
+exceeds some threshold (the one case that worked, 4096³, took ~300–400ms for
+*one* GEMM call; repeating a 3ms dispatch 1000 times never produces a single
+call anywhere near that length) — not cumulative activity across many short
+calls. This is consistent with a hardware/firmware design where the counter
+is latched or flushed once per command-buffer/queue-depth event rather than
+on any periodic or cumulative-activity basis.
+
+On the thermal question this test was originally meant to check: no
+dramatic throttling signature. Clock dipped modestly across the two
+back-to-back runs (1.94 → 1.83 GHz, ~6%) and `[11]`/`[12]` grew in
+proportion to normal DVFS idle-throttle accounting, not a sudden spike — so
+these short (1–3s) bursts don't appear to be hitting real thermal limits on
+this device, and the frozen `[21]`/`[23]` readings above aren't explained by
+a throttling-induced measurement artifact.
 
 ### 9.6 Net conclusion
 
