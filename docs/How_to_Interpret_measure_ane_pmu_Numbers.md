@@ -336,7 +336,7 @@ graph TD
 | `[16]` | `kANE_NE_KERNEL_STALL_CYCLES`| Pipeline Stall | Weight coefficient fetch stalls |
 | **`[17]`** | **`kANE_DMA_READWRITE_BYTES`** | **Unified Memory Bus**| **Total bytes transferred between Unified RAM and ANE over DMA** |
 | `[18]` | `kANE_DMA_READ_BYTES` | Unified Memory Bus| Bytes read from Unified RAM (Input tensors + weights) |
-| `[19]` | `kANE_DPE_ENERGY` | Power Management | Free-running energy accumulator, **nanojoules (nJ)** on H18 — genuinely unpopulated (hard zero) on iPhone 16 Pro (H17); nonzero but slow/coarse-updating on an M6 Mac mini; see §8.1-8.4 |
+| `[19]` | `kANE_DPE_ENERGY` | Power Management | Free-running energy accumulator, **nanojoules (nJ)** on H18 — genuinely unpopulated (hard zero) on iPhone 16 Pro (H17); nonzero but slow/coarse-updating on an M6 Mac mini; intermittently nonzero on iPhone 18 Pro (H19); see §8.1-8.4, §9.5.2.1 |
 | `[20]` | `kANE_L2_NOMINAL_CYCLES` | L2 SRAM Bus | L2 controller operational nominal cycles |
 | **`[21]`** | **`kANE_L2PE_COMPUTE_CYCLES`** | **Planar Engine (PE)**| **Active vector ALU compute cycles — but coarse-cadence/frozen on sub-2s windows, see §9** |
 | `[22]` | `kANE_L2PE_INPUT_STALL_CYCLES`| Planar Engine (PE) | Planar Engine vector operand starvation stalls |
@@ -738,6 +738,39 @@ emerging picture is that this coarse-cadence behavior is chip/firmware-
 specific in both direction and degree — not a simple "gets coarser with each
 new generation" trend — so each new chip checked should be measured fresh
 rather than assumed to follow a pattern from the previous one.
+
+### 9.5.2.1 iPhone 18 Pro (H19): a third, distinct pattern
+
+Once iPhone 18 Pro was available, re-ran the same matmulDimensions sweep
+(128³–4096³, FP16, L=20, 5 iterations) there too, extending the per-register
+behavior to all three register, not just `[19]`/`[21]`/`[23]` on H17/H18:
+
+| Size | Window (avgMs×5) | `[19]` Δ | `[21]` Δ | `[23]` Δ |
+|---|---|---|---|---|
+| 128³ | 7.05ms | 0 | 54,602,582,006 | 0 |
+| 256³ | 6.0ms | 1,066 | 54,331,589,172 | 1,684,408 |
+| 512³ | 10.05ms | 55,282 | 223,549,779,063 | 734,648 |
+| 1024³ | 13.7ms | 0 | 1,026,227,677,049 | 0 |
+| 2048³ | 66.45ms | 0 | 7,573,441,659,827 | 0 |
+| 4096³ | 738.7ms | 0 | 52,532,989,953,753 | 40,960 |
+
+H19 matches neither H17 nor H18's pattern — it's a third, distinct
+behavior:
+
+- `[21]` moves at **every** size, like H17's fast-cadence behavior — not
+  frozen the way H18's `[21]` was.
+- `[19]` and `[23]` are **intermittent**: nonzero at 256³/512³ (and `[23]`
+  also at 4096³), but exactly zero at 128³, 1024³, and 2048³ — neither
+  H17's "always live" nor H18's "frozen except the single longest step"
+  pattern. (§8.1's H18 nJ-energy derivation does not apply here — H19's
+  `[19]` deltas are too sparse and non-monotonic in step-to-step magnitude
+  to support a comparable time-proportionality argument without a lot more
+  data.)
+
+Three adjacent chip generations (H17, H18, H19), three different behaviors
+for the same three registers. This reinforces §9.5.2's conclusion even more
+strongly: there is no simple directional trend (older/newer, coarser/finer)
+to extrapolate from — each chip genuinely needs to be measured on its own.
 
 ### 9.5.3 Idle-wait test: the tick needs activity, not just elapsed wall time
 
