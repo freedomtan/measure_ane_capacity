@@ -620,32 +620,72 @@ voltage-states1, voltage-states5, voltage-states8, voltage-states9, ...
 SoC Stats, Performance States, Cluster Power States, Energy Model
 ```
 
-This is a completely different mechanism than a live energy-accumulator
-register: `powermetrics` queries the IORegistry/IODeviceTree node for each
-physical ANE instance (`/arm-io/ane0`, `/arm-io/ane1`, ... — explaining the
-literal `ANE0`/`ANE1` per-instance format strings, which lines up with M6's
-two bonded ANE units) for (a) **DVFS state residency** — how much time was
-spent at each performance/frequency state (the same kind of "busy time"
-accounting IOKit tracks natively for every `IOService`; `ioreg -n ane0 -l`
-shows exactly this kind of counter on the `ane0` node) and (b) the chip's
-static **`voltage-states*` characterization table** (frequency ↔ voltage
-pairs baked into the device tree at manufacturing time, never changes at
-runtime). It then computes:
+**Correction (from disassembling the actual arm64e binary, not just its
+strings):** the residency/voltage-states-table hypothesis above is wrong.
+Extracting the arm64e slice (`lipo -thin arm64e`) and disassembling it
+(`otool -tV`) around the exact instruction that formats `"ANE %u Power:
+%0.0f mW\n"` shows this:
 
 ```
-ANE Power ≈ Σ_states (residency_fraction_at_state × power_at_that_voltage/frequency_state)
+d0 = ucvtf([x27, #0x88])        // energy_raw, an unsigned 64-bit counter
+                                 // (dumped elsewhere, verbatim, as
+                                 // <key>ane_energy</key><integer>%llu</integer> —
+                                 // no scaling, i.e. this *is* the plain mJ value)
+d1 = ucvtf([global, #0x698])    // TimebaseScale (mach_timebase_info numer/denom,
+                                 // runtime-populated — reads as 0 in the static file)
+d2 = [struct, #0x8]             // IntervalRaw (elapsed ticks between samples)
+d1 = d2 * d1                    // IntervalRaw * TimebaseScale
+d1 = d1 / 1000000000.0          // -> elapsed seconds (the constant 1e9 is read
+                                 // directly out of the binary at file offset 0xf2b0)
+d0 = d0 / d1                    // Power(mW) = energy_raw(mJ) / elapsed_seconds
 ```
 
-i.e. a **residency-weighted average over a static per-chip power model**,
-not a readback of any live joule/milliwatt accumulator. This explains why
-none of this investigation's attempts to find a live "ANE energy register"
-(`kANE_DPE_ENERGY`, the `IOReport "Energy Model"` group) reproduced
-`powermetrics`' numbers — it isn't reading an accumulator at all. It's
-multiplying a (reliable, fine-grained, IOKit-native) duty-cycle counter by a
-(static, always-correct-by-construction) power table. Which also explains
-why it's trustworthy where everything else in this investigation wasn't:
-duty-cycle/residency counters are a much more mature, universally-relied-on
-IOKit primitive than the private ANE PMU block this whole document is about.
+And critically: **the CPU Power and GPU Power print sites use the identical
+template**, against their own Energy Model channels (confirmed by
+disassembling the `"GPU Power: %0.0f mW\n"` and `"CPU Power: %0.0f mW\n"`
+call sites too — same four-instruction shape, same shared `1e9` constant).
+So the formula is universal across subsystems:
+
+```
+Power(mW) = ΔEnergy (mJ, from IOReport group "Energy Model", channel "ANE"/"GPU"/"CPU")
+            ─────────────────────────────────────────────────────────────────────────
+            Δt (seconds, from mach_absolute_time between samples)
+```
+
+That's just **Energy / Time** — no DVFS-residency-weighted average, no
+voltage-states table lookup. The `voltage-states*` properties and the
+`ANE %u SW active residency` / `ANE %u SW frequency` text lines are real,
+but they come from a *separate* DVFS-state-ticks array used only for the
+residency/frequency reporting, not for the Power number. The `ane_power.c`
+source-file string and `voltage-states*` property names were a red herring
+from reading strings in isolation; the actual Power computation is the
+exact same `IOReport "Energy Model"` channel this document already tested
+in §8.6 — the one found to be real but **decoupled from short deliberate
+workloads**.
+
+This closes the loop on the whole investigation: `powermetrics`' "ANE
+Power" is sourced from the identical class of coarse-cadence energy counter
+every other mechanism in this document ran into. It isn't more
+fundamentally reliable — it just happens, on chips/workloads where the
+Energy Model channel updates, to average over `powermetrics`' own sampling
+interval (so a `-i 1000` run smooths over exactly the kind of short-burst
+blind spot this document's L2PE investigation found).
+
+**M4 Mac mini confirmation.** On this machine, both sides agree and both
+read as "nothing," not "zero": our own reimplementation
+(`/Users/freedom/work/test-ioreport/ane_power.m`, which subscribes to
+`IOReportCopyChannelsInGroup(@"Energy Model", ...)`, takes two samples
+across a `mach_absolute_time`-measured interval, and divides) read `ANE:
+energy delta = 0 (mJ)` even across a 40-second sustained GEMM load. Real
+`sudo powermetrics --samplers ane_power -i 1000 -n 2` run concurrently with
+an active GEMM load printed **no ANE section at all** — not even a `0 mW`
+line. That matches the disassembly: the per-ANE-instance print loop is
+gated behind a count field (how many physical ANE dies `powermetrics`
+thinks exist) that's apparently `0` on this M4 Mac mini, so the whole
+section is skipped. This is the same per-chip-divergence pattern as every
+other register in this document (hard zero on some chips, real-but-coarse
+on others) — just manifesting one layer up, at the `powermetrics`/IOReport
+level instead of the private PMU register level.
 
 ## 9. `kANE_L2PE_COMPUTE_CYCLES` ([21]) and `kANE_L2PE_OUTPUT_STALL_CYCLES` ([23]): a second coarse-cadence counter pair
 
