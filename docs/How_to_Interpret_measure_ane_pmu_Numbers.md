@@ -702,6 +702,95 @@ array to compute the Power number — those are two entirely separate
 reporting paths within the same print function. This removes any remaining
 doubt from the hand-disassembly version of this finding above.
 
+### 8.8 Retraction: the "decoupled from short workloads" claim above was wrong — it's a private entitlement, not a coarse counter
+
+Having fully reverse-engineered the formula, the natural next step was to
+actually *implement* it as a standalone tool
+(`/Users/freedom/work/test-ioreport/ane_power.m`): subscribe to the
+`"Energy Model"` IOReport group, take two samples a known interval apart,
+divide the delta by the elapsed time. It compiled and ran — and read
+`0 mJ` delta, every time, across every test: 1s windows, 40s windows,
+persistent long-lived subscriptions instead of fresh ones each run, with
+`sudo`, with the `"SoC Stats"/"Cluster Power States"` and
+`"SoC Stats"/"PMGR Counters"` groups also actively subscribed alongside
+it. Meanwhile `sudo powermetrics --samplers ane_power,cpu_power -i 1000`
+run concurrently against the exact same real ANE load
+(`./measure_conv` in a loop) printed clearly live, volatile, per-second
+`ANE Power` numbers (765 mW, 2217 mW, 5243 mW, 6728 mW, ...). Both
+processes were reading the literal same channel — confirmed by attaching
+`lldb` to the running, privileged `powermetrics` process
+(`sudo lldb -p $(pgrep -n powermetrics)`), breaking on
+`IOReportSimpleGetIntegerValue`, and calling
+`po (id)IOReportChannelGetChannelName((void*)$x0)` at the stop: it printed
+the bare channel name `"ANE"`, and the raw absolute value read at that
+exact breakpoint (`83705152`) was in the identical ~80–84 million range our
+own tool's absolute-value probes had been tracking all session.
+
+So: same process API, same channel, same group, same formula — yet one
+process sees it move and the other doesn't, even as root. That ruled out
+every API-usage hypothesis tried earlier (subscription lifetime, auxiliary
+group side effects, sampler-flag combinations). The actual answer:
+
+```
+$ codesign -d --entitlements - /usr/bin/powermetrics
+[Dict]
+  com.apple.private.applegraphicsdevicecontrol  = true
+  com.apple.private.clpc.reporting              = true
+  com.apple.private.pmgr.nrg.reporting          = true   <-- this one
+  com.apple.system-task-ports.inspect           = true
+```
+
+`powermetrics` carries the private entitlement
+**`com.apple.private.pmgr.nrg.reporting`** ("nrg" = energy). This is an
+Apple-signing-authority-only entitlement — no amount of `sudo`/root
+privilege can grant it to an arbitrary binary under normal code-signing
+rules, because the kernel/driver checks the calling process's actual
+entitlement set, not its UID. Without it, `IOReportCreateSamples` on this
+specific group apparently still returns *something* (a dictionary with
+the right shape, same channel names, same `(mJ)` unit label) but the
+underlying value is a frozen/placeholder snapshot rather than a live
+read — which is why every absolute-value probe this session saw the same
+number stay fixed for seconds-to-minutes at a time and only crawl upward
+very slowly across the whole session (67.5M → 74.4M → 80.8M → 81.5M →
+83.7M mJ), which was genuinely misleading and led to the wrong "coarse,
+workload-decoupled accumulator" conclusion in §8.6/the earlier part of
+this section. That conclusion is **retracted**: the channel is not
+coarse — it was never unlocked for our process in the first place.
+
+**Confirmed by closing the loop**: this machine has SIP disabled
+(`csrutil status` → disabled), which relaxes enough of the normal
+entitlement enforcement that a locally ad-hoc-signed binary can actually
+carry Apple-private entitlements:
+
+```
+$ codesign -s - --entitlements ane_power.entitlements -f ane_power_v3
+$ ./ane_power_v3_signed 1 12   # (while ./measure_conv is looping)
+[sample 0]  ANE: energy delta = 5980 (mJ) over 1.016s -> Power = 5886.8 mW
+[sample 1]  ANE: energy delta = 8057 (mJ) over 1.014s -> Power = 7945.6 mW
+[sample 2]  ANE: energy delta = 7213 (mJ) over 1.018s -> Power = 7087.5 mW
+...
+```
+
+where `ane_power.entitlements` is just:
+```xml
+<key>com.apple.private.pmgr.nrg.reporting</key><true/>
+<key>com.apple.private.clpc.reporting</key><true/>
+```
+
+Once signed with that entitlement, our own clean-room reimplementation —
+the exact same ~80 lines of code that had read `0 mJ` every single time
+before — immediately started reading real, live, second-to-second ANE
+energy deltas, matching `powermetrics`' own volatility pattern. **This is
+the actual, complete, and now fully working answer to "implement what
+powermetrics does to get ANE Power": it's genuinely just `ΔEnergy/Δt` off
+a public-looking IOReport API, gated behind a private entitlement that
+only matters if you're not Apple — and that gate, not any coarse hardware
+cadence, is why every unprivileged/root (but unentitled) attempt earlier
+in this document read zero.** On a normal Mac with SIP enabled, this
+self-signing trick would not work, and `powermetrics` (or something
+carrying an equivalent Apple-provisioned entitlement) would remain the
+only way to read this value live.
+
 This closes the loop on the whole investigation: `powermetrics`' "ANE
 Power" is sourced from the identical class of coarse-cadence energy counter
 every other mechanism in this document ran into. It isn't more
