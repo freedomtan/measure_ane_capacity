@@ -663,6 +663,45 @@ exact same `IOReport "Energy Model"` channel this document already tested
 in §8.6 — the one found to be real but **decoupled from short deliberate
 workloads**.
 
+**Full decompilation (Ghidra), not just hand-traced disassembly, confirms
+this exactly.** `/Users/freedom/work/ghidra` was available locally, so
+rather than relying only on manual register tracing, the arm64e slice was
+imported into Ghidra headless (`analyzeHeadless ... -postScript
+DecompileAll.java`) and every function decompiled to C. The relevant
+functions name every piece unambiguously:
+
+```c
+// FUN_10000326c -- the IOReportIterate callback for the ANE Energy Model channel
+undefined4 FUN_10000326c(long param_1, undefined8 param_2) {
+  ...
+  uVar2 = _IOReportSimpleGetIntegerValue(param_2, 0);   // <- raw IOReport sample value
+  DAT_10001c4a8[idx] = uVar2;                           // <- this becomes "ane_energy"
+  ...
+}
+
+// FUN_100002af0 -- called right before each sample is taken
+void FUN_100002af0(void) {
+  if (DAT_10001c088 == '\x01') {
+    DAT_10001c698 = _mach_absolute_time();              // <- the Power formula's denominator
+  }
+  ...
+}
+
+// FUN_1000026c8 -- the printer (the function hand-traced in the box above)
+NEON_ucvtf(DAT_10001c4a8[idx]);     // ucvtf(ane_energy)
+NEON_ucvtf(DAT_10001c698);          // ucvtf(mach_absolute_time-derived elapsed value)
+pcVar4 = "ANE %u Power: %0.0f mW\n";
+```
+
+So the full call chain, by name rather than by inference: `ane_energy` is
+populated *directly* from `IOReportSimpleGetIntegerValue()` on the "Energy
+Model" group's ANE channel sample, and the Power denominator is populated
+*directly* from `mach_absolute_time()`. There is no code path anywhere in
+this binary that reads a `voltage-states*` property or a DVFS-residency
+array to compute the Power number — those are two entirely separate
+reporting paths within the same print function. This removes any remaining
+doubt from the hand-disassembly version of this finding above.
+
 This closes the loop on the whole investigation: `powermetrics`' "ANE
 Power" is sourced from the identical class of coarse-cadence energy counter
 every other mechanism in this document ran into. It isn't more
