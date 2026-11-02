@@ -791,29 +791,90 @@ self-signing trick would not work, and `powermetrics` (or something
 carrying an equivalent Apple-provisioned entitlement) would remain the
 only way to read this value live.
 
-This closes the loop on the whole investigation: `powermetrics`' "ANE
-Power" is sourced from the identical class of coarse-cadence energy counter
-every other mechanism in this document ran into. It isn't more
-fundamentally reliable — it just happens, on chips/workloads where the
-Energy Model channel updates, to average over `powermetrics`' own sampling
-interval (so a `-i 1000` run smooths over exactly the kind of short-burst
-blind spot this document's L2PE investigation found).
+(Earlier drafts of this section claimed the `ane_power,cpu_power` sampler
+combo mattered and that the counter was simply coarse/workload-decoupled.
+Both of those were wrong guesses made before the entitlement was found —
+see §8.8 above for the retraction, and §8.9 below for an even better,
+fully unprivileged alternative that was found after this.)
 
-**M4 Mac mini confirmation.** On this machine, both sides agree and both
-read as "nothing," not "zero": our own reimplementation
-(`/Users/freedom/work/test-ioreport/ane_power.m`, which subscribes to
-`IOReportCopyChannelsInGroup(@"Energy Model", ...)`, takes two samples
-across a `mach_absolute_time`-measured interval, and divides) read `ANE:
-energy delta = 0 (mJ)` even across a 40-second sustained GEMM load. Real
-`sudo powermetrics --samplers ane_power -i 1000 -n 2` run concurrently with
-an active GEMM load printed **no ANE section at all** — not even a `0 mW`
-line. That matches the disassembly: the per-ANE-instance print loop is
-gated behind a count field (how many physical ANE dies `powermetrics`
-thinks exist) that's apparently `0` on this M4 Mac mini, so the whole
-section is skipped. This is the same per-chip-divergence pattern as every
-other register in this document (hard zero on some chips, real-but-coarse
-on others) — just manifesting one layer up, at the `powermetrics`/IOReport
-level instead of the private PMU register level.
+### 8.9 A better answer: fully unprivileged live energy, via `AppleCLPC`'s undocumented "CLPC" IOReport channels
+
+The entitlement workaround in §8.8 only works because this machine has
+SIP disabled — on a normal Mac it would be a dead end, since self-signing
+cannot grant an Apple-private entitlement under full SIP enforcement. The
+user pointed at a genuinely better answer: the `clpc.rs` module of
+[vladkens/macmon](https://github.com/vladkens/macmon), an open-source
+`powermetrics`-alternative CLI, which reads live CPU/GPU/ANE energy with
+**zero entitlements and zero sudo**.
+
+The trick: `AppleCLPC` (the CLPC/"Core Performance Level Controller"
+driver — the same `AppleCLPC` IOKit service seen earlier in this document
+at `pmgr/clpc/AppleCLPC`, `CFBundleIdentifier =
+"com.apple.driver.AppleT6041CLPC"` on this M4 Mac mini) exposes its own,
+*separate* set of per-subsystem energy counters under IOReport group
+`"CLPC"`, subgroup `"Energy Counters"`, unit **nanojoules** — a completely
+different group from the entitlement-gated `"Energy Model"` group this
+whole document had been focused on. Critically, these `CLPC` channels:
+
+- Are **not discoverable** via `IOReportCopyChannelsInGroup(@"CLPC",
+  @"Energy Counters", ...)` — there is no public legend entry for them at
+  all, so the normal "ask IOReport what channels exist" pattern used
+  throughout this document finds nothing.
+- Require knowing each channel's full 64-bit ID *in advance*: a
+  macOS-major-version-specific table index (`24` for ANE, `16` for CPU,
+  `25` for GPU, on macOS 27.x) combined via `(index << 32) | key` with a
+  per-chip-driver 32-bit hex key that macmon extracted by (per its own
+  `docs/clpc-discovery.md`) analyzing each `AppleT*CLPC` kext across macOS
+  versions. For this M4 Mac mini's `AppleT6041CLPC`:
+  `cpu=0x263cf1f0, gpu=0x22e4cf59, ane=0x7849fb5c`.
+- Once you know the ID, you don't look the channel up — you **construct a
+  synthetic `CFDictionary` channel descriptor by hand** (there's no API
+  that takes just an ID) with the exact binary field layout IOReport
+  expects (`IOReportTypes.h`'s packed format: `channelType = 1 | (2<<16) |
+  (1<<32)` for "Simple format, power category, 1 element";
+  `unit = (3<<56) | (118<<32)` for nJ), tag it with
+  `DriverName="AppleCLPC"`, `IOReportGroupName="CLPC"`,
+  `IOReportSubGroupName="Energy Counters"`, and `DriverID` set to the
+  `AppleCLPC` service's actual `IORegistryEntryID` (`0x100000468` here,
+  from `ioreg -c AppleCLPC`) — then hand that fabricated dictionary
+  straight to `IOReportCreateSubscription`, exactly as if it had come from
+  a real legend lookup.
+
+Implemented as `/Users/freedom/work/test-ioreport/ane_power.m` (now the
+primary tool in that directory; the entitlement-based version moved to
+`ane_power_entitled.m` for comparison). No `codesign`, no `sudo`, built
+with a completely ordinary `clang` invocation
+(`codesign -d --entitlements -` on the resulting binary shows an empty
+entitlement set). Tested against the same `measure_conv` loop used
+throughout this investigation:
+
+```
+[sample 0] group=CLPC CPU Energy: delta = 907309458 (nJ) -> Power = 901.73 mW
+[sample 0] group=CLPC GPU Energy: delta = 715700222 (nJ) -> Power = 711.30 mW
+[sample 0] group=CLPC ANE:        delta = 7377127225 (nJ) -> Power = 7331.75 mW
+[sample 1] group=CLPC ANE:        delta = 2761051 (nJ)    -> Power = 2.75 mW
+[sample 2] group=CLPC ANE:        delta = 5125536998 (nJ) -> Power = 5118.38 mW
+...
+```
+
+Real, live, per-second-responsive, correctly alternating between a near-
+idle floor (~2.8 mW) and multi-watt bursts in sync with `measure_conv`'s
+own duty cycle — with zero privilege escalation of any kind.
+
+**Net conclusion, superseding §8.7/§8.8**: there isn't one single "how
+powermetrics gets ANE Power" story — there are at least two independent,
+differently-gated IOReport sources for essentially the same measurement
+(`"Energy Model"`, entitlement-gated; `"CLPC"/"Energy Counters"`,
+unprivileged but undiscoverable-by-name), and `powermetrics` itself
+appears to prefer whichever is available (macmon's own code comments says
+as much: *"entitlement. Prefer readable CLPC counters, including valid
+idle zeroes. Drivers with unknown CLPC IDs need the legacy sources; ANE
+can use PMP."* — implying a fallback chain of CLPC → Energy Model → PMP
+bandwidth-based proxy, in roughly that preference order). The actual
+arithmetic (`Energy/Time`) was correct all along; what took the rest of
+this session to find was *which* IOReport channel to point it at, and
+that the "obvious" one found via normal, documented discovery APIs happens
+to be the privileged one.
 
 ## 9. `kANE_L2PE_COMPUTE_CYCLES` ([21]) and `kANE_L2PE_OUTPUT_STALL_CYCLES` ([23]): a second coarse-cadence counter pair
 
