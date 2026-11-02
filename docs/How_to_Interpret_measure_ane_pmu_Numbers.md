@@ -876,6 +876,34 @@ this session to find was *which* IOReport channel to point it at, and
 that the "obvious" one found via normal, documented discovery APIs happens
 to be the privileged one.
 
+**Cross-chip confirmation on `mac-mini-m6.local` (M6, bonded dual-ANE).**
+`ioreg -c AppleCLPC -r -l` there shows `CFBundleIdentifier =
+"com.apple.driver.AppleT8152CLPC"` — a chip macmon's static table already
+has an entry for (`cpu=0x485d4bfc, gpu=0x1178_4654, ane=0x9380c6bb`), so
+the only change needed was swapping those four constants (and the
+`AppleCLPC` service's own `IORegistryEntryID`, `0x100000550` on this
+machine) into the same unprivileged `ane_power.m` from the M4 Mac mini —
+no other code changes. Built clean, no entitlement, no `sudo`. Against a
+real `measure_ane_pmu --size 2048 --iterations 50` load:
+
+```
+[sample 1]  group=CLPC ANE: delta = 21377051433 (nJ) over 1.010s -> Power = 21158.01 mW
+[sample 2]  group=CLPC ANE: delta = 21302515427 (nJ) over 1.011s -> Power = 21068.89 mW
+[sample 4]  group=CLPC ANE: delta = 19896995261 (nJ) over 1.006s -> Power = 19776.70 mW
+...
+```
+
+10–21 W, matching the independent `powermetrics` ground-truth validation
+from earlier in this document (§8.5: peak 17.47 W, active-mean ~10.1 W
+under sustained GEMM load on this same M6). So the unprivileged
+`"CLPC"/"Energy Counters"` technique isn't an M4-only accident — it
+generalizes across chip generations exactly the way macmon's own
+per-bundle-identifier table implies it should, as long as the target
+chip's `AppleT*CLPC` bundle is one macmon has already reverse-engineered
+(a growing but finite list; a brand-new, not-yet-catalogued chip would
+need its own `(index, key)` triple extracted the same way macmon did,
+which is out of scope for this document).
+
 ## 9. `kANE_L2PE_COMPUTE_CYCLES` ([21]) and `kANE_L2PE_OUTPUT_STALL_CYCLES` ([23]): a second coarse-cadence counter pair
 
 Prompted by the independent `ane_pmu_profiler` report's M1-vs-M4 table (§8.3),
