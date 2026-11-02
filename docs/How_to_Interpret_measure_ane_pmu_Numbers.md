@@ -598,6 +598,55 @@ alternative to the private PMU register" path, but doesn't open a new one;
 all its caveats) remain the only working options found in this
 investigation.
 
+### 8.7 So what *does* `powermetrics` actually use for "ANE Power"?
+
+`otool -L /usr/bin/powermetrics` shows it links two private libraries
+specifically for this purpose: `libpmenergy.dylib` (exports only
+`pm_energy_impact`/`pm_energy_impact_internal`) and `libpmsample.dylib`
+(per-process/per-task sampling, `pm_sample_*`). Neither alone explains the
+system-wide "ANE Power" line, so the real logic is inside the
+`powermetrics` binary itself. `strings -a /usr/bin/powermetrics` reveals the
+actual mechanism:
+
+```
+ane_power.c
+IODeviceTree:/arm-io/ane%u
+ane-id, die-id, die-ane-id
+ANE0, ANE1, ANE%u, ANE%u_%u
+ANE %u SW active residency: %6.2f%%
+ANE %u SW frequency: %0.0f MHz
+ANE %u Power: %0.0f mW
+voltage-states1, voltage-states5, voltage-states8, voltage-states9, ...
+SoC Stats, Performance States, Cluster Power States, Energy Model
+```
+
+This is a completely different mechanism than a live energy-accumulator
+register: `powermetrics` queries the IORegistry/IODeviceTree node for each
+physical ANE instance (`/arm-io/ane0`, `/arm-io/ane1`, ... — explaining the
+literal `ANE0`/`ANE1` per-instance format strings, which lines up with M6's
+two bonded ANE units) for (a) **DVFS state residency** — how much time was
+spent at each performance/frequency state (the same kind of "busy time"
+accounting IOKit tracks natively for every `IOService`; `ioreg -n ane0 -l`
+shows exactly this kind of counter on the `ane0` node) and (b) the chip's
+static **`voltage-states*` characterization table** (frequency ↔ voltage
+pairs baked into the device tree at manufacturing time, never changes at
+runtime). It then computes:
+
+```
+ANE Power ≈ Σ_states (residency_fraction_at_state × power_at_that_voltage/frequency_state)
+```
+
+i.e. a **residency-weighted average over a static per-chip power model**,
+not a readback of any live joule/milliwatt accumulator. This explains why
+none of this investigation's attempts to find a live "ANE energy register"
+(`kANE_DPE_ENERGY`, the `IOReport "Energy Model"` group) reproduced
+`powermetrics`' numbers — it isn't reading an accumulator at all. It's
+multiplying a (reliable, fine-grained, IOKit-native) duty-cycle counter by a
+(static, always-correct-by-construction) power table. Which also explains
+why it's trustworthy where everything else in this investigation wasn't:
+duty-cycle/residency counters are a much more mature, universally-relied-on
+IOKit primitive than the private ANE PMU block this whole document is about.
+
 ## 9. `kANE_L2PE_COMPUTE_CYCLES` ([21]) and `kANE_L2PE_OUTPUT_STALL_CYCLES` ([23]): a second coarse-cadence counter pair
 
 Prompted by the independent `ane_pmu_profiler` report's M1-vs-M4 table (§8.3),
