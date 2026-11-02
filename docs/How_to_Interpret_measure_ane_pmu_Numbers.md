@@ -534,6 +534,70 @@ a microjoule reading would imply kilowatt-scale ANE power (also contradicted).
 This is the first validation in this investigation that doesn't rely on any
 private/reverse-engineered API.
 
+### 8.6 A public(ish) alternative, tried and found dead: `IOReport`'s "Energy Model" group
+
+Since `kANE_DPE_ENERGY` is a private, reverse-engineered register, it's
+worth asking whether Apple's own `IOReport` API (a public framework,
+`libIOReport.dylib`, the same mechanism `powermetrics` itself uses
+internally) exposes a cleaner, documented-unit ANE energy channel directly.
+It does list one: `IOReportCopyChannelsInGroup(@"Energy Model", ...)`
+surfaces a channel literally named `ANE`, reported in `mJ` by the driver
+itself (`AppleT6041PMGR`) — no unit-guessing required, unlike `kANE_DPE_ENERGY`.
+
+Tested on M4 (local machine) with a small custom tool
+(`test_ane_energy_delta.m`, using `IOReportCreateSamplesDelta` to take two
+samples within one subscription — the correct way to get a delta, since two
+separate process launches each start a fresh subscription and can't diff
+against each other) while a sustained GEMM loop ran concurrently, with
+`sudo` (required — unprivileged reads returned all zeros outright):
+
+```
+AppleT6041PMGR: Energy Model: CPU Energy: 0 (mJ)
+AppleT6041PMGR: Energy Model: ANE: 0 (mJ)
+AppleT6041PMGR: Energy Model: GPU: 0 (mJ)
+...
+AGXAcceleratorG16X: Energy Model: GPU Energy: 384239569 (nJ)   <- different driver, real nonzero delta
+```
+
+Taking the delta *within one subscription* via `IOReportCreateSamplesDelta`
+(a small custom tool, `test_ane_energy_delta.m`) returned exactly 0 for every
+single `AppleT6041PMGR`-driver "Energy Model" channel — not just `ANE`, but
+`CPU Energy` too — even running as root, even with real concurrent CPU/GPU/
+ANE activity. The one channel that *did* show a nonzero delta there was
+`GPU Energy` from a completely different driver (`AGXAcceleratorG16X`, the
+GPU's own dedicated accelerator IOService) — real, live, moving over a plain
+5-second window. There's no equivalent ANE-specific accelerator IOService to
+fall back on the way there is for GPU, and it's unclear whether the
+`IOReportCreateSamplesDelta`-based zeros reflect a real limitation of this
+channel group or a bug in that specific one-off tool — it wasn't pinned down
+further.
+
+**A cleaner, more decisive test**: rather than using the delta API, just take
+two independent single-sample *absolute* reads (plain `test_ioreport`, no
+sudo) and diff them manually. This works and is genuinely informative: the
+raw `ANE: ... (mJ)` value moved across the session (2,683,767 → 67,595,610 →
+74,470,918 mJ at three points, unprivileged, no `sudo` needed for this read
+path) — so it's a real, live, non-static counter, contradicting the first
+pass's "appears non-functional" read. But a precisely-bounded, genuinely
+sustained 64-second GEMM load (wall-clock timed, not just "N iterations")
+produced **exactly zero change** (74,470,918 → 74,470,918) across that
+window — meaning the value that moved earlier was being driven by something
+other than this app's deliberate workload (plausibly unrelated background
+system/ANE activity — Spotlight, Siri suggestions, etc. — on its own, much
+slower independent cadence). So this channel is real, but **decoupled from
+the specific, short-duration workload this investigation needs to measure**
+— not useful as a benchmarking signal regardless of privilege level.
+
+**Conclusion**: `powermetrics`' own `ANE Power: ### mW` output (§8.5, which
+did respond cleanly to load on M6) is not coming from this public
+`IOReport "Energy Model"` group in any form tested here — neither the delta
+API nor manual absolute-value diffing tracks this app's workload the way
+`powermetrics` itself does. This rules out one plausible "cleaner public
+alternative to the private PMU register" path, but doesn't open a new one;
+`powermetrics` itself (or the private `_ANEPerformanceStats` register, with
+all its caveats) remain the only working options found in this
+investigation.
+
 ## 9. `kANE_L2PE_COMPUTE_CYCLES` ([21]) and `kANE_L2PE_OUTPUT_STALL_CYCLES` ([23]): a second coarse-cadence counter pair
 
 Prompted by the independent `ane_pmu_profiler` report's M1-vs-M4 table (§8.3),
