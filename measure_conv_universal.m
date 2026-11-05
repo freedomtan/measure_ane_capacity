@@ -240,9 +240,11 @@ int main(int argc, char *argv[]) {
     run_bench(device, kTargetANE, MPSDataTypeFloat16, @"ANE FP16");
     run_bench(device, kTargetANE, MPSDataTypeInt8, @"ANE INT8");
   }
-  if (!onlyTarget || [onlyTarget isEqualToString:@"cpu"]) {
+  if ([onlyTarget isEqualToString:@"cpu"]) {
     run_bench(device, kTargetCPU, MPSDataTypeFloat16, @"CPU FP16");
     run_bench(device, kTargetCPU, MPSDataTypeInt8, @"CPU INT8");
+  } else if (!onlyTarget) {
+    NSLog(@"[CPU] Skipped by default (known OS bug crashes the process -- pass --target cpu to run it anyway).");
   }
 
   return 0;
